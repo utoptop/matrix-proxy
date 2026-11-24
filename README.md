@@ -87,7 +87,12 @@ backend bk_matrix_proxy
     option httpchk GET /_proxy/health
     http-check expect status 200
 
+    # 标准 HTTP 模式（config.toml: accept_proxy_v2 = false）：
     server matrix_proxy 127.0.0.1:8910 check inter 10s rise 2 fall 3
+
+    # 若需全链路 HAProxy PROXY Protocol v2（config.toml: accept_proxy_v2 = true），
+    # 请改用以下 server 行（务必加 check-send-proxy，并保持 http-reuse safe 与 no option forwardfor）：
+    # server matrix_proxy 127.0.0.1:8910 send-proxy-v2 check check-send-proxy inter 10s rise 2 fall 3
 ```
 
 ### HAProxy：每上游自定义独立端口

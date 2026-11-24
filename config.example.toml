@@ -25,7 +25,10 @@ listen = "0.0.0.0:8080"
 tls_cert_path = ""
 tls_key_path = ""
 
-# 是否在入站 TCP 连接上解析 HAProxy PROXY Protocol v2（前置为 HTTP 反向代理时设为 false）
+# 是否在入站 TCP 连接上解析 HAProxy PROXY Protocol v2：
+# - 设为 true 时，仅放行来自下方 `trusted_proxies` 物理对端的连接，同时保留真实客户端 IP/端口
+#   以及 HAProxy 传入的 `X-Forwarded-Proto` / `X-Forwarded-Host`，内置 `--health-check` 也会自动走 PPv2 LOCAL 探测。
+# - 对应 HAProxy backend 必须同时配置 `send-proxy-v2` 与 `check-send-proxy`（且建议 `http-reuse safe` + `no option forwardfor`）。
 accept_proxy_v2 = false
 
 # ---------------------- 安全与真实客户端 IP 校验 ----------------------

@@ -176,13 +176,26 @@ impl Ppv2Client {
         }
     }
 
-    /// Convenience helper for buffered discovery/metadata GET requests over PROXY Protocol v2.
+    /// Convenience helper for buffered discovery/metadata GET requests over PROXY Protocol v2 (LOCAL command).
     pub async fn get_bytes(
+        &self,
+        url: &Url,
+        host_override: Option<&str>,
+        headers: HeaderMap,
+        timeout: Duration,
+    ) -> Result<(StatusCode, Vec<u8>, Option<HeaderValue>)> {
+        self.get_bytes_for_client(url, host_override, headers, timeout, None)
+            .await
+    }
+
+    /// Buffered GET over PROXY Protocol v2, optionally carrying the real client address in the PPv2 header.
+    pub async fn get_bytes_for_client(
         &self,
         url: &Url,
         host_override: Option<&str>,
         mut headers: HeaderMap,
         timeout: Duration,
+        client_addr: Option<SocketAddr>,
     ) -> Result<(StatusCode, Vec<u8>, Option<HeaderValue>)> {
         headers.insert(
             http::header::ACCEPT_ENCODING,
@@ -197,7 +210,7 @@ impl Ppv2Client {
                 host_override,
                 headers,
                 Body::empty(),
-                None,
+                client_addr,
             ),
         )
         .await

@@ -7,16 +7,25 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-/// Verified client network identity extracted from TCP peer + trusted proxy headers.
+/// Raw TCP peer address paired with an optional client address decoded from inbound PROXY Protocol v2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InboundPeer {
+    /// Physical TCP socket peer address (never overwritten by PROXY Protocol headers).
+    pub physical_peer: SocketAddr,
+    /// Real client address decoded from an inbound PROXY Protocol v2 `PROXY` frame (if present).
+    pub ppv2_client: Option<SocketAddr>,
+}
+
+/// Verified client network identity extracted from TCP peer + optional inbound PPv2 + trusted proxy headers.
 #[derive(Debug, Clone)]
 pub struct ClientInfo {
-    /// Physical TCP peer address (or address recovered by inbound PROXY protocol v2).
+    /// Physical TCP peer address (used for trusted-proxy checks and XFF chain handling).
     pub peer_addr: SocketAddr,
     /// True whether `peer_addr.ip()` is in `server.trusted_proxies` (and `trust_forwarded_headers` is enabled).
     pub peer_is_trusted: bool,
     /// Authoritative real client IP (anti-spoofing protected).
     pub client_ip: IpAddr,
-    /// Authoritative client source port (best-effort; falls back to peer port).
+    /// Authoritative client source port (from inbound PPv2 when available; otherwise TCP peer port).
     pub client_port: u16,
     /// Effective client scheme (`"https"` or `"http"`).
     pub client_proto: String,
@@ -31,14 +40,33 @@ impl ClientInfo {
         headers: &HeaderMap,
         listener_is_tls: bool,
     ) -> Self {
-        let peer_ip = canonical_ip(peer_addr.ip());
-        let peer_is_trusted =
-            runtime.server.trust_forwarded_headers && runtime.is_trusted_proxy(peer_ip);
+        Self::extract_with_ppv2(runtime, peer_addr, None, headers, listener_is_tls)
+    }
+
+    pub fn extract_with_ppv2(
+        runtime: &RuntimeConfig,
+        physical_peer: SocketAddr,
+        ppv2_client: Option<SocketAddr>,
+        headers: &HeaderMap,
+        listener_is_tls: bool,
+    ) -> Self {
+        let peer_ip = canonical_ip(physical_peer.ip());
+        let physical_is_trusted = runtime.is_trusted_proxy(peer_ip);
+        let peer_is_trusted = runtime.server.trust_forwarded_headers && physical_is_trusted;
 
         let mut client_ip = peer_ip;
+        let mut client_port = physical_peer.port();
         let mut trusted_xff_chain: Option<String> = None;
 
-        if peer_is_trusted {
+        if let Some(real_src) = ppv2_client
+            && physical_is_trusted
+        {
+            // Inbound PROXY Protocol v2 from a trusted physical proxy (e.g. HAProxy `send-proxy-v2`)
+            // is L4-authoritative for client IP and source port, while `peer_is_trusted` remains true
+            // so `X-Forwarded-Proto` / `X-Forwarded-Host` from HAProxy are still honored.
+            client_ip = canonical_ip(real_src.ip());
+            client_port = real_src.port();
+        } else if peer_is_trusted {
             // 1. Check X-Forwarded-For right-to-left, skipping trusted proxy hops.
             if let Some(xff_raw) = headers
                 .get("x-forwarded-for")
@@ -109,10 +137,10 @@ impl ClientInfo {
         };
 
         Self {
-            peer_addr: SocketAddr::new(peer_ip, peer_addr.port()),
+            peer_addr: SocketAddr::new(peer_ip, physical_peer.port()),
             peer_is_trusted,
             client_ip,
-            client_port: peer_addr.port(),
+            client_port,
             client_proto,
             trusted_xff_chain,
         }
@@ -500,6 +528,66 @@ mod tests {
         assert_eq!(local.len(), 16);
         let mut cursor_l = std::io::Cursor::new(local);
         assert_eq!(read_ppv2_header(&mut cursor_l).await.unwrap(), None);
+    }
+
+    #[test]
+    fn trusted_ppv2_preserves_client_ip_port_and_forwarded_proto() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [upstream]
+            matrix_url = "https://matrix.example.org"
+            "#,
+        )
+        .unwrap()
+        .into_runtime()
+        .unwrap();
+
+        let mut hdrs = HeaderMap::new();
+        // Spoofed XFF should NOT override L4 PPv2 client IP, while X-Forwarded-Proto from trusted HAProxy IS kept.
+        hdrs.insert("x-forwarded-for", HeaderValue::from_static("1.2.3.4"));
+        hdrs.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+
+        let physical_peer: SocketAddr = "172.18.0.1:41000".parse().unwrap();
+        let ppv2_client: SocketAddr = "198.51.100.77:54321".parse().unwrap();
+        let info =
+            ClientInfo::extract_with_ppv2(&cfg, physical_peer, Some(ppv2_client), &hdrs, false);
+
+        assert!(info.peer_is_trusted);
+        assert_eq!(info.peer_addr, physical_peer);
+        assert_eq!(info.client_ip, "198.51.100.77".parse::<IpAddr>().unwrap());
+        assert_eq!(info.client_port, 54321);
+        assert_eq!(info.client_proto, "https");
+
+        let (xff, xrip, fwd) = info.upstream_ip_headers(ClientIpMode::Replace).unwrap();
+        assert_eq!(xff, "198.51.100.77");
+        assert_eq!(xrip, "198.51.100.77");
+        assert_eq!(fwd, "for=198.51.100.77;proto=https");
+    }
+
+    #[test]
+    fn untrusted_ppv2_peer_is_ignored() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [upstream]
+            matrix_url = "https://matrix.example.org"
+            "#,
+        )
+        .unwrap()
+        .into_runtime()
+        .unwrap();
+
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+
+        let physical_peer: SocketAddr = "203.0.113.55:44321".parse().unwrap();
+        let spoofed_ppv2: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let info =
+            ClientInfo::extract_with_ppv2(&cfg, physical_peer, Some(spoofed_ppv2), &hdrs, false);
+
+        assert!(!info.peer_is_trusted);
+        assert_eq!(info.client_ip, "203.0.113.55".parse::<IpAddr>().unwrap());
+        assert_eq!(info.client_port, 44321);
+        assert_eq!(info.client_proto, "http");
     }
 
     #[test]

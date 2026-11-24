@@ -6,24 +6,26 @@ use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
 use hyper_util::service::TowerToHyperService;
-use matrix_proxy::client_ip::read_ppv2_header;
-use matrix_proxy::config::{Config, ListenerPlan, redact_proxy_url};
+use matrix_proxy::client_ip::{InboundPeer, encode_ppv2_local, read_ppv2_header};
+use matrix_proxy::config::{Config, ListenerPlan, RuntimeConfig, canonical_ip, redact_proxy_url};
 use matrix_proxy::ppv2_client::configure_tcp_socket;
 use matrix_proxy::proxy::{ListenerState, build_listener_router};
-use rustls::pki_types::PrivateKeyDer;
+use matrix_proxy::ws::build_client_tls_config;
+use rustls::pki_types::{PrivateKeyDer, ServerName};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::fs::File;
 use std::io::BufReader;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
 use tokio::sync::watch;
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tower::ServiceExt;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -105,9 +107,9 @@ async fn main() -> Result<()> {
         );
 
         let rx = shutdown_rx.clone();
-        let server_cfg = runtime.server.clone();
+        let runtime_ref = Arc::clone(&runtime);
         handles.push(tokio::spawn(async move {
-            serve_listener(listener, plan, server_cfg, tls_acceptor, app, rx).await
+            serve_listener(listener, plan, runtime_ref, tls_acceptor, app, rx).await
         }));
     }
 
@@ -155,13 +157,15 @@ fn bind_high_perf_listener(addr: SocketAddr, backlog: u32) -> Result<TcpListener
 async fn serve_listener(
     listener: TcpListener,
     plan: ListenerPlan,
-    server_cfg: matrix_proxy::config::ServerConfig,
+    runtime: Arc<RuntimeConfig>,
     tls_acceptor: Option<TlsAcceptor>,
     app: axum::Router,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
+    let server_cfg = &runtime.server;
     let header_timeout = Duration::from_secs(server_cfg.header_read_timeout_secs.max(1));
     let keepalive = Duration::from_secs(server_cfg.tcp_keepalive_secs);
+    let tcp_nodelay = server_cfg.tcp_nodelay;
 
     loop {
         tokio::select! {
@@ -171,7 +175,7 @@ async fn serve_listener(
                 }
             }
             accepted = listener.accept() => {
-                let (mut tcp_stream, mut peer) = match accepted {
+                let (mut tcp_stream, physical_peer) = match accepted {
                     Ok(pair) => pair,
                     Err(err) => {
                         error!(listen = %plan.listen, error = %err, "TCP accept error");
@@ -179,39 +183,60 @@ async fn serve_listener(
                     }
                 };
 
-                configure_tcp_socket(&tcp_stream, server_cfg.tcp_nodelay, keepalive);
+                configure_tcp_socket(&tcp_stream, tcp_nodelay, keepalive);
 
                 let tls_acceptor = tls_acceptor.clone();
                 let app = app.clone();
+                let runtime_ref = Arc::clone(&runtime);
+                let listen_addr = plan.listen;
                 let accept_ppv2 = plan.accept_proxy_v2;
 
                 tokio::spawn(async move {
-                    if accept_ppv2 {
+                    let ppv2_client = if accept_ppv2 {
+                        // Anti-spoofing guard: only accept inbound PROXY Protocol v2 from trusted_proxies
+                        // (analogous to HAProxy `fc_src` whitelist).
+                        let physical_ip = canonical_ip(physical_peer.ip());
+                        if !runtime_ref.is_trusted_proxy(physical_ip) {
+                            warn!(
+                                peer = %physical_peer,
+                                listen = %listen_addr,
+                                "rejected inbound PROXY Protocol v2 connection from untrusted peer"
+                            );
+                            return;
+                        }
                         match tokio::time::timeout(
                             Duration::from_secs(5),
                             read_ppv2_header(&mut tcp_stream),
                         )
                         .await
                         {
-                            Ok(Ok(Some(real_src))) => peer = real_src,
-                            Ok(Ok(None)) => {} // PPv2 LOCAL command
+                            Ok(Ok(real_src)) => real_src,
                             Ok(Err(err)) => {
-                                debug!(peer = %peer, error = %err, "rejected invalid inbound PROXY Protocol v2 header");
+                                debug!(peer = %physical_peer, error = %err, "rejected invalid inbound PROXY Protocol v2 header");
                                 return;
                             }
                             Err(_) => {
-                                debug!(peer = %peer, "timed out reading inbound PROXY Protocol v2 header");
+                                debug!(peer = %physical_peer, "timed out reading inbound PROXY Protocol v2 header");
                                 return;
                             }
                         }
-                    }
+                    } else {
+                        None
+                    };
+
+                    let inbound = InboundPeer {
+                        physical_peer,
+                        ppv2_client,
+                    };
+                    let effective_peer = ppv2_client.unwrap_or(physical_peer);
 
                     let service = TowerToHyperService::new(tower::service_fn(
                         move |req: http::Request<Incoming>| {
                             let app = app.clone();
                             async move {
                                 let mut req = req.map(Body::new);
-                                req.extensions_mut().insert(ConnectInfo(peer));
+                                req.extensions_mut().insert(inbound);
+                                req.extensions_mut().insert(ConnectInfo(effective_peer));
                                 app.oneshot(req).await
                             }
                         },
@@ -238,22 +263,22 @@ async fn serve_listener(
                         {
                             Ok(Ok(s)) => s,
                             Ok(Err(err)) => {
-                                debug!(peer = %peer, error = %err, "TLS accept handshake failed");
+                                debug!(peer = %effective_peer, error = %err, "TLS accept handshake failed");
                                 return;
                             }
                             Err(_) => {
-                                debug!(peer = %peer, "TLS accept handshake timed out");
+                                debug!(peer = %effective_peer, "TLS accept handshake timed out");
                                 return;
                             }
                         };
                         let io = TokioIo::new(tls_stream);
                         if let Err(err) = builder.serve_connection_with_upgrades(io, service).await {
-                            debug!(peer = %peer, error = %err, "TLS connection closed");
+                            debug!(peer = %effective_peer, error = %err, "TLS connection closed");
                         }
                     } else {
                         let io = TokioIo::new(tcp_stream);
                         if let Err(err) = builder.serve_connection_with_upgrades(io, service).await {
-                            debug!(peer = %peer, error = %err, "HTTP connection closed");
+                            debug!(peer = %effective_peer, error = %err, "HTTP connection closed");
                         }
                     }
                 });
@@ -304,8 +329,57 @@ fn resolve_config_path(explicit: Option<PathBuf>) -> Option<PathBuf> {
     None
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HealthCheckTarget {
+    connect_addr: SocketAddr,
+    proxy_prefix: String,
+    tls: bool,
+    accept_proxy_v2: bool,
+}
+
+impl HealthCheckTarget {
+    fn from_parts(
+        listen: &str,
+        proxy_prefix: &str,
+        tls: bool,
+        accept_proxy_v2: bool,
+    ) -> Result<Self> {
+        let addr: SocketAddr = listen
+            .parse()
+            .with_context(|| format!("invalid listen address '{listen}'"))?;
+        let connect_ip = if addr.ip().is_unspecified() {
+            if addr.is_ipv6() {
+                IpAddr::V6(Ipv6Addr::LOCALHOST)
+            } else {
+                IpAddr::V4(Ipv4Addr::LOCALHOST)
+            }
+        } else {
+            addr.ip()
+        };
+        Ok(Self {
+            connect_addr: SocketAddr::new(connect_ip, addr.port()),
+            proxy_prefix: proxy_prefix.trim_end_matches('/').to_string(),
+            tls,
+            accept_proxy_v2,
+        })
+    }
+
+    fn url(&self) -> String {
+        let scheme = if self.tls { "https" } else { "http" };
+        let host = match self.connect_addr.ip() {
+            IpAddr::V6(v6) => format!("[{v6}]"),
+            IpAddr::V4(v4) => v4.to_string(),
+        };
+        format!(
+            "{scheme}://{host}:{}{}/health",
+            self.connect_addr.port(),
+            self.proxy_prefix
+        )
+    }
+}
+
 async fn run_health_check(config_path: Option<&Path>) -> Result<()> {
-    let urls = collect_health_check_urls(config_path)?;
+    let targets = collect_health_check_targets(config_path)?;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(4))
@@ -313,16 +387,90 @@ async fn run_health_check(config_path: Option<&Path>) -> Result<()> {
         .no_proxy()
         .build()?;
 
-    for url in urls {
-        let resp = client
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("health check request to {url} failed"))?;
+    for target in targets {
+        if target.accept_proxy_v2 {
+            probe_ppv2_health(&target).await?;
+        } else {
+            let url = target.url();
+            let resp = client
+                .get(&url)
+                .send()
+                .await
+                .with_context(|| format!("health check request to {url} failed"))?;
 
-        if !resp.status().is_success() {
-            anyhow::bail!("health check {url} returned HTTP {}", resp.status());
+            if !resp.status().is_success() {
+                anyhow::bail!("health check {url} returned HTTP {}", resp.status());
+            }
         }
+    }
+
+    Ok(())
+}
+
+async fn probe_ppv2_health(target: &HealthCheckTarget) -> Result<()> {
+    let timeout = Duration::from_secs(4);
+    let mut tcp = tokio::time::timeout(timeout, TcpStream::connect(target.connect_addr))
+        .await
+        .with_context(|| {
+            format!(
+                "PPv2 health check connect timed out for {}",
+                target.connect_addr
+            )
+        })?
+        .with_context(|| {
+            format!(
+                "PPv2 health check connect failed for {}",
+                target.connect_addr
+            )
+        })?;
+
+    let ppv2_local = encode_ppv2_local();
+    tokio::time::timeout(timeout, tcp.write_all(&ppv2_local))
+        .await
+        .context("PPv2 health check write header timed out")?
+        .context("PPv2 health check write header failed")?;
+
+    let req = format!(
+        "GET {}/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        target.proxy_prefix
+    );
+
+    let mut resp_buf = [0u8; 512];
+    let n = if target.tls {
+        let tls_cfg = build_client_tls_config(true, &[b"http/1.1".as_slice()])?;
+        let connector = TlsConnector::from(tls_cfg);
+        let sni = ServerName::try_from("localhost".to_string())
+            .map_err(|_| anyhow!("invalid health check SNI"))?;
+        let mut tls = tokio::time::timeout(timeout, connector.connect(sni, tcp))
+            .await
+            .context("PPv2 TLS health check handshake timed out")?
+            .context("PPv2 TLS health check handshake failed")?;
+        tokio::time::timeout(timeout, tls.write_all(req.as_bytes()))
+            .await
+            .context("PPv2 TLS health check write timed out")?
+            .context("PPv2 TLS health check write failed")?;
+        tokio::time::timeout(timeout, tls.read(&mut resp_buf))
+            .await
+            .context("PPv2 TLS health check read timed out")?
+            .context("PPv2 TLS health check read failed")?
+    } else {
+        tokio::time::timeout(timeout, tcp.write_all(req.as_bytes()))
+            .await
+            .context("PPv2 health check write timed out")?
+            .context("PPv2 health check write failed")?;
+        tokio::time::timeout(timeout, tcp.read(&mut resp_buf))
+            .await
+            .context("PPv2 health check read timed out")?
+            .context("PPv2 health check read failed")?
+    };
+
+    let head = String::from_utf8_lossy(&resp_buf[..n]);
+    let status_line = head.lines().next().unwrap_or_default().trim();
+    if !status_line.starts_with("HTTP/1.1 200") && !status_line.starts_with("HTTP/1.0 200") {
+        anyhow::bail!(
+            "PPv2 health check to {} returned unexpected status: '{status_line}'",
+            target.connect_addr
+        );
     }
 
     Ok(())
@@ -335,25 +483,22 @@ fn non_empty_env(key: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn collect_health_check_urls(config_path: Option<&Path>) -> Result<Vec<String>> {
-    // Prefer full Config::load -> RuntimeConfig so multi-port [[proxies]] listeners are ALL checked.
+fn collect_health_check_targets(config_path: Option<&Path>) -> Result<Vec<HealthCheckTarget>> {
+    // Prefer full Config::load -> RuntimeConfig so ALL listeners (including accept_proxy_v2) are checked.
     if let Ok(cfg) = Config::load(config_path)
         && let Ok(runtime) = cfg.into_runtime()
     {
-        let mut urls = Vec::new();
+        let mut targets = Vec::with_capacity(runtime.listeners.len());
         for listener in &runtime.listeners {
-            if listener.accept_proxy_v2 {
-                // Skip raw HTTP probe against listeners requiring binary PPv2 on TCP accept.
-                continue;
-            }
-            urls.push(build_health_check_url_from_parts(
+            targets.push(HealthCheckTarget::from_parts(
                 &listener.listen.to_string(),
                 &listener.proxy_prefix,
                 listener.tls_enabled(),
+                listener.accept_proxy_v2,
             )?);
         }
-        if !urls.is_empty() {
-            return Ok(urls);
+        if !targets.is_empty() {
+            return Ok(targets);
         }
     }
 
@@ -370,36 +515,17 @@ fn collect_health_check_urls(config_path: Option<&Path>) -> Result<Vec<String>> 
         .unwrap_or_else(|| "/_proxy".to_string());
     let tls = (non_empty_env("TLS_CERT_PATH").is_some() && non_empty_env("TLS_KEY_PATH").is_some())
         || file_cfg.as_ref().is_some_and(Config::tls_enabled);
+    let accept_ppv2 = file_cfg
+        .as_ref()
+        .map(|c| c.server.accept_proxy_v2)
+        .unwrap_or(false);
 
-    Ok(vec![build_health_check_url_from_parts(
+    Ok(vec![HealthCheckTarget::from_parts(
         &listen,
         &proxy_prefix,
         tls,
+        accept_ppv2,
     )?])
-}
-
-fn build_health_check_url_from_parts(
-    listen: &str,
-    proxy_prefix: &str,
-    tls: bool,
-) -> Result<String> {
-    let addr: SocketAddr = listen
-        .parse()
-        .with_context(|| format!("invalid listen address '{listen}'"))?;
-    let host = if addr.ip().is_unspecified() {
-        if addr.is_ipv6() { "[::1]" } else { "127.0.0.1" }.to_string()
-    } else if addr.is_ipv6() {
-        format!("[{}]", addr.ip())
-    } else {
-        addr.ip().to_string()
-    };
-
-    let scheme = if tls { "https" } else { "http" };
-    let clean_prefix = proxy_prefix.trim_end_matches('/');
-    Ok(format!(
-        "{scheme}://{host}:{}{clean_prefix}/health",
-        addr.port()
-    ))
 }
 
 fn init_tracing() {
@@ -449,12 +575,50 @@ mod tests {
         )
         .unwrap();
         assert!(!raw_cfg.tls_enabled());
-        let url = build_health_check_url_from_parts(
+        let target = HealthCheckTarget::from_parts(
             &raw_cfg.server.listen,
             &raw_cfg.routing.proxy_prefix,
             raw_cfg.tls_enabled(),
+            raw_cfg.server.accept_proxy_v2,
         )
         .unwrap();
-        assert_eq!(url, "http://127.0.0.1:8080/_proxy/health");
+        assert_eq!(target.url(), "http://127.0.0.1:8080/_proxy/health");
+        assert!(!target.accept_proxy_v2);
+    }
+
+    #[tokio::test]
+    async fn ppv2_health_check_probes_accept_proxy_v2_listener() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [server]
+            listen = "127.0.0.1:0"
+            accept_proxy_v2 = true
+            expose_info = "trusted"
+
+            [[proxies]]
+            name = "test"
+            domains = ["proxy.example.com"]
+            matrix_url = "https://matrix.example.org"
+            "#,
+        )
+        .unwrap();
+        let runtime = Arc::new(cfg.into_runtime().unwrap());
+        let plan = runtime.listeners[0].clone();
+        let state = ListenerState::build(Arc::clone(&runtime), plan.clone()).unwrap();
+        let app = build_listener_router(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (tx, rx) = watch::channel(false);
+        let server_task = tokio::spawn(async move {
+            let _ = serve_listener(listener, plan, runtime, None, app, rx).await;
+        });
+
+        let target =
+            HealthCheckTarget::from_parts(&addr.to_string(), "/_proxy", false, true).unwrap();
+        probe_ppv2_health(&target).await.unwrap();
+
+        let _ = tx.send(true);
+        let _ = server_task.await;
     }
 }

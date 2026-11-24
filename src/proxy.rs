@@ -1,4 +1,4 @@
-use crate::client_ip::{ClientInfo, IpRateLimiter, apply_upstream_client_ip_headers};
+use crate::client_ip::{ClientInfo, InboundPeer, IpRateLimiter, apply_upstream_client_ip_headers};
 use crate::config::{
     ExposeInfoMode, ListenerPlan, ProxyProfile, RuntimeConfig, ServerConfig, normalized_base_url,
     redact_proxy_url,
@@ -243,14 +243,30 @@ async fn handle_request(
         None
     };
 
-    // 3. Extract verified real client IP (anti-spoofing protected).
-    let peer_addr = req
+    // 3. Extract verified real client IP (anti-spoofing protected; preserves physical peer across inbound PPv2).
+    let inbound = req
         .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ci| ci.0)
-        .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+        .get::<InboundPeer>()
+        .copied()
+        .unwrap_or_else(|| {
+            let peer_addr = req
+                .extensions()
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|ci| ci.0)
+                .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+            InboundPeer {
+                physical_peer: peer_addr,
+                ppv2_client: None,
+            }
+        });
 
-    let client = ClientInfo::extract(&state.runtime, peer_addr, &headers, state.listener_is_tls);
+    let client = ClientInfo::extract_with_ppv2(
+        &state.runtime,
+        inbound.physical_peer,
+        inbound.ppv2_client,
+        &headers,
+        state.listener_is_tls,
+    );
 
     // 4. Optional per-IP rate limiting.
     if let Some(limiter) = &state.rate_limiter
@@ -381,14 +397,30 @@ async fn handle_request(
             if method == Method::OPTIONS {
                 return cors_preflight_response(&headers, false);
             }
-            handle_auth_metadata(&inst, &public, &upstreams, &requested_path, &headers).await
+            handle_auth_metadata(
+                &inst,
+                &public,
+                &upstreams,
+                &client,
+                &requested_path,
+                &headers,
+            )
+            .await
         }
 
         RouteTarget::OidcDiscovery { upstream_path } => {
             if method == Method::OPTIONS {
                 return cors_preflight_response(&headers, false);
             }
-            handle_oidc_discovery(&inst, &public, &upstreams, &upstream_path, &headers).await
+            handle_oidc_discovery(
+                &inst,
+                &public,
+                &upstreams,
+                &client,
+                &upstream_path,
+                &headers,
+            )
+            .await
         }
 
         RouteTarget::Matrix {
@@ -564,6 +596,7 @@ async fn handle_auth_metadata(
     inst: &ProxyInstance,
     public: &PublicContext,
     upstreams: &ResolvedUpstreams,
+    client: &ClientInfo,
     requested_path: &str,
     req_headers: &HeaderMap,
 ) -> Response<Body> {
@@ -613,7 +646,7 @@ async fn handle_auth_metadata(
     let mut last_non_200: Option<(StatusCode, Vec<u8>, Option<HeaderValue>)> = None;
 
     for (url, use_ppv2, host_ov) in candidates {
-        match fetch_metadata_json(inst, &url, use_ppv2, host_ov, req_headers).await {
+        match fetch_metadata_json(inst, client, &url, use_ppv2, host_ov, req_headers).await {
             Ok((status, body_bytes, content_type)) if status.is_success() => {
                 match serde_json::from_slice::<Value>(&body_bytes) {
                     Ok(json_val) => {
@@ -667,6 +700,7 @@ async fn handle_oidc_discovery(
     inst: &ProxyInstance,
     public: &PublicContext,
     upstreams: &ResolvedUpstreams,
+    client: &ClientInfo,
     upstream_path: &str,
     req_headers: &HeaderMap,
 ) -> Response<Body> {
@@ -675,7 +709,7 @@ async fn handle_oidc_discovery(
     let use_ppv2 = inst.profile.auth_uses_ppv2();
     let host_ov = inst.profile.upstream.auth_host_header.as_deref();
 
-    match fetch_metadata_json(inst, &target_url, use_ppv2, host_ov, req_headers).await {
+    match fetch_metadata_json(inst, client, &target_url, use_ppv2, host_ov, req_headers).await {
         Ok((status, body_bytes, content_type)) if status.is_success() => {
             match serde_json::from_slice::<Value>(&body_bytes) {
                 Ok(json_val) => {
@@ -724,22 +758,35 @@ async fn handle_oidc_discovery(
 
 async fn fetch_metadata_json(
     inst: &ProxyInstance,
+    client: &ClientInfo,
     url: &Url,
     use_ppv2: bool,
     host_override: Option<&str>,
     incoming_headers: &HeaderMap,
 ) -> Result<(StatusCode, Vec<u8>, Option<HeaderValue>)> {
+    let mut out_headers = HeaderMap::new();
+    out_headers.insert(
+        http::header::ACCEPT,
+        HeaderValue::from_static("application/json"),
+    );
+    if let Some(ua) = incoming_headers.get(http::header::USER_AGENT) {
+        out_headers.insert(http::header::USER_AGENT, ua.clone());
+    }
+    apply_upstream_client_ip_headers(
+        &mut out_headers,
+        client,
+        inst.profile.upstream.client_ip_mode,
+    );
+
     if use_ppv2 && let Some(ppv2) = &inst.ppv2_client {
-        let mut hdrs = HeaderMap::new();
-        hdrs.insert(
-            http::header::ACCEPT,
-            HeaderValue::from_static("application/json"),
-        );
-        if let Some(ua) = incoming_headers.get(http::header::USER_AGENT) {
-            hdrs.insert(http::header::USER_AGENT, ua.clone());
-        }
         return ppv2
-            .get_bytes(url, host_override, hdrs, Duration::from_secs(15))
+            .get_bytes_for_client(
+                url,
+                host_override,
+                out_headers,
+                Duration::from_secs(15),
+                Some(client.client_socket_addr()),
+            )
             .await;
     }
 
@@ -747,14 +794,13 @@ async fn fetch_metadata_json(
         .rewrite_client
         .get(url.clone())
         .timeout(Duration::from_secs(15))
-        .header(reqwest::header::ACCEPT, "application/json")
         .header(reqwest::header::ACCEPT_ENCODING, "identity");
 
+    for (name, val) in &out_headers {
+        builder = builder.header(name, val);
+    }
     if let Some(host_ov) = host_override {
         builder = builder.header(reqwest::header::HOST, host_ov);
-    }
-    if let Some(ua) = incoming_headers.get(http::header::USER_AGENT) {
-        builder = builder.header(reqwest::header::USER_AGENT, ua.clone());
     }
 
     let resp = builder.send().await?;
