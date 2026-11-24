@@ -91,7 +91,7 @@ backend bk_matrix_proxy
     server matrix_proxy 127.0.0.1:8910 check inter 10s rise 2 fall 3
 
     # 若需全链路 HAProxy PROXY Protocol v2（config.toml: accept_proxy_v2 = true），
-    # 请改用以下 server 行（务必加 check-send-proxy，并保持 http-reuse safe 与 no option forwardfor）：
+    # 请改用以下 server 行（务必加 check-send-proxy，并保持 http-reuse safe）：
     # server matrix_proxy 127.0.0.1:8910 send-proxy-v2 check check-send-proxy inter 10s rise 2 fall 3
 ```
 
