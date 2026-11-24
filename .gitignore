@@ -1,0 +1,7 @@
+/target
+*.log
+.DS_Store
+.env
+config.toml
+*.pem
+*.key

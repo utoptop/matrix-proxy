@@ -1,0 +1,41 @@
+# =============================================================================
+# matrix-proxy Docker Compose 部署示例
+# 推荐：复制 config.example.toml 为 config.toml 后直接 `docker compose up -d`
+#      镜像启动时会自动检测并加载 `/app/config.toml`（无需额外指定 command）。
+# =============================================================================
+services:
+  matrix-proxy:
+    image: utoptop/matrix-proxy:1.0
+    container_name: matrix-proxy
+    restart: unless-stopped
+    # 安全加固：只读根文件系统 + 丢弃全部 Linux Capabilities + 禁止提权
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # 推荐仅绑定 127.0.0.1，由宿主机 HAProxy / Nginx / Caddy 统一终止 TLS
+    # 若在 config.toml 中为多个 [[proxies]] 配置了独立端口（例如 8081），请同步追加映射
+    ports:
+      - "127.0.0.1:8910:8080"
+      # - "127.0.0.1:8911:8081"
+    environment:
+      RUST_LOG: "${RUST_LOG:-matrix_proxy=info}"
+      # 若不使用 config.toml，可改用纯环境变量部署单上游（取消下方注释并移除 volumes）：
+      # PUBLIC_URL: "${PUBLIC_URL:-https://proxy.example.com}"
+      # MATRIX_UPSTREAM: "${MATRIX_UPSTREAM:-https://matrix.example.org}"
+      # AUTH_UPSTREAM: "${AUTH_UPSTREAM:-https://auth.example.org}"
+      # RTC_UPSTREAM: "${RTC_UPSTREAM:-}"
+      # UPSTREAM_PROXY: "${UPSTREAM_PROXY:-}"
+      # CLIENT_IP_MODE: "${CLIENT_IP_MODE:-replace}"
+      # SEND_PROXY_V2: "${SEND_PROXY_V2:-false}"
+      # EXPOSE_INFO: "${EXPOSE_INFO:-trusted}"
+    volumes:
+      # 挂载多上游 / 单上游配置文件，容器自动加载
+      - ./config.toml:/app/config.toml:ro
+    # 可选：限制容器日志体积，防止磁盘被撑满
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"

@@ -1,0 +1,12 @@
+/target
+.git
+.gitignore
+.DS_Store
+.env
+config.toml
+*.log
+*.pem
+*.key
+scripts/
+README.md
+compose.yaml
