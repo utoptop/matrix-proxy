@@ -854,7 +854,7 @@ fn run_check_config(config_path: Option<&Path>) -> Result<()> {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "<environment>".to_string());
     println!(
-        "OK: matrix-proxy v{} configuration valid (source={}, listeners={}, global_outbound_proxy={})",
+        "OK: matrix-proxy v{} configuration valid (source={}, listeners={}, default_outbound_proxy={}, default_no_proxy={})",
         env!("CARGO_PKG_VERSION"),
         src,
         runtime.listeners.len(),
@@ -864,29 +864,45 @@ fn run_check_config(config_path: Option<&Path>) -> Result<()> {
             .as_deref()
             .map(redact_proxy_url)
             .unwrap_or_else(|| "direct".to_string()),
+        runtime.server.outbound_no_proxy.len(),
     );
     for plan in &runtime.listeners {
-        let profiles: Vec<String> = plan
-            .profiles
-            .iter()
-            .map(|p| {
-                let proxy = if let Some(raw) = &p.upstream.outbound_proxy {
-                    redact_proxy_url(raw)
-                } else if p.upstream.outbound_proxy_direct {
-                    "direct(explicit)".to_string()
-                } else {
-                    "direct".to_string()
-                };
-                format!("{}[proxy={}]", p.name, proxy)
-            })
-            .collect();
         println!(
-            "  - listen={} tls={} inbound_pp={} profiles={}",
+            "  listener {} (tls={}, inbound_pp={}):",
             plan.listen,
             plan.tls_enabled(),
             plan.inbound_proxy_protocol,
-            profiles.join(", "),
         );
+        for p in &plan.profiles {
+            let proxy = if let Some(raw) = &p.upstream.outbound_proxy {
+                redact_proxy_url(raw)
+            } else if p.upstream.outbound_proxy_direct {
+                "direct(override)".to_string()
+            } else {
+                "direct".to_string()
+            };
+            let pub_url = p
+                .matrix_proxy_public_url
+                .as_ref()
+                .map(|u| u.as_str().trim_end_matches('/').to_string())
+                .unwrap_or_else(|| "<auto-infer>".to_string());
+            let hs = p
+                .upstream
+                .upstream_matrix_server_url
+                .as_deref()
+                .or(p.upstream.upstream_matrix_server_name.as_deref())
+                .unwrap_or("<unknown>");
+            println!(
+                "    - {} | public={} -> upstream={} | outbound_proxy={} | pp={}/{}/{}",
+                p.name,
+                pub_url,
+                hs,
+                proxy,
+                p.matrix_proxy_protocol(),
+                p.auth_proxy_protocol(),
+                p.rtc_proxy_protocol(),
+            );
+        }
     }
     Ok(())
 }

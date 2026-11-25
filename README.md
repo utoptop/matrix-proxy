@@ -33,9 +33,9 @@ Designed for environments where direct connectivity to upstream Matrix homeserve
    - **Rollback-safe atomic swap**: Validates TOML, TLS certificates, discovery warmup, and new listener binds before touching live state.
    - **Graceful draining (`shutdown_grace_secs`)**, Slowloris defense (`header_read_timeout_secs`), concurrency semaphore (`max_concurrent_requests`), optional per-IP rate limiting (`rate_limit_rps`), and trusted-only `/_proxy/info` & Prometheus `/_proxy/metrics`.
 
-## Quick Start (Docker)
+## Quick Start (Docker — Multi-Arch `linux/amd64` + `linux/arm64`)
 
-Prebuilt `linux/amd64` images are published to both **Docker Hub** and **GitHub Container Registry (GHCR)**:
+Prebuilt native multi-arch (`linux/amd64` + `linux/arm64`) images are published to both **Docker Hub** and **GitHub Container Registry (GHCR)**:
 - Docker Hub: `utoptop/matrix-proxy:1.0` / `utoptop/matrix-proxy:latest`
 - GitHub Container Registry: `ghcr.io/utoptop/matrix-proxy:latest` / `ghcr.io/utoptop/matrix-proxy:1.0`
 
@@ -54,7 +54,7 @@ Mount the config directory to `/app/conf:ro` (as in [compose.yaml](compose.yaml)
 Run `matrix-proxy` on a server connected to your Tailscale tailnet (for example `100.64.0.10`), optionally routing outbound upstream traffic through a local SOCKS5/HTTP proxy:
 
 ```toml
-[server]
+[defaults]
 outbound_proxy = "socks5h://127.0.0.1:1080"
 outbound_no_proxy = ["127.0.0.1", "localhost", "100.64.0.0/10"]
 
@@ -164,26 +164,25 @@ backend bk_matrix_proxy
 - `GET /_proxy/metrics` — Prometheus exposition metrics (requests, active connections, upstream errors, PROXY Protocol retries, rate limits, reload counters; gated by `expose_info`).
 - `POST /_proxy/reload` — Trigger an immediate zero-downtime config & TLS certificate reload (gated by `expose_info`; alternatively edit `config.toml` directly or send `SIGHUP`).
 
-## Configuration Precedence
+## Configuration Structure & Precedence
 
-When global settings (`[server]`, `[upstream]`, `[routing]`, `[discovery]`) and per-profile settings (`[[proxies]]`) are both present, **the `[[proxies]]` block always takes precedence**:
+`config.toml` uses three clean layers where **per-node `[[proxies]]` settings always take precedence**:
 
-1. **`[[proxies]]` explicit fields** (e.g. custom `listen`, `outbound_proxy` including `"direct"`, `outbound_no_proxy`, `tls_cert_path = "off"`, `upstream_matrix_proxy_protocol`, `auth_mode`, timeouts).
-2. **Global default sections** (`[upstream]`, `[routing]`, `[discovery]`).
-3. **Global `[server]` settings** (`listen`, `outbound_proxy`, `outbound_no_proxy`, `inbound_proxy_protocol`, `tls_*`).
-4. **Built-in defaults**.
+1. **`[[proxies]]`** — Per-node settings (overrides anything in `[defaults]` or `[server]`: custom `listen`, `outbound_proxy` including `"direct"`, `outbound_no_proxy`, `tls_cert = "off"`, `upstream_matrix_proxy_protocol`, `auth_mode`, timeouts, etc.).
+2. **`[defaults]`** — Unified global defaults inherited by all `[[proxies]]` blocks (every key uses the exact same name inside `[[proxies]]`).
+3. **`[server]`** (with optional `[server.reload]` and `[server.tuning]`) — Shared listener, TLS, `trusted_proxies`, management ACL, hot reload, and connection tuning.
 
-See [config.example.toml](config.example.toml) for a complete, fully annotated reference covering all five deployment scenarios.
+Legacy flat `[server].*` and `[upstream]`/`[routing]`/`[discovery]` sections remain 100% backward compatible. See [config.example.toml](config.example.toml) for a complete reference.
 
-## Development & Testing
+## Development & Multi-Arch Build
 
 ```bash
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 
-# Build and push linux/amd64 images (Docker Hub + optional GHCR) via remote build node
-./scripts/build-utop.sh
+# Native multi-arch build & push (local ARM64 Mac + remote AMD64 utop -> unified manifest)
+./scripts/build-multiarch.sh
 ```
 
 ## License

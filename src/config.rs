@@ -93,13 +93,84 @@ impl std::fmt::Display for ProxyProtocol {
 #[serde(default)]
 pub struct Config {
     pub server: ServerConfig,
-    /// Legacy single-upstream sections (fully backward compatible when `[[proxies]]` is empty).
+    /// Unified global defaults inherited by every `[[proxies]]` block (any field set inside a
+    /// `[[proxies]]` block overrides `[defaults]`).
+    pub defaults: ProxyDefaultsConfig,
+    /// Legacy single-upstream / v1.0-v1.3 default sections (fully backward compatible).
     pub upstream: UpstreamConfig,
     pub routing: RoutingConfig,
     pub discovery: DiscoveryConfig,
-    /// Multi-upstream proxy profiles: each block can bind its own port OR share `server.listen` by domain.
+    /// Multi-upstream proxy profiles: each block can share `[server].listen` or bind its own port.
     #[serde(alias = "profiles")]
     pub proxies: Vec<ProxyProfileInput>,
+}
+
+/// Optional `[server.reload]` sub-table for hot reload and graceful draining.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ServerReloadConfig {
+    pub enabled: Option<bool>,
+    pub interval_secs: Option<u64>,
+    pub shutdown_grace_secs: Option<u64>,
+}
+
+/// Optional `[server.tuning]` sub-table for connection pooling, socket, and abuse protection knobs.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ServerTuningConfig {
+    pub max_rewrite_body_bytes: Option<usize>,
+    pub max_concurrent_requests: Option<usize>,
+    pub rate_limit_rps: Option<u64>,
+    pub rate_limit_burst: Option<u64>,
+    pub header_read_timeout_secs: Option<u64>,
+    pub pool_max_idle_per_host: Option<usize>,
+    pub pool_idle_timeout_secs: Option<u64>,
+    pub tcp_keepalive_secs: Option<u64>,
+    pub tcp_nodelay: Option<bool>,
+    #[serde(alias = "ppv2_pool_max_entries")]
+    pub proxy_protocol_pool_max_entries: Option<usize>,
+    pub listen_backlog: Option<u32>,
+}
+
+/// Unified `[defaults]` section holding all global proxy-node defaults.
+/// Every key here has the exact same name inside `[[proxies]]`; per-profile values always win.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ProxyDefaultsConfig {
+    /// Global outbound HTTP / HTTPS / SOCKS5 / SOCKS5h proxy (or `"direct"`).
+    pub outbound_proxy: Option<String>,
+    /// Global bypass list (hosts, `.suffix` domains, IPs, CIDRs such as `100.64.0.0/10`).
+    pub outbound_no_proxy: Option<Vec<String>>,
+    /// Standard HTTP forwarded IP header mode (`"replace"` | `"append"` | `"off"`).
+    pub client_ip_mode: Option<ClientIpMode>,
+    /// Default outbound PROXY Protocol (`"off"` | `"v1"` | `"v2"`).
+    #[serde(alias = "proxy_protocol")]
+    pub upstream_proxy_protocol: Option<ProxyProtocol>,
+    #[serde(alias = "matrix_proxy_protocol")]
+    pub upstream_matrix_proxy_protocol: Option<ProxyProtocol>,
+    #[serde(alias = "auth_proxy_protocol")]
+    pub upstream_auth_proxy_protocol: Option<ProxyProtocol>,
+    #[serde(alias = "rtc_proxy_protocol")]
+    pub upstream_rtc_proxy_protocol: Option<ProxyProtocol>,
+    #[serde(alias = "rewrite_origins")]
+    pub upstream_rewrite_origins: Option<Vec<String>>,
+    pub connect_timeout_secs: Option<u64>,
+    pub request_timeout_secs: Option<u64>,
+    pub danger_accept_invalid_certs: Option<bool>,
+
+    pub auth_mode: Option<AuthRouteMode>,
+    pub auth_prefix: Option<String>,
+    pub rtc_prefix: Option<String>,
+    pub proxy_prefix: Option<String>,
+    pub matrix_extra_prefixes: Option<Vec<String>>,
+    pub auth_matrix_prefixes: Option<Vec<String>>,
+
+    pub rewrite_issuer: Option<bool>,
+    pub force_msc2965_well_known: Option<bool>,
+    pub rewrite_auth_body: Option<bool>,
+    pub merge_upstream_well_known: Option<bool>,
+    pub identity_server_url: Option<String>,
+    pub cache_ttl_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -112,20 +183,26 @@ pub struct ServerConfig {
     /// Optional separate external Auth/OIDC proxy address (dual-URL mode).
     #[serde(alias = "public_auth_url")]
     pub matrix_proxy_public_auth_url: Option<String>,
+    #[serde(alias = "tls_cert")]
     pub tls_cert_path: Option<String>,
+    #[serde(alias = "tls_key")]
     pub tls_key_path: Option<String>,
     /// Inbound PROXY Protocol framing on accepted TCP connections (`"off"` | `"v1"` | `"v2"`).
     pub inbound_proxy_protocol: ProxyProtocol,
     /// Deprecated v1.1 alias for `inbound_proxy_protocol = "v2"`.
     #[serde(skip_serializing)]
     pub accept_proxy_v2: Option<bool>,
-    /// Global outbound HTTP / HTTPS / SOCKS5 / SOCKS5h proxy for all upstream requests (e.g. `socks5h://127.0.0.1:1080` or `http://127.0.0.1:7890`; set `"direct"` to ignore env proxies).
+    /// Legacy v1.3 location for global outbound proxy (prefer `[defaults].outbound_proxy`).
     pub outbound_proxy: Option<String>,
-    /// Global bypass list for `outbound_proxy` (hosts, `.suffix` domains, IPs, CIDRs such as `100.64.0.0/10` or `127.0.0.1`).
+    /// Legacy v1.3 location for global no-proxy list (prefer `[defaults].outbound_no_proxy`).
     pub outbound_no_proxy: Vec<String>,
     pub trust_forwarded_headers: bool,
     pub trusted_proxies: Vec<String>,
     pub expose_info: ExposeInfoMode,
+    /// Clean structured hot-reload & graceful drain settings (`[server.reload]`).
+    pub reload: Option<ServerReloadConfig>,
+    /// Clean structured performance & abuse protection settings (`[server.tuning]`).
+    pub tuning: Option<ServerTuningConfig>,
     pub max_rewrite_body_bytes: usize,
     pub max_concurrent_requests: usize,
     pub rate_limit_rps: u64,
@@ -173,6 +250,8 @@ impl Default for ServerConfig {
             trust_forwarded_headers: true,
             trusted_proxies: default_trusted_proxies(),
             expose_info: ExposeInfoMode::Trusted,
+            reload: None,
+            tuning: None,
             max_rewrite_body_bytes: 4 * 1024 * 1024,
             max_concurrent_requests: 10_000,
             rate_limit_rps: 0,
@@ -339,7 +418,9 @@ pub struct ProxyProfileInput {
     /// Optional separate proxy URL for Auth/OIDC in dual-URL deployments.
     #[serde(alias = "public_auth_url")]
     pub matrix_proxy_public_auth_url: Option<String>,
+    #[serde(alias = "tls_cert")]
     pub tls_cert_path: Option<String>,
+    #[serde(alias = "tls_key")]
     pub tls_key_path: Option<String>,
     pub inbound_proxy_protocol: Option<ProxyProtocol>,
     #[serde(skip_serializing)]
@@ -527,6 +608,7 @@ impl Config {
             Config::default()
         };
 
+        cfg.apply_structured_sections();
         cfg.apply_env_overrides()?;
         cfg.normalize_and_validate()?;
         Ok(cfg)
@@ -534,11 +616,139 @@ impl Config {
 
     pub fn from_toml_str(content: &str) -> Result<Self> {
         let mut cfg: Config = toml::from_str(content).context("failed to parse TOML config")?;
+        cfg.apply_structured_sections();
         cfg.normalize_and_validate()?;
         Ok(cfg)
     }
 
+    /// Folds the clean v1.4 structured sections (`[server.reload]`, `[server.tuning]`, `[defaults]`)
+    /// into normalized runtime fields while preserving 100% compatibility with legacy flat keys.
+    fn apply_structured_sections(&mut self) {
+        if let Some(reload) = self.server.reload.take() {
+            if let Some(v) = reload.enabled {
+                self.server.hot_reload = v;
+            }
+            if let Some(v) = reload.interval_secs {
+                self.server.hot_reload_interval_secs = v;
+            }
+            if let Some(v) = reload.shutdown_grace_secs {
+                self.server.shutdown_grace_secs = v;
+            }
+        }
+        if let Some(tuning) = self.server.tuning.take() {
+            if let Some(v) = tuning.max_rewrite_body_bytes {
+                self.server.max_rewrite_body_bytes = v;
+            }
+            if let Some(v) = tuning.max_concurrent_requests {
+                self.server.max_concurrent_requests = v;
+            }
+            if let Some(v) = tuning.rate_limit_rps {
+                self.server.rate_limit_rps = v;
+            }
+            if let Some(v) = tuning.rate_limit_burst {
+                self.server.rate_limit_burst = v;
+            }
+            if let Some(v) = tuning.header_read_timeout_secs {
+                self.server.header_read_timeout_secs = v;
+            }
+            if let Some(v) = tuning.pool_max_idle_per_host {
+                self.server.pool_max_idle_per_host = v;
+            }
+            if let Some(v) = tuning.pool_idle_timeout_secs {
+                self.server.pool_idle_timeout_secs = v;
+            }
+            if let Some(v) = tuning.tcp_keepalive_secs {
+                self.server.tcp_keepalive_secs = v;
+            }
+            if let Some(v) = tuning.tcp_nodelay {
+                self.server.tcp_nodelay = v;
+            }
+            if let Some(v) = tuning.proxy_protocol_pool_max_entries {
+                self.server.proxy_protocol_pool_max_entries = v;
+            }
+            if let Some(v) = tuning.listen_backlog {
+                self.server.listen_backlog = v;
+            }
+        }
+
+        // Fold `[defaults]` over legacy `[upstream]`/`[routing]`/`[discovery]`/`[server].outbound_*`
+        // (while individual `[[proxies]]` blocks still always take highest precedence!).
+        let d = std::mem::take(&mut self.defaults);
+        if let Some(v) = d.outbound_proxy {
+            self.server.outbound_proxy = Some(v);
+            self.upstream.outbound_proxy = None;
+        }
+        if let Some(v) = d.outbound_no_proxy {
+            self.server.outbound_no_proxy = v;
+            self.upstream.outbound_no_proxy.clear();
+        }
+        if let Some(v) = d.client_ip_mode {
+            self.upstream.client_ip_mode = v;
+        }
+        if let Some(v) = d.upstream_proxy_protocol {
+            self.upstream.upstream_proxy_protocol = v;
+        }
+        if let Some(v) = d.upstream_matrix_proxy_protocol {
+            self.upstream.upstream_matrix_proxy_protocol = Some(v);
+        }
+        if let Some(v) = d.upstream_auth_proxy_protocol {
+            self.upstream.upstream_auth_proxy_protocol = Some(v);
+        }
+        if let Some(v) = d.upstream_rtc_proxy_protocol {
+            self.upstream.upstream_rtc_proxy_protocol = Some(v);
+        }
+        if let Some(v) = d.upstream_rewrite_origins {
+            self.upstream.upstream_rewrite_origins = v;
+        }
+        if let Some(v) = d.connect_timeout_secs {
+            self.upstream.connect_timeout_secs = v;
+        }
+        if let Some(v) = d.request_timeout_secs {
+            self.upstream.request_timeout_secs = v;
+        }
+        if let Some(v) = d.danger_accept_invalid_certs {
+            self.upstream.danger_accept_invalid_certs = v;
+        }
+        if let Some(v) = d.auth_mode {
+            self.routing.auth_mode = v;
+        }
+        if let Some(v) = d.auth_prefix {
+            self.routing.auth_prefix = v;
+        }
+        if let Some(v) = d.rtc_prefix {
+            self.routing.rtc_prefix = v;
+        }
+        if let Some(v) = d.proxy_prefix {
+            self.routing.proxy_prefix = v;
+        }
+        if let Some(v) = d.matrix_extra_prefixes {
+            self.routing.matrix_extra_prefixes = v;
+        }
+        if let Some(v) = d.auth_matrix_prefixes {
+            self.routing.auth_matrix_prefixes = v;
+        }
+        if let Some(v) = d.rewrite_issuer {
+            self.discovery.rewrite_issuer = v;
+        }
+        if let Some(v) = d.force_msc2965_well_known {
+            self.discovery.force_msc2965_well_known = v;
+        }
+        if let Some(v) = d.rewrite_auth_body {
+            self.discovery.rewrite_auth_body = v;
+        }
+        if let Some(v) = d.merge_upstream_well_known {
+            self.discovery.merge_upstream_well_known = v;
+        }
+        if let Some(v) = d.identity_server_url {
+            self.discovery.identity_server_url = Some(v);
+        }
+        if let Some(v) = d.cache_ttl_secs {
+            self.discovery.cache_ttl_secs = v;
+        }
+    }
+
     pub fn into_runtime(mut self) -> Result<RuntimeConfig> {
+        self.apply_structured_sections();
         self.normalize_and_validate()?;
         let trusted_proxies = parse_trusted_proxies(&self.server.trusted_proxies)?;
         let profiles = self.build_profiles()?;
@@ -1999,6 +2209,87 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("identical proxy_prefix"));
+    }
+
+    #[test]
+    fn structured_v14_sections_and_defaults_precedence() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [server]
+            listen = "0.0.0.0:8080"
+            tls_cert = "/certs/global.pem"
+            tls_key = "/certs/global.key"
+            inbound_proxy_protocol = "off"
+
+            [server.reload]
+            enabled = true
+            interval_secs = 5
+            shutdown_grace_secs = 30
+
+            [server.tuning]
+            max_concurrent_requests = 5000
+            rate_limit_rps = 50
+            proxy_protocol_pool_max_entries = 2048
+
+            [defaults]
+            outbound_proxy = "socks5h://127.0.0.1:1080"
+            outbound_no_proxy = ["localhost", "100.64.0.0/10"]
+            client_ip_mode = "replace"
+            upstream_proxy_protocol = "off"
+            auth_mode = "root"
+            connect_timeout_secs = 12
+            cache_ttl_secs = 90
+
+            [[proxies]]
+            name = "inherits-defaults"
+            matrix_proxy_public_url = "https://one.example.com"
+            upstream_matrix_server_url = "https://hs1.example.org"
+
+            [[proxies]]
+            name = "overrides-defaults"
+            listen = "0.0.0.0:8081"
+            tls_cert = "off"
+            tls_key = "off"
+            matrix_proxy_public_url = "http://100.64.0.10:8081"
+            upstream_matrix_server_url = "https://hs2.example.org"
+            outbound_proxy = "direct"
+            outbound_no_proxy = []
+            auth_mode = "prefix"
+            connect_timeout_secs = 5
+            "#,
+        )
+        .unwrap()
+        .into_runtime()
+        .unwrap();
+
+        assert!(cfg.server.hot_reload);
+        assert_eq!(cfg.server.hot_reload_interval_secs, 5);
+        assert_eq!(cfg.server.shutdown_grace_secs, 30);
+        assert_eq!(cfg.server.max_concurrent_requests, 5000);
+        assert_eq!(cfg.server.rate_limit_rps, 50);
+        assert_eq!(cfg.server.proxy_protocol_pool_max_entries, 2048);
+
+        assert_eq!(cfg.listeners.len(), 2);
+        let p0 = &cfg.listeners[0].profiles[0];
+        assert!(cfg.listeners[0].tls_enabled());
+        assert_eq!(
+            p0.upstream.outbound_proxy.as_deref(),
+            Some("socks5h://127.0.0.1:1080")
+        );
+        assert_eq!(
+            p0.upstream.outbound_no_proxy,
+            vec!["localhost", "100.64.0.0/10"]
+        );
+        assert_eq!(p0.upstream.connect_timeout_secs, 12);
+        assert_eq!(p0.discovery.cache_ttl_secs, 90);
+
+        let p1 = &cfg.listeners[1].profiles[0];
+        assert!(!cfg.listeners[1].tls_enabled());
+        assert_eq!(p1.upstream.outbound_proxy, None);
+        assert!(p1.upstream.outbound_proxy_direct);
+        assert!(p1.upstream.outbound_no_proxy.is_empty());
+        assert_eq!(p1.routing.auth_mode, AuthRouteMode::Prefix);
+        assert_eq!(p1.upstream.connect_timeout_secs, 5);
     }
 
     #[test]

@@ -1,106 +1,37 @@
 # =============================================================================
-# matrix-proxy v1.3.1 — Complete Configuration Reference
+# matrix-proxy v1.4 — Clean Configuration Reference
 # =============================================================================
+# THREE SIMPLE LAYERS (Highest -> Lowest Precedence):
+#   1. `[[proxies]]`  — Per-node config (ALWAYS wins over `[defaults]` & `[server]`)
+#   2. `[defaults]`   — Global defaults shared by all `[[proxies]]` blocks
+#                       (every key here uses the exact same name inside `[[proxies]]`)
+#   3. `[server]`     — Server listener, TLS, trust allowlist, reload & tuning
 #
-# CONFIGURATION PRECEDENCE (Highest -> Lowest):
-#   1. Per-profile `[[proxies]]` settings ALWAYS win over global defaults.
-#      - Set `listen = "0.0.0.0:8081"` to give a profile its own port instead of `[server].listen`.
-#      - Set `outbound_proxy = "socks5h://..."` or `"direct"` to override `[server].outbound_proxy`.
-#      - Set `outbound_no_proxy = [...]` (or `[]`) to override `[server].outbound_no_proxy`.
-#      - Set `tls_cert_path = "off"` & `tls_key_path = "off"` on a dedicated port to disable
-#        global `[server]` TLS for plain `http://ip:port` (e.g. Tailscale / LAN) access.
-#   2. Global default sections: `[upstream]`, `[routing]`, `[discovery]`.
-#   3. Global server section: `[server]`.
-#   4. Built-in safe defaults.
-#
-# DEPLOYMENT ARCHITECTURES (All can be mixed freely inside ONE process):
-#   A. Shared port + host routing:
-#      Omit `listen` on multiple `[[proxies]]` blocks so they share `[server].listen`.
-#      Routing hosts are automatically extracted from `matrix_proxy_public_url`
-#      (and `matrix_proxy_public_auth_url` if set). No separate `domains` list is required.
-#   B. Dedicated port per upstream / Domainless `http://ip:port` (Tailscale / WireGuard / LAN):
-#      Assign a unique `listen` (e.g. `0.0.0.0:8081`) and `matrix_proxy_public_url = "http://100.64.0.10:8081"`.
-#      Zero domain name or TLS certificate needed — Tailscale encrypts the transport layer.
-#   C. Global or per-profile HTTP / HTTPS / SOCKS5 outbound proxy:
-#      Set `[server].outbound_proxy` once for all nodes, or configure/bypass per `[[proxies]]`.
-#
-# QUICK START & VALIDATION:
-#   cp config.example.toml config.toml
-#   docker run --rm -v ./:/app/conf:ro utoptop/matrix-proxy:1.0 --check-config --config /app/conf/config.toml
-#   docker compose up -d
+# QUICK COMMANDS:
+#   Validate : docker run --rm -v ./:/app/conf:ro utoptop/matrix-proxy:1.0 --check-config --config /app/conf/config.toml
+#   Start    : docker compose up -d
+#   Reload   : Save this file (auto-reloads in 2s), `docker kill -s HUP matrix-proxy`, or `POST /_proxy/reload`
 # =============================================================================
 
 
 # =============================================================================
-# 1. GLOBAL SERVER SETTINGS (`[server]`)
-# Applies to all listeners & profiles unless overridden inside a `[[proxies]]` block.
+# 1. SERVER (`[server]`, `[server.reload]`, `[server.tuning]`)
 # =============================================================================
 [server]
-# Default TCP listen address shared by all `[[proxies]]` blocks that omit `listen`.
-# Use "0.0.0.0:8080" inside Docker (and restrict host exposure via `ports: ["127.0.0.1:8910:8080"]`).
+# Default shared port for all `[[proxies]]` blocks that omit `listen`.
 listen = "0.0.0.0:8080"
 
-# Optional global native TLS termination (PEM certificate chain & private key).
-# Leave empty when TLS is terminated by Nginx / HAProxy / Caddy / Envoy, or when using plain
-# `http://ip:port` over Tailscale / WireGuard.
-# Individual dedicated-port profiles can override these paths OR set `"off"` to disable TLS.
-tls_cert_path = ""
-tls_key_path = ""
-
-# Global inbound PROXY Protocol framing on accepted TCP sockets:
-#   - "off" (default, recommended behind local HTTP reverse proxies or direct Tailscale access)
-#   - "v1"  (standard ASCII PROXY Protocol v1 header)
-#   - "v2"  (standard binary PROXY Protocol v2 header, e.g. L4 TCP passthrough / AWS NLB)
-# Security: ONLY physical TCP peers matching `trusted_proxies` are allowed to send PROXY Protocol frames.
-# Note: Dedicated-port `[[proxies]]` blocks may override `inbound_proxy_protocol` independently.
+# Inbound PROXY Protocol framing from edge proxies ("off" | "v1" | "v2").
+# Keep "off" behind local L7 HTTP proxies (Nginx/HAProxy HTTP) or direct Tailscale access.
 inbound_proxy_protocol = "off"
 
-# ---------------- Global Outbound Proxy (HTTP / HTTPS / SOCKS5) ----------------
-# Global outbound proxy applied to ALL upstream requests (Matrix API, Auth/OIDC, LiveKit RTC,
-# `.well-known` discovery, WebSocket tunnels, and outbound PROXY Protocol connections).
-# Ideal when the server hosting `matrix-proxy` cannot reach upstream Matrix homeservers directly.
-#
-# Supported formats:
-#   ""                                   -> Direct connection (or OS env proxy if set)
-#   "direct" / "none" / "off"            -> Force direct connection, ignoring OS HTTP_PROXY/ALL_PROXY env vars
-#   "http://127.0.0.1:7890"              -> Global HTTP forward/CONNECT proxy
-#   "http://user:pass@127.0.0.1:7890"    -> Global HTTP proxy with Basic auth (URL-encode special chars)
-#   "https://proxy.example.net:8443"     -> Global HTTPS proxy (TLS-encrypted CONNECT tunnel)
-#   "socks5://127.0.0.1:1080"            -> Global SOCKS5 proxy
-#   "socks5h://127.0.0.1:1080"           -> Global SOCKS5 proxy with remote DNS (RECOMMENDED against DNS blocks)
-#   "socks5h://user:pass@127.0.0.1:1080" -> Global SOCKS5h proxy with RFC 1929 username/password auth
-#
-# Precedence: Any `outbound_proxy` set inside a `[[proxies]]` block overrides this global value
-# (including setting `outbound_proxy = "direct"` to bypass the global proxy for a specific upstream).
-outbound_proxy = ""
+# Optional native TLS (leave empty when terminating TLS at Nginx/HAProxy/Caddy or using plain HTTP).
+# Dedicated-port `[[proxies]]` blocks can override `tls_cert`/`tls_key` or set `"off"` for plain HTTP.
+tls_cert = ""
+tls_key = ""
 
-# Global bypass list when `outbound_proxy` is enabled.
-# Matches consistently across HTTP, Discovery, WebSocket, and PROXY Protocol upstreams.
-# Supported rule types:
-#   - Exact hostnames       : "localhost", "origin.internal"
-#   - Domain suffixes       : ".internal", ".lan" (matches both `internal` and `a.internal`)
-#   - IPv4 / IPv6 literals  : "127.0.0.1", "::1"
-#   - IPv4 / IPv6 CIDRs     : "10.0.0.0/8", "100.64.0.0/10" (Tailscale), "192.168.0.0/16", "fc00::/7"
-#   - Wildcard              : "*" (bypass all)
-# Precedence: If a `[[proxies]]` block sets `outbound_no_proxy = [...]`, it replaces this list for that profile.
-outbound_no_proxy = [
-  "localhost",
-  "127.0.0.1",
-  "::1",
-  "10.0.0.0/8",
-  "100.64.0.0/10",
-  "172.16.0.0/12",
-  "192.168.0.0/16",
-]
-
-# ---------------- Real Client IP Trust & Management ACL ----------------
-# Trust incoming `X-Forwarded-For`, `X-Real-IP`, `Forwarded`, `X-Forwarded-Host`, and `X-Forwarded-Proto`
-# ONLY when the physical TCP peer belongs to `trusted_proxies` (anti-spoofing protection).
+# Only trust incoming X-Forwarded-* / Forwarded / inbound PROXY Protocol from `trusted_proxies`.
 trust_forwarded_headers = true
-
-# Trusted reverse-proxy IP / CIDR allowlist (loopback, Docker bridges, private LANs).
-# Tip: Add "100.64.0.0/10" ONLY if another reverse proxy forwards headers over Tailscale,
-# or if you want Tailscale peers to access `/_proxy/info`, `/_proxy/metrics`, and `/_proxy/reload`.
 trusted_proxies = [
   "127.0.0.1/32",
   "::1/128",
@@ -111,246 +42,157 @@ trusted_proxies = [
   "fe80::/10",
 ]
 
-# Access control for management endpoints (`/_proxy/info`, `/_proxy/metrics`, `POST /_proxy/reload`):
-#   - "trusted"  (recommended): allow only direct requests from `trusted_proxies`; return 403 publicly
-#   - "always"   : allow from any source (not recommended on public internet listeners)
-#   - "disabled" : disable management endpoints completely (return 404)
-# Note: `/_proxy/health` always returns 200 OK without exposing upstream configuration details.
+# Access control for `/_proxy/info`, `/_proxy/metrics`, and `POST /_proxy/reload`:
+#   "trusted" (recommended: 403 publicly) | "always" | "disabled"
 expose_info = "trusted"
 
-# ---------------- Performance, Connection Pooling & DoS Defense ----------------
-# Max response body size (bytes, default 4 MiB) buffered for Auth HTML/JSON/JS/CSS origin rewriting.
-# `/_matrix/*` sync, events, and media uploads/downloads always stream with zero buffering.
-max_rewrite_body_bytes = 4194304
-
-# Max concurrent in-flight requests per listener (returns 503 + Retry-After when saturated; 0 = unlimited).
-max_concurrent_requests = 10000
-
-# Optional per-client-IP token-bucket rate limit (requests/sec; 0 = disabled, ideal when Nginx/HAProxy limits).
-rate_limit_rps = 0
-rate_limit_burst = 200
-
-# HTTP/1.1 request header read timeout in seconds (Slowloris defense).
-header_read_timeout_secs = 15
-
-# Standard HTTP/HTTPS upstream connection pool tuning (with HTTP/2 adaptive flow control & 20s PING timeout).
-pool_max_idle_per_host = 128
-pool_idle_timeout_secs = 90
-
-# TCP socket tuning (`TCP_NODELAY` lowers Matrix JSON `/sync` latency; keepalive prevents silent NAT drops).
-tcp_keepalive_secs = 30
-tcp_nodelay = true
-
-# Max isolated `(upstream, protocol, client_ip)` entries in the outbound PROXY Protocol H2/H1 pool.
-proxy_protocol_pool_max_entries = 4096
-
-# TCP listen socket backlog size.
-listen_backlog = 4096
-
-# ---------------- Zero-Downtime Hot Reload & Graceful Drain ----------------
-# Automatically poll `config.toml` and any native TLS cert/key files for content changes and reload in place.
-# Invalid reloads are rejected safely while keeping the previous active configuration serving traffic.
-# Even when false, `SIGHUP` (`docker kill -s HUP matrix-proxy`) and `POST /_proxy/reload` remain active.
-hot_reload = true
-hot_reload_interval_secs = 2
-
-# Max seconds to wait for in-flight HTTP/2, `/sync`, and WebSocket connections to drain on SIGTERM/SIGINT.
+# Optional: zero-downtime hot reload & graceful draining (omit to use defaults below).
+[server.reload]
+enabled = true
+interval_secs = 2
 shutdown_grace_secs = 15
 
+# Optional: connection pooling, socket & DoS tuning (omit to use defaults below).
+[server.tuning]
+max_concurrent_requests = 10000
+rate_limit_rps = 0                  # 0 = disabled (let Nginx/HAProxy rate-limit at edge)
+rate_limit_burst = 200
+header_read_timeout_secs = 15
+max_rewrite_body_bytes = 4194304    # 4 MiB max buffer for Auth HTML/JSON rewriting
+pool_max_idle_per_host = 128
+pool_idle_timeout_secs = 90
+proxy_protocol_pool_max_entries = 4096
+tcp_keepalive_secs = 30
+tcp_nodelay = true
+listen_backlog = 4096
+
 
 # =============================================================================
-# 2. GLOBAL PROFILE DEFAULTS (`[upstream]`, `[routing]`, `[discovery]`)
-# Optional shared defaults inherited by EVERY `[[proxies]]` block below.
-# Any matching key specified inside a `[[proxies]]` block overrides these values.
+# 2. GLOBAL PROXY DEFAULTS (`[defaults]`)
+# Inherited by EVERY `[[proxies]]` block below. Set the exact same key inside
+# any `[[proxies]]` block to override it for that specific node.
 # =============================================================================
-[upstream]
-# Default HTTP client IP forwarding header strategy:
-#   - "replace" (recommended): overwrite X-Forwarded-For, X-Real-IP, and RFC 7239 Forwarded with real client IP
-#   - "append"               : append trusted hop to existing X-Forwarded-For chain
-#   - "off"                  : do not emit forwarded client IP headers
-client_ip_mode = "replace"
+[defaults]
+# Global outbound proxy for all upstreams (HTTP, Auth, RTC, Discovery, WebSocket & PROXY Protocol).
+# Supported values:
+#   ""                                   -> direct (or ambient OS env proxy)
+#   "direct"                             -> force direct, ignoring OS HTTP_PROXY/ALL_PROXY
+#   "http://[user:pass@]host:port"       -> HTTP proxy
+#   "https://[user:pass@]host:port"      -> TLS-encrypted HTTPS proxy
+#   "socks5://[user:pass@]host:port"     -> SOCKS5 proxy
+#   "socks5h://[user:pass@]host:port"    -> SOCKS5 proxy with remote DNS (recommended)
+outbound_proxy = ""
 
-# Default outbound PROXY Protocol version for all profiles ("off" | "v1" | "v2").
-# Keep "off" globally and enable per-profile ONLY for self-hosted upstreams expecting PROXY Protocol.
-upstream_proxy_protocol = "off"
+# Hosts / `.suffix` domains / IPs / CIDRs that bypass `outbound_proxy` globally.
+outbound_no_proxy = [
+  "localhost",
+  "127.0.0.1",
+  "::1",
+  "10.0.0.0/8",
+  "100.64.0.0/10",
+  "172.16.0.0/12",
+  "192.168.0.0/16",
+]
 
-# Default upstream TCP/TLS connect timeout (seconds) and full request timeout (0 = unlimited for long `/sync`).
-connect_timeout_secs = 15
-request_timeout_secs = 0
+# Client IP forwarding & outbound PROXY Protocol defaults:
+client_ip_mode = "replace"          # "replace" | "append" | "off"
+upstream_proxy_protocol = "off"     # "off" | "v1" | "v2" (MUST stay "off" for public servers)
 
-# Allow invalid/self-signed upstream TLS certificates (NEVER enable in production).
-danger_accept_invalid_certs = false
-
-[routing]
-# Default single-endpoint Auth routing mode:
-#   - "root"   (recommended): preserves root asset paths required by MAS / OIDC frontends
-#   - "prefix"              : mounts Auth endpoints under `auth_prefix` (e.g. `/_auth`)
-auth_mode = "root"
+# Routing, rewriting & discovery defaults:
+auth_mode = "root"                  # "root" (recommended for MAS/OIDC) | "prefix" (`/_auth`)
 auth_prefix = "/_auth"
 rtc_prefix = "/_rtc"
 proxy_prefix = "/_proxy"
-
-# Additional path prefixes always routed to Matrix or Auth (optional).
-matrix_extra_prefixes = []
-auth_matrix_prefixes = []
-
-[discovery]
-# Rewrite OIDC `issuer`, discovery endpoints, redirects, cookies, CSP, and Auth HTML/JSON responses.
 rewrite_issuer = true
-force_msc2965_well_known = false
 rewrite_auth_body = true
 merge_upstream_well_known = true
-# Optional global m.identity_server base_url override (leave empty to preserve upstream).
-identity_server_url = ""
-# Upstream `.well-known` and `auth_metadata` discovery cache TTL (seconds).
 cache_ttl_secs = 60
+
+# Upstream timeouts & TLS:
+connect_timeout_secs = 15
+request_timeout_secs = 0            # 0 = unlimited (required for Matrix long-poll `/sync`)
+danger_accept_invalid_certs = false
 
 
 # =============================================================================
-# 3. PER-UPSTREAM PROXY PROFILES (`[[proxies]]`)
-# Each block defines one proxied Matrix service. Any parameter set here takes
-# precedence over `[server]`, `[upstream]`, `[routing]`, and `[discovery]`.
+# 3. MATRIX PROXY NODES (`[[proxies]]`)
+# Routing hosts are automatically extracted from `matrix_proxy_public_url`
+# (no `domains` field required). Only specify keys that differ from `[defaults]`.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# Example 1 (Shared Port): Public Matrix Homeserver + Separate Auth/MAS
-# - Omits `listen` -> shares `[server].listen` (`0.0.0.0:8080`).
-# - Omits `outbound_proxy` -> inherits `[server].outbound_proxy` & `outbound_no_proxy`.
-# - Omits timeouts/auth_mode/discovery flags -> inherits global `[upstream]/[routing]/[discovery]`.
+# Node 1 (Shared Port): Public Matrix Homeserver + Separate Auth/MAS
+# Inherits `[server].listen` (`0.0.0.0:8080`) and all `[defaults]` settings.
 # -----------------------------------------------------------------------------
 [[proxies]]
 name = "matrix-primary"
-
-# Proxy URL entered by users in Matrix clients (`matrix1.example.com` is auto-extracted for routing).
 matrix_proxy_public_url = "https://matrix1.example.com"
-
-# Upstream Matrix Client-Server URL (required unless auto-discovered via `upstream_matrix_server_name`).
 upstream_matrix_server_url = "https://matrix-client.example.org"
-
-# Upstream Matrix Auth / MAS / OIDC URL (omit to auto-discover from `auth_metadata`; self-loop protected).
 upstream_matrix_auth_url = "https://account.example.org"
-
-# Optional upstream Matrix `server_name` for `.well-known/matrix/client` merging (follows up to 3 redirects).
 upstream_matrix_server_name = "example.org"
-
-# Optional upstream LiveKit JWT / Element Call RTC endpoint (automatically exposed at `/_rtc`).
 upstream_matrix_rtc_url = "https://livekit-jwt.example.org"
-
-# Public third-party upstreams MUST keep outbound PROXY Protocol `"off"`.
-upstream_matrix_proxy_protocol = "off"
-upstream_auth_proxy_protocol = "off"
-upstream_rtc_proxy_protocol = "off"
 
 
 # -----------------------------------------------------------------------------
-# Example 2 (Shared Port + Outbound PROXY Protocol v2 + Per-Profile Direct Bypass)
-# - Shares `[server].listen` (`0.0.0.0:8080`) with Example 1, routed by `matrix2.example.com`.
-# - Overrides global `[server].outbound_proxy` with `"direct"` so traffic goes directly to your origin.
-# - Sends standard PROXY Protocol v2 toward Nginx (`listen 8443 ssl proxy_protocol`) or HAProxy (`accept-proxy`).
+# Node 2 (Shared Port + PROXY Protocol v2 + Per-Node Direct Bypass)
+# Overrides `[defaults]` to send PROXY Protocol v2 to a self-hosted Nginx/HAProxy
+# upstream on :8443 and bypasses any global `outbound_proxy` with `"direct"`.
 # -----------------------------------------------------------------------------
 [[proxies]]
 name = "selfhosted-pp"
 matrix_proxy_public_url = "https://matrix2.example.com"
-
-# Connect directly to an upstream port listening with PROXY Protocol (e.g. Nginx/HAProxy on 8443).
 upstream_matrix_server_url = "https://origin.example.net:8443"
 upstream_matrix_auth_url = "https://origin.example.net:8443"
 upstream_matrix_server_name = "origin.example.net"
 upstream_matrix_rtc_url = "https://rtc.example.net"
-
-# Optional Host header overrides (only needed when upstream URL uses a custom port or internal IP).
 upstream_matrix_host_header = "origin.example.net"
 upstream_auth_host_header = "origin.example.net"
-
-# Enable standard PROXY Protocol per upstream service ("off" | "v1" | "v2").
-# Connections are pooled per `(upstream, protocol, client_ip)` with H2 multiplexing and zero IP leakage.
 upstream_matrix_proxy_protocol = "v2"
 upstream_auth_proxy_protocol = "v2"
 upstream_rtc_proxy_protocol = "off"
-
-# Per-profile override: explicitly bypass `[server].outbound_proxy` and connect directly!
 outbound_proxy = "direct"
-
-# Extra upstream origins to rewrite (when origin metadata/HTML advertises another public domain).
 upstream_rewrite_origins = ["https://public-origin.example.net"]
 
 
 # -----------------------------------------------------------------------------
-# Example 3 (Dedicated Port + Domainless Tailscale `http://ip:port` + Per-Profile SOCKS5h)
-# Uncomment below (and expose host port 8081 in compose.yaml) to access a Matrix server
-# directly via Tailscale IP without any domain name or TLS certificate.
+# Node 3 (Optional Dedicated Port + Domainless Tailscale `http://ip:port` + SOCKS5h)
+# Uncomment below & expose port 8081 in compose.yaml — zero domain or TLS cert needed!
 # -----------------------------------------------------------------------------
 # [[proxies]]
 # name = "tailscale-matrix-org"
-#
-# # Dedicated listener port for this profile (overrides `[server].listen`).
-# # You can bind specifically to your Tailscale IP (e.g. "100.64.0.10:8081") or "0.0.0.0:8081".
-# listen = "0.0.0.0:8081"
-#
-# # If `[server]` has native TLS enabled on 8080, set `"off"` here to keep this Tailscale port plain HTTP.
-# tls_cert_path = "off"
-# tls_key_path = "off"
-# inbound_proxy_protocol = "off"
-#
-# # Enter `http://100.64.0.10:8081` directly in Element / Cinny / FluffyChat over Tailscale!
-# # Plain-HTTP mode automatically strips `Secure`/HSTS, downgrades `SameSite=None` -> `SameSite=Lax`,
-# # and removes CSP `upgrade-insecure-requests` so web OIDC/MAS logins work seamlessly.
-# matrix_proxy_public_url = "http://100.64.0.10:8081"
-#
+# listen = "0.0.0.0:8081"                                  # Dedicated port (overrides [server].listen)
+# tls_cert = "off"                                         # Force plain HTTP even if [server] enables TLS
+# tls_key = "off"
+# matrix_proxy_public_url = "http://100.64.0.10:8081"      # Enter directly in Element / Cinny over Tailscale
 # upstream_matrix_server_url = "https://matrix-client.matrix.org"
 # upstream_matrix_auth_url = "https://account.matrix.org"
 # upstream_matrix_server_name = "matrix.org"
 # upstream_matrix_rtc_url = "https://livekit-jwt.call.matrix.org"
-#
-# # Per-profile outbound SOCKS5h proxy override (takes precedence over `[server].outbound_proxy`).
-# # Supports optional RFC 1929 authentication (`user:pass@`).
-# outbound_proxy = "socks5h://proxyuser:proxypass@127.0.0.1:1080"
-# # Optional per-profile `outbound_no_proxy` override (replaces `[server].outbound_no_proxy` for this profile).
+# outbound_proxy = "socks5h://user:pass@127.0.0.1:1080"    # Per-node SOCKS5h override (wins over [defaults])
 # outbound_no_proxy = ["127.0.0.1", "100.64.0.0/10"]
-#
-# upstream_proxy_protocol = "off"
-# client_ip_mode = "replace"
-# auth_mode = "root"
-# rewrite_issuer = true
-# rewrite_auth_body = true
-# merge_upstream_well_known = true
 
 
 # -----------------------------------------------------------------------------
-# Example 4 (Dedicated Port + Per-Profile HTTP Proxy + Prefix Auth Mode `/_auth`)
-# Uncomment below (and expose port 8082 in compose.yaml) if you want an isolated port
-# using an HTTP outbound proxy and `/_auth` path prefix routing.
+# Node 4 (Optional Dedicated Port + Per-Node HTTP Proxy + Prefix Auth `/_auth`)
 # -----------------------------------------------------------------------------
 # [[proxies]]
 # name = "dedicated-http-proxy"
 # listen = "0.0.0.0:8082"
-# # Reject requests whose Host does not match `matrix_proxy_public_url`, even on a dedicated port.
 # strict_host_match = true
-#
 # matrix_proxy_public_url = "https://matrix3.example.com"
 # upstream_matrix_server_url = "https://homeserver.example.net"
 # upstream_matrix_auth_url = "https://auth.example.net"
-#
-# # Per-profile HTTP outbound proxy override (takes precedence over `[server].outbound_proxy`).
 # outbound_proxy = "http://127.0.0.1:7890"
-#
-# # Per-profile routing & timeout overrides (override global `[routing]` & `[upstream]`).
 # auth_mode = "prefix"
-# auth_prefix = "/_auth"
 # connect_timeout_secs = 10
-# request_timeout_secs = 0
-# cache_ttl_secs = 30
 
 
 # -----------------------------------------------------------------------------
-# Example 5 (Dual-URL Mode + Shared-Port Fallback Profile)
-# Uncomment if you expose Matrix and Auth on two distinct domains/URLs or want a
-# catch-all fallback profile (`default = true`) on a shared port.
+# Node 5 (Optional Dual-URL Mode + Shared-Port Fallback)
 # -----------------------------------------------------------------------------
 # [[proxies]]
 # name = "dual-url-fallback"
-# # Handles unmatched Host headers on `[server].listen` (at most one profile per port may set `default = true`).
-# default = true
+# default = true                                           # Fallback for unmatched Host on [server].listen
 # matrix_proxy_public_url = "https://matrix-dual.example.com"
 # matrix_proxy_public_auth_url = "https://auth-dual.example.com"
 # upstream_matrix_server_url = "https://hs-dual.example.org"

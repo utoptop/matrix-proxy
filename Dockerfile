@@ -3,17 +3,23 @@
 FROM rust:1.93.1-bookworm AS builder
 WORKDIR /app
 
+ARG CARGO_BUILD_JOBS
+
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    cargo build --release --locked --bin matrix-proxy
+    if [ -n "${CARGO_BUILD_JOBS}" ]; then \
+      cargo build --release --locked --bin matrix-proxy -j "${CARGO_BUILD_JOBS}"; \
+    else \
+      cargo build --release --locked --bin matrix-proxy; \
+    fi
 
 FROM debian:bookworm-slim AS runtime
 LABEL org.opencontainers.image.title="matrix-proxy" \
       org.opencontainers.image.description="High-performance multi-tenant Rust reverse proxy for Matrix Client-Server and Matrix Auth (MAS/OIDC) with auto-discovery, HTTP/IP:port & Tailscale support, global HTTP/SOCKS5 outbound proxy, zero-downtime hot reload, and standard PROXY Protocol v1/v2" \
-      org.opencontainers.image.version="1.3.1" \
+      org.opencontainers.image.version="1.4.0" \
       org.opencontainers.image.source="https://github.com/utoptop/matrix-proxy" \
       org.opencontainers.image.licenses="MIT"
 
