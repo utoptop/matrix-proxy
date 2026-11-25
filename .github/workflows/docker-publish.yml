@@ -23,8 +23,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain (matches Dockerfile)
+        uses: dtolnay/rust-toolchain@1.93.1
         with:
           components: rustfmt, clippy
 
