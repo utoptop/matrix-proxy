@@ -29,10 +29,11 @@ Designed for environments where direct connectivity to upstream Matrix homeserve
    - **Anti-spoofing allowlist (`server.trusted_proxies`)**: Only trusts incoming forwarded headers and inbound PROXY Protocol frames when the physical TCP peer belongs to configured trusted CIDRs.
    - **Standard HTTP headers (`client_ip_mode = "replace" | "append" | "off"`)**: Injects clean `X-Forwarded-For`, `X-Real-IP`, and RFC 7239 `Forwarded` headers upstream.
    - **Standard PROXY Protocol v1 & v2 (`"off" | "v1" | "v2"`)**: Vendor-neutral inbound (`inbound_proxy_protocol`) and per-target outbound (`upstream_matrix_proxy_protocol`, `upstream_auth_proxy_protocol`, `upstream_rtc_proxy_protocol`) support compatible with **Nginx (`proxy_protocol`)**, **HAProxy (`accept-proxy`/`send-proxy-v2`)**, **Envoy**, **Traefik**, **Caddy**, and **AWS NLB**.
-   - Maintains a bounded `(upstream, protocol, client_ip)`-isolated TLS 1.3 + HTTP/2 multiplexed connection pool (zero cross-client IP leakage) with **automatic single retry on stale idle connections** and WebSocket PROXY Protocol support.
+   - Maintains a bounded `(upstream, protocol, client_ip)`-isolated TLS 1.3 + HTTP/2 multiplexed connection pool (zero cross-client IP leakage) with **cold-dial singleflight coalescing**, **automatic single retry on stale idle connections**, high-BDP HTTP/2 flow-control windows (`1 MiB` stream / `4 MiB` connection), and WebSocket PROXY Protocol support.
 
-5. **Zero-Downtime Hot Reload, Graceful Draining & Observability**
-   - **Three reload triggers**: automatic file & TLS cert watcher (`hot_reload = true`, default 2s polling with debounce), Unix `SIGHUP` (`docker kill -s HUP matrix-proxy`), and `POST /_proxy/reload`.
+5. **Zero-Downtime Hot Reload, Caching, Graceful Draining & Observability**
+   - **Low-latency caching & Stale-While-Revalidate (SWR)**: Non-blocking SWR upstream discovery refresh and singleflight TTL caching for `auth_metadata` / OIDC discovery documents (with stale-on-error fallback and `Cache-Control`) keep hot-path latency sub-millisecond with zero per-request header cloning.
+   - **Three reload triggers**: non-blocking metadata-first file & TLS cert watcher (`hot_reload = true`, default 2s polling with debounce), Unix `SIGHUP` (`docker kill -s HUP matrix-proxy`), and `POST /_proxy/reload`.
    - **Rollback-safe atomic swap**: Validates TOML, TLS certificates, discovery warmup, and new listener binds before touching live state.
    - **Graceful draining (`shutdown_grace_secs`)**, Slowloris defense (`header_read_timeout_secs`), concurrency semaphore (`max_concurrent_requests`), optional per-IP rate limiting (`rate_limit_rps`), and trusted-only `/_proxy/info` & Prometheus `/_proxy/metrics`.
 

@@ -154,13 +154,14 @@ pub fn classify_request(
 ) -> RouteTarget {
     let pq = join_pq(path, query);
 
-    let health_path = format!("{}/health", profile.routing.proxy_prefix);
-    if path == health_path || path == format!("{health_path}/") {
-        return RouteTarget::ProxyHealth;
-    }
-    let info_path = format!("{}/info", profile.routing.proxy_prefix);
-    if path == info_path || path == format!("{info_path}/") {
-        return RouteTarget::ProxyInfo;
+    let proxy_prefix = profile.routing.proxy_prefix.trim_end_matches('/');
+    if let Some(rest) = path.strip_prefix(proxy_prefix) {
+        if rest == "/health" || rest == "/health/" {
+            return RouteTarget::ProxyHealth;
+        }
+        if rest == "/info" || rest == "/info/" {
+            return RouteTarget::ProxyInfo;
+        }
     }
 
     // Dual-domain host routing within one profile (`public_url` + `public_auth_url`)
@@ -262,6 +263,9 @@ fn is_matrix_path(path: &str, extra_prefixes: &[String]) -> bool {
 }
 
 fn match_oidc_discovery_path(path: &str, auth_prefix: Option<&str>) -> Option<String> {
+    if !path.contains(".well-known/") {
+        return None;
+    }
     const WELL_KNOWN_DOCS: [&str; 2] = [
         "/.well-known/openid-configuration",
         "/.well-known/oauth-authorization-server",
@@ -272,7 +276,8 @@ fn match_oidc_discovery_path(path: &str, auth_prefix: Option<&str>) -> Option<St
             return Some(doc.to_string());
         }
         if let Some(prefix) = auth_prefix
-            && (path == format!("{prefix}{doc}") || path == format!("{doc}{prefix}"))
+            && ((path.starts_with(prefix) && path[prefix.len()..] == *doc)
+                || (path.starts_with(doc) && path[doc.len()..] == *prefix))
         {
             return Some(doc.to_string());
         }

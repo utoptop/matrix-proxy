@@ -1849,3 +1849,81 @@ async fn auth_proxy_mode_token_only_and_direct_preserve_interactive_login() {
         format!("{}/account/graphql", cluster.auth_url)
     );
 }
+
+#[tokio::test]
+async fn auth_metadata_cache_coalesces_upstream_fetches_and_preserves_dynamic_hosts() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hs_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hs_addr = hs_listener.local_addr().unwrap();
+    let hs_url = format!("http://{hs_addr}");
+    let hits_clone = Arc::clone(&hits);
+    let hs_url_clone = hs_url.clone();
+
+    let hs_app = Router::new().route(
+        "/_matrix/client/v1/auth_metadata",
+        get(move || {
+            let hits = Arc::clone(&hits_clone);
+            let base = hs_url_clone.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                let doc = json!({
+                    "issuer": format!("{base}/"),
+                    "authorization_endpoint": format!("{base}/authorize"),
+                    "token_endpoint": format!("{base}/oauth2/token"),
+                });
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(doc.to_string()))
+                    .unwrap()
+            }
+        }),
+    );
+    tokio::spawn(async move {
+        let _ = axum::serve(hs_listener, hs_app).await;
+    });
+
+    let mut cfg = Config::default();
+    cfg.upstream.upstream_matrix_server_url = Some(hs_url.clone());
+    cfg.upstream.upstream_matrix_auth_url = Some(hs_url);
+    cfg.discovery.merge_upstream_well_known = false;
+    cfg.discovery.cache_ttl_secs = 60;
+
+    let app = build_single_listener_app(cfg).await;
+    let hits_after_startup = hits.load(Ordering::SeqCst);
+
+    // 5 consecutive requests across 2 different X-Forwarded-Host values should only trigger 1 upstream fetch
+    for i in 0..5 {
+        let host = if i % 2 == 0 {
+            "edge-a.example.net"
+        } else {
+            "edge-b.example.net"
+        };
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/_matrix/client/v1/auth_metadata")
+                    .header("x-forwarded-proto", "https")
+                    .header("x-forwarded-host", host)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=60"
+        );
+        let meta = body_json(resp).await;
+        assert_eq!(
+            meta["token_endpoint"],
+            format!("https://{host}/oauth2/token")
+        );
+    }
+
+    assert_eq!(hits.load(Ordering::SeqCst) - hits_after_startup, 1);
+}

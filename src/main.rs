@@ -27,7 +27,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
@@ -555,13 +555,37 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-type FileSnapshot = Vec<(PathBuf, Option<Vec<u8>>)>;
+type FileMetaSnapshot = Vec<(PathBuf, Option<(Option<SystemTime>, u64)>)>;
+type FileContentSnapshot = Vec<(PathBuf, Option<Vec<u8>>)>;
 
-fn snapshot_files(paths: &[PathBuf]) -> FileSnapshot {
-    paths
-        .iter()
-        .map(|p| (p.clone(), std::fs::read(p).ok()))
-        .collect()
+async fn snapshot_metadata_async(paths: Vec<PathBuf>) -> FileMetaSnapshot {
+    tokio::task::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .map(|p| {
+                let meta = std::fs::metadata(&p)
+                    .ok()
+                    .map(|m| (m.modified().ok(), m.len()));
+                (p, meta)
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+async fn snapshot_contents_async(paths: Vec<PathBuf>) -> FileContentSnapshot {
+    tokio::task::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .map(|p| {
+                let bytes = std::fs::read(&p).ok();
+                (p, bytes)
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 async fn run_file_watcher(
@@ -569,7 +593,9 @@ async fn run_file_watcher(
     interval: Duration,
     mut stop: watch::Receiver<bool>,
 ) {
-    let mut last_snapshot = snapshot_files(&coordinator.watched_paths());
+    let initial_paths = coordinator.watched_paths();
+    let mut last_meta = snapshot_metadata_async(initial_paths.clone()).await;
+    let mut last_contents = snapshot_contents_async(initial_paths).await;
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker.tick().await; // consume immediate first tick
@@ -583,23 +609,31 @@ async fn run_file_watcher(
             }
             _ = ticker.tick() => {
                 let paths = coordinator.watched_paths();
-                let current = snapshot_files(&paths);
-                if current != last_snapshot {
-                    // Brief debounce so editors/scripts finish writing the complete file before reload.
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    let settled = snapshot_files(&coordinator.watched_paths());
-                    if settled != last_snapshot {
-                        let config_present = settled
-                            .first()
-                            .and_then(|(_, bytes)| bytes.as_ref())
-                            .is_some_and(|b| !b.is_empty());
-                        if config_present {
-                            info!("detected configuration or TLS certificate change; triggering hot reload");
-                            let _ = coordinator.reload("file_change").await;
+                // Fast stat-only check on blocking pool: zero file reads when mtime+len are unchanged.
+                let current_meta = snapshot_metadata_async(paths.clone()).await;
+                if current_meta != last_meta {
+                    let current_contents = snapshot_contents_async(paths).await;
+                    if current_contents != last_contents {
+                        // Brief debounce so editors/scripts finish writing the complete file before reload.
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        let settled_paths = coordinator.watched_paths();
+                        let settled_contents = snapshot_contents_async(settled_paths).await;
+                        if settled_contents != last_contents {
+                            let config_present = settled_contents
+                                .first()
+                                .and_then(|(_, bytes)| bytes.as_ref())
+                                .is_some_and(|b| !b.is_empty());
+                            if config_present {
+                                info!("detected configuration or TLS certificate change; triggering hot reload");
+                                let _ = coordinator.reload("file_change").await;
+                            }
+                            let refreshed_paths = coordinator.watched_paths();
+                            last_meta = snapshot_metadata_async(refreshed_paths.clone()).await;
+                            last_contents = snapshot_contents_async(refreshed_paths).await;
+                            continue;
                         }
-                        // Advance baseline using refreshed watch list so broken configs don't spam logs every tick.
-                        last_snapshot = snapshot_files(&coordinator.watched_paths());
                     }
+                    last_meta = current_meta;
                 }
             }
         }
@@ -744,6 +778,9 @@ async fn serve_listener(
                         .http2()
                         .timer(TokioTimer::new())
                         .adaptive_window(true)
+                        .initial_stream_window_size(1024 * 1024)
+                        .initial_connection_window_size(4 * 1024 * 1024)
+                        .max_concurrent_streams(256)
                         .keep_alive_interval(Duration::from_secs(30))
                         .keep_alive_timeout(Duration::from_secs(20));
 
@@ -1109,8 +1146,8 @@ fn collect_health_check_targets(config_path: Option<&Path>) -> Result<Vec<Health
 }
 
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("matrix_proxy=info,tower_http=info"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("matrix_proxy=info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)

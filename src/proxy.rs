@@ -1,7 +1,7 @@
 use crate::client_ip::{ClientInfo, InboundPeer, IpRateLimiter, apply_upstream_client_ip_headers};
 use crate::config::{
-    ExposeInfoMode, ListenerPlan, ProxyProfile, ProxyProtocol, RuntimeConfig, ServerConfig,
-    normalized_base_url, redact_proxy_url, should_bypass_outbound_proxy,
+    AuthProxyMode, ExposeInfoMode, ListenerPlan, ProxyProfile, ProxyProtocol, RuntimeConfig,
+    ServerConfig, normalized_base_url, redact_proxy_url, should_bypass_outbound_proxy,
 };
 use crate::discovery::{DiscoveryManager, ResolvedUpstreams};
 use crate::metrics::ProxyMetrics;
@@ -345,6 +345,8 @@ fn build_http_client(
         .pool_idle_timeout(Duration::from_secs(server.pool_idle_timeout_secs))
         .tcp_nodelay(server.tcp_nodelay)
         .http2_adaptive_window(true)
+        .http2_initial_stream_window_size(1024 * 1024)
+        .http2_initial_connection_window_size(4 * 1024 * 1024)
         .http2_keep_alive_interval(Duration::from_secs(30))
         .http2_keep_alive_timeout(Duration::from_secs(20))
         .http2_keep_alive_while_idle(true);
@@ -397,23 +399,24 @@ async fn handle_request(
 ) -> Response<Body> {
     let state = live.current();
     let method = req.method().clone();
-    let path = req.uri().path().to_string();
-    let query = req.uri().query().map(ToString::to_string);
 
     // 1. Fast-path listener liveness probe (always 200 OK regardless of Host header or upstream state).
-    if path == state.health_path || path == state.health_path_slash {
-        return json_response(
-            StatusCode::OK,
-            &json!({
-                "status": "ok",
-                "service": "matrix-proxy",
-                "version": env!("CARGO_PKG_VERSION"),
-                "generation": live.metrics.generation(),
-                "listener": state.plan.listen.to_string(),
-                "profiles": state.vhost.instances().len(),
-            }),
-            false,
-        );
+    {
+        let path = req.uri().path();
+        if path == state.health_path || path == state.health_path_slash {
+            return json_response(
+                StatusCode::OK,
+                &json!({
+                    "status": "ok",
+                    "service": "matrix-proxy",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "generation": live.metrics.generation(),
+                    "listener": state.plan.listen.to_string(),
+                    "profiles": state.vhost.instances().len(),
+                }),
+                false,
+            );
+        }
     }
 
     let _req_guard = live.metrics.track_request();
@@ -440,7 +443,7 @@ async fn handle_request(
         None
     };
 
-    // 3. Extract verified real client IP (anti-spoofing protected; preserves physical peer across inbound PPv2).
+    // 3. Extract verified real client IP (anti-spoofing protected; borrows headers with zero clone).
     let inbound = req
         .extensions()
         .get::<InboundPeer>()
@@ -457,12 +460,11 @@ async fn handle_request(
             }
         });
 
-    let headers = req.headers().clone();
     let client = ClientInfo::extract_with_ppv2(
         &state.runtime,
         inbound.physical_peer,
         inbound.ppv2_client,
-        &headers,
+        req.headers(),
         state.listener_is_tls,
     );
 
@@ -483,10 +485,10 @@ async fn handle_request(
         return resp;
     }
 
-    let req_host = extract_request_host(&client, &headers);
+    let req_host = extract_request_host(&client, req.headers());
 
     // 5. Listener-level management endpoints (`/info`, `/metrics`, `POST /reload`) gated by `expose_info` ACL.
-    if path == state.info_path || path == state.info_path_slash {
+    if req.uri().path() == state.info_path || req.uri().path() == state.info_path_slash {
         if let Some(denied) = check_info_access(&state, &client) {
             return denied;
         }
@@ -496,7 +498,7 @@ async fn handle_request(
             let public = PublicContext::from_request(
                 &inst.profile,
                 &client,
-                &headers,
+                req.headers(),
                 upstreams.rtc_url.is_some(),
             );
             return handle_profile_info(&state, &live.metrics, &inst, &public, &upstreams, &client);
@@ -504,7 +506,7 @@ async fn handle_request(
         return handle_listener_summary_info(&state, &live.metrics, &client);
     }
 
-    if path == state.metrics_path || path == state.metrics_path_slash {
+    if req.uri().path() == state.metrics_path || req.uri().path() == state.metrics_path_slash {
         if let Some(denied) = check_info_access(&state, &client) {
             return denied;
         }
@@ -522,7 +524,7 @@ async fn handle_request(
             .unwrap_or_else(|_| Response::new(Body::empty()));
     }
 
-    if path == state.reload_path || path == state.reload_path_slash {
+    if req.uri().path() == state.reload_path || req.uri().path() == state.reload_path_slash {
         if let Some(denied) = check_info_access(&state, &client) {
             return denied;
         }
@@ -583,7 +585,7 @@ async fn handle_request(
                 .fetch_add(1, Ordering::Relaxed);
             error!(
                 profile = %inst.profile.name,
-                error = %err,
+                error = %format!("{err:#}"),
                 "failed to resolve upstream Matrix/Auth endpoints"
             );
             return json_error(
@@ -597,7 +599,7 @@ async fn handle_request(
     let public = PublicContext::from_request(
         &inst.profile,
         &client,
-        &headers,
+        req.headers(),
         upstreams.rtc_url.is_some(),
     );
     let target = classify_request(
@@ -605,16 +607,16 @@ async fn handle_request(
         &public,
         &upstreams,
         &client,
-        &headers,
-        &path,
-        query.as_deref(),
+        req.headers(),
+        req.uri().path(),
+        req.uri().query(),
     );
 
     debug!(
         profile = %inst.profile.name,
         client_ip = %client.client_ip,
         method = %method,
-        path = %path,
+        path = %req.uri().path(),
         target = ?target,
         "routing request"
     );
@@ -640,21 +642,21 @@ async fn handle_request(
 
         RouteTarget::WellKnownMatrixClient => {
             if method == Method::OPTIONS {
-                return cors_preflight_response(&headers, false);
+                return cors_preflight_response(req.headers(), false);
             }
             let rewriter = RewriteEngine::new(&inst.profile, &public, &upstreams);
             let doc = rewriter.build_well_known_client();
             let mut resp = json_response(StatusCode::OK, &doc, true);
             resp.headers_mut().insert(
                 http::header::CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=60"),
+                cache_control_header(inst.discovery.cache_ttl().as_secs()),
             );
             resp
         }
 
         RouteTarget::AuthMetadata { requested_path } => {
             if method == Method::OPTIONS {
-                return cors_preflight_response(&headers, false);
+                return cors_preflight_response(req.headers(), false);
             }
             handle_auth_metadata(
                 &inst,
@@ -662,14 +664,14 @@ async fn handle_request(
                 &upstreams,
                 &client,
                 &requested_path,
-                &headers,
+                req.headers(),
             )
             .await
         }
 
         RouteTarget::OidcDiscovery { upstream_path } => {
             if method == Method::OPTIONS {
-                return cors_preflight_response(&headers, false);
+                return cors_preflight_response(req.headers(), false);
             }
             handle_oidc_discovery(
                 &inst,
@@ -677,7 +679,7 @@ async fn handle_request(
                 &upstreams,
                 &client,
                 &upstream_path,
-                &headers,
+                req.headers(),
             )
             .await
         }
@@ -686,7 +688,7 @@ async fn handle_request(
             upstream_path_and_query,
         } => {
             if method == Method::OPTIONS {
-                return cors_preflight_response(&headers, false);
+                return cors_preflight_response(req.headers(), false);
             }
             let target_url =
                 build_upstream_target_url(&upstreams.matrix_url, &upstream_path_and_query);
@@ -709,7 +711,7 @@ async fn handle_request(
             stripped_prefix,
         } => {
             if method == Method::OPTIONS {
-                return cors_preflight_response(&headers, true);
+                return cors_preflight_response(req.headers(), true);
             }
             let auth_base = upstreams.effective_auth_url();
             let target_url = build_upstream_target_url(auth_base, &upstream_path_and_query);
@@ -731,7 +733,7 @@ async fn handle_request(
             upstream_path_and_query,
         } => {
             if method == Method::OPTIONS {
-                return cors_preflight_response(&headers, false);
+                return cors_preflight_response(req.headers(), false);
             }
             let Some(rtc_base) = &upstreams.rtc_url else {
                 return json_error(
@@ -882,6 +884,27 @@ fn handle_profile_info(
     json_response(StatusCode::OK, &body, false)
 }
 
+fn cache_control_header(ttl_secs: u64) -> HeaderValue {
+    HeaderValue::from_str(&format!("public, max-age={}", ttl_secs.max(1)))
+        .unwrap_or_else(|_| HeaderValue::from_static("public, max-age=60"))
+}
+
+fn build_rewritten_metadata_response(
+    inst: &ProxyInstance,
+    public: &PublicContext,
+    upstreams: &ResolvedUpstreams,
+    raw_doc: Value,
+) -> Response<Body> {
+    let rewriter = RewriteEngine::new(&inst.profile, public, upstreams);
+    let rewritten = rewriter.rewrite_auth_metadata(raw_doc);
+    let mut resp = json_response(StatusCode::OK, &rewritten, true);
+    resp.headers_mut().insert(
+        http::header::CACHE_CONTROL,
+        cache_control_header(inst.discovery.cache_ttl().as_secs()),
+    );
+    resp
+}
+
 async fn handle_auth_metadata(
     inst: &ProxyInstance,
     public: &PublicContext,
@@ -890,6 +913,26 @@ async fn handle_auth_metadata(
     requested_path: &str,
     req_headers: &HeaderMap,
 ) -> Response<Body> {
+    let cache_key = format!("auth_meta:{requested_path}");
+    let stale_fallback = match inst.discovery.cached_metadata(&cache_key) {
+        Some((doc, true)) => {
+            return build_rewritten_metadata_response(inst, public, upstreams, doc);
+        }
+        Some((doc, false)) => Some(doc),
+        None => None,
+    };
+
+    // Singleflight: coalesce concurrent cache-miss metadata fetches into one upstream probe.
+    let _refresh_guard = inst.discovery.metadata_refresh_lock().lock().await;
+    if let Some((doc, true)) = inst.discovery.cached_metadata(&cache_key) {
+        let fresh_upstreams = inst
+            .discovery
+            .get_upstreams()
+            .await
+            .unwrap_or_else(|_| Arc::new(upstreams.clone()));
+        return build_rewritten_metadata_response(inst, public, &fresh_upstreams, doc);
+    }
+
     let fallback_path = if requested_path == "/_matrix/client/v1/auth_metadata" {
         "/_matrix/client/unstable/org.matrix.msc2965/auth_metadata"
     } else {
@@ -940,15 +983,20 @@ async fn handle_auth_metadata(
             Ok((status, body_bytes, content_type)) if status.is_success() => {
                 match serde_json::from_slice::<Value>(&body_bytes) {
                     Ok(json_val) => {
-                        inst.discovery.observe_auth_metadata(&json_val).await;
+                        inst.discovery.observe_auth_metadata(&json_val);
+                        inst.discovery
+                            .store_metadata(cache_key.clone(), json_val.clone());
                         let fresh_upstreams = inst
                             .discovery
                             .get_upstreams()
                             .await
                             .unwrap_or_else(|_| Arc::new(upstreams.clone()));
-                        let rewriter = RewriteEngine::new(&inst.profile, public, &fresh_upstreams);
-                        let rewritten = rewriter.rewrite_auth_metadata(json_val);
-                        return json_response(StatusCode::OK, &rewritten, true);
+                        return build_rewritten_metadata_response(
+                            inst,
+                            public,
+                            &fresh_upstreams,
+                            json_val,
+                        );
                     }
                     Err(err) => {
                         warn!(url = %url, error = %err, "auth_metadata returned invalid JSON");
@@ -966,6 +1014,11 @@ async fn handle_auth_metadata(
                 warn!(url = %url, error = %format!("{err:#}"), "auth_metadata upstream fetch error");
             }
         }
+    }
+
+    if let Some(stale) = stale_fallback {
+        warn!(profile = %inst.profile.name, path = requested_path, "serving stale cached auth_metadata after upstream refresh failure");
+        return build_rewritten_metadata_response(inst, public, upstreams, stale);
     }
 
     if let Some((status, body_bytes, content_type)) = last_non_200 {
@@ -994,6 +1047,25 @@ async fn handle_oidc_discovery(
     upstream_path: &str,
     req_headers: &HeaderMap,
 ) -> Response<Body> {
+    let cache_key = format!("oidc:{upstream_path}");
+    let stale_fallback = match inst.discovery.cached_metadata(&cache_key) {
+        Some((doc, true)) => {
+            return build_rewritten_metadata_response(inst, public, upstreams, doc);
+        }
+        Some((doc, false)) => Some(doc),
+        None => None,
+    };
+
+    let _refresh_guard = inst.discovery.metadata_refresh_lock().lock().await;
+    if let Some((doc, true)) = inst.discovery.cached_metadata(&cache_key) {
+        let fresh_upstreams = inst
+            .discovery
+            .get_upstreams()
+            .await
+            .unwrap_or_else(|_| Arc::new(upstreams.clone()));
+        return build_rewritten_metadata_response(inst, public, &fresh_upstreams, doc);
+    }
+
     let auth_base = upstreams.effective_auth_url();
     let target_url = build_upstream_target_url(auth_base, upstream_path);
     let auth_pp = inst.profile.auth_proxy_protocol();
@@ -1003,15 +1075,14 @@ async fn handle_oidc_discovery(
         Ok((status, body_bytes, content_type)) if status.is_success() => {
             match serde_json::from_slice::<Value>(&body_bytes) {
                 Ok(json_val) => {
-                    inst.discovery.observe_auth_metadata(&json_val).await;
+                    inst.discovery.observe_auth_metadata(&json_val);
+                    inst.discovery.store_metadata(cache_key, json_val.clone());
                     let fresh_upstreams = inst
                         .discovery
                         .get_upstreams()
                         .await
                         .unwrap_or_else(|_| Arc::new(upstreams.clone()));
-                    let rewriter = RewriteEngine::new(&inst.profile, public, &fresh_upstreams);
-                    let rewritten = rewriter.rewrite_auth_metadata(json_val);
-                    json_response(StatusCode::OK, &rewritten, true)
+                    build_rewritten_metadata_response(inst, public, &fresh_upstreams, json_val)
                 }
                 Err(_) => {
                     let mut builder = Response::builder().status(status);
@@ -1026,6 +1097,10 @@ async fn handle_oidc_discovery(
             }
         }
         Ok((status, body_bytes, content_type)) => {
+            if let Some(stale) = stale_fallback {
+                warn!(profile = %inst.profile.name, path = upstream_path, status = %status, "serving stale cached OIDC discovery after upstream error");
+                return build_rewritten_metadata_response(inst, public, upstreams, stale);
+            }
             let mut builder = Response::builder().status(status);
             if let Some(ct) = content_type {
                 builder = builder.header(http::header::CONTENT_TYPE, ct);
@@ -1037,6 +1112,9 @@ async fn handle_oidc_discovery(
         }
         Err(err) => {
             warn!(url = %target_url, error = %format!("{err:#}"), "OIDC discovery upstream fetch failed");
+            if let Some(stale) = stale_fallback {
+                return build_rewritten_metadata_response(inst, public, upstreams, stale);
+            }
             json_error(
                 StatusCode::BAD_GATEWAY,
                 "M_UNKNOWN",
@@ -1160,7 +1238,7 @@ async fn forward_request(
                     .metrics
                     .upstream_errors_total
                     .fetch_add(1, Ordering::Relaxed);
-                warn!(profile = %inst.profile.name, error = %err, "websocket proxy error");
+                warn!(profile = %inst.profile.name, error = %format!("{err:#}"), "websocket proxy error");
                 json_error(
                     StatusCode::BAD_GATEWAY,
                     "M_UNKNOWN",
@@ -1172,7 +1250,9 @@ async fn forward_request(
 
     let (parts, body) = req.into_parts();
     let is_auth = kind == ForwardKind::Auth;
-    let should_maybe_rewrite_body = is_auth && inst.profile.discovery.rewrite_auth_body;
+    let should_maybe_rewrite_body = is_auth
+        && inst.profile.discovery.rewrite_auth_body
+        && inst.profile.discovery.auth_proxy_mode == AuthProxyMode::Full;
 
     // Collect dynamic hop-by-hop headers declared via RFC 9110 `Connection: ...`.
     let dynamic_req_hop = collect_connection_headers(&parts.headers);
@@ -1270,7 +1350,7 @@ async fn forward_request(
                     .metrics
                     .upstream_errors_total
                     .fetch_add(1, Ordering::Relaxed);
-                warn!(profile = %inst.profile.name, target_url = %target_url, error = %err, "PPv2 upstream request failed");
+                warn!(profile = %inst.profile.name, target_url = %target_url, error = %format!("{err:#}"), "PPv2 upstream request failed");
                 return json_error(
                     StatusCode::BAD_GATEWAY,
                     "M_UNKNOWN",

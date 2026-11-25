@@ -1,5 +1,5 @@
 # =============================================================================
-# matrix-proxy v1.4.1 — Clean Configuration Reference
+# matrix-proxy v1.4.2 — Clean Configuration Reference
 # =============================================================================
 # THREE SIMPLE LAYERS (Highest -> Lowest Precedence):
 #   1. `[[proxies]]`  — Per-node config (ALWAYS wins over `[defaults]` & `[server]`)

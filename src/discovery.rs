@@ -3,9 +3,10 @@ use crate::ppv2_client::Ppv2Client;
 use anyhow::{Context, Result, anyhow};
 use http::{HeaderMap, HeaderValue};
 use serde_json::Value;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use url::Url;
 
@@ -72,6 +73,12 @@ impl ResolvedUpstreams {
     }
 }
 
+#[derive(Debug, Clone)]
+struct CachedMetadata {
+    doc: Value,
+    fetched_at: Instant,
+}
+
 #[derive(Debug, Default)]
 struct DiscoveryCache {
     resolved: Option<Arc<ResolvedUpstreams>>,
@@ -89,9 +96,14 @@ pub struct DiscoveryManager {
     /// (e.g. `mozilla.org/.well-known/matrix/client` -> 301 -> `www.mozilla.org/.well-known/matrix/client`).
     well_known_client: reqwest::Client,
     ppv2_client: Option<Arc<Ppv2Client>>,
+    /// Synchronous RwLock held only for nanosecond Arc clones/swaps (never across `.await`).
     cache: RwLock<DiscoveryCache>,
-    /// Singleflight mutex preventing concurrent TTL-expiry discovery stampedes.
-    refresh_lock: Mutex<()>,
+    /// Singleflight mutex preventing concurrent TTL-expiry discovery stampedes (supports SWR background refresh).
+    refresh_lock: Arc<Mutex<()>>,
+    /// Bounded TTL cache for raw upstream `auth_metadata` and OIDC discovery JSON documents.
+    metadata_cache: RwLock<HashMap<String, CachedMetadata>>,
+    /// Singleflight lock coalescing concurrent cache-miss upstream metadata fetches.
+    metadata_refresh_lock: Mutex<()>,
 }
 
 impl DiscoveryManager {
@@ -107,8 +119,55 @@ impl DiscoveryManager {
             well_known_client,
             ppv2_client,
             cache: RwLock::new(DiscoveryCache::default()),
-            refresh_lock: Mutex::new(()),
+            refresh_lock: Arc::new(Mutex::new(())),
+            metadata_cache: RwLock::new(HashMap::with_capacity(4)),
+            metadata_refresh_lock: Mutex::new(()),
         }
+    }
+
+    pub fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(self.profile.discovery.cache_ttl_secs.max(1))
+    }
+
+    /// Returns `(raw_json, is_fresh)` from the per-profile auth_metadata / OIDC discovery cache.
+    pub fn cached_metadata(&self, key: &str) -> Option<(Value, bool)> {
+        let ttl = self.cache_ttl();
+        let guard = self
+            .metadata_cache
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        guard
+            .get(key)
+            .map(|entry| (entry.doc.clone(), entry.fetched_at.elapsed() < ttl))
+    }
+
+    /// Stores a raw upstream auth_metadata / OIDC discovery document in the bounded cache.
+    pub fn store_metadata(&self, key: String, doc: Value) {
+        let mut guard = self
+            .metadata_cache
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        const MAX_METADATA_ENTRIES: usize = 16;
+        if guard.len() >= MAX_METADATA_ENTRIES
+            && !guard.contains_key(&key)
+            && let Some(oldest_key) = guard
+                .iter()
+                .min_by_key(|(_, v)| v.fetched_at)
+                .map(|(k, _)| k.clone())
+        {
+            guard.remove(&oldest_key);
+        }
+        guard.insert(
+            key,
+            CachedMetadata {
+                doc,
+                fetched_at: Instant::now(),
+            },
+        );
+    }
+
+    pub fn metadata_refresh_lock(&self) -> &Mutex<()> {
+        &self.metadata_refresh_lock
     }
 
     pub async fn initial_resolve(&self) -> Result<Arc<ResolvedUpstreams>> {
@@ -126,49 +185,54 @@ impl DiscoveryManager {
         Ok(resolved)
     }
 
-    /// Hot-path O(1) `Arc` clone when cache is fresh; singleflight-coalesced when TTL expires.
-    pub async fn get_upstreams(&self) -> Result<Arc<ResolvedUpstreams>> {
-        let ttl = Duration::from_secs(self.profile.discovery.cache_ttl_secs.max(1));
-        {
-            let guard = self.cache.read().await;
-            if let (Some(resolved), Some(last)) = (&guard.resolved, guard.last_refresh)
-                && last.elapsed() < ttl
-            {
-                return Ok(Arc::clone(resolved));
+    /// Hot-path O(1) `Arc` clone when cached; uses Stale-While-Revalidate (SWR) on TTL expiry
+    /// so live user traffic never blocks waiting for upstream `.well-known` / `auth_metadata` probes.
+    pub async fn get_upstreams(self: &Arc<Self>) -> Result<Arc<ResolvedUpstreams>> {
+        let ttl = self.cache_ttl();
+        let stale_snapshot = {
+            let guard = self.cache.read().unwrap_or_else(|e| e.into_inner());
+            if let (Some(resolved), Some(last)) = (&guard.resolved, guard.last_refresh) {
+                if last.elapsed() < ttl {
+                    return Ok(Arc::clone(resolved));
+                }
+                Some(Arc::clone(resolved))
+            } else {
+                guard.resolved.as_ref().map(Arc::clone)
             }
+        };
+
+        // Stale-While-Revalidate: return cached snapshot immediately and refresh in background (singleflight).
+        if let Some(stale) = stale_snapshot {
+            if let Ok(refresh_guard) = Arc::clone(&self.refresh_lock).try_lock_owned() {
+                let this = Arc::clone(self);
+                tokio::spawn(async move {
+                    let _guard = refresh_guard;
+                    if let Err(err) = this.refresh_internal(false).await {
+                        warn!(
+                            profile = %this.profile.name,
+                            error = %format!("{err:#}"),
+                            "background upstream discovery refresh failed; keeping cached state"
+                        );
+                    }
+                });
+            }
+            return Ok(stale);
         }
 
-        // Singleflight: only one concurrent caller refreshes after TTL expiry; others reuse its result.
+        // Cold path (only if `initial_resolve` hasn't populated the cache yet): singleflight inline resolve.
         let _refresh_guard = self.refresh_lock.lock().await;
         {
-            let guard = self.cache.read().await;
-            if let (Some(resolved), Some(last)) = (&guard.resolved, guard.last_refresh)
-                && last.elapsed() < ttl
-            {
+            let guard = self.cache.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(resolved) = &guard.resolved {
                 return Ok(Arc::clone(resolved));
             }
         }
 
-        match self.refresh_internal(false).await {
-            Ok(fresh) => Ok(fresh),
-            Err(err) => {
-                let guard = self.cache.read().await;
-                if let Some(stale) = &guard.resolved {
-                    warn!(
-                        profile = %self.profile.name,
-                        error = %err,
-                        "upstream discovery refresh failed, using cached state"
-                    );
-                    Ok(Arc::clone(stale))
-                } else {
-                    Err(err)
-                }
-            }
-        }
+        self.refresh_internal(false).await
     }
 
     /// Dynamically learns an upstream Auth server URL, issuer, and extra rewrite origins from live `auth_metadata`.
-    pub async fn observe_auth_metadata(&self, metadata: &Value) {
+    pub fn observe_auth_metadata(&self, metadata: &Value) {
         let mut learned_url: Option<Url> = None;
         let mut learned_issuer: Option<String> = None;
         let mut observed_origins: Vec<String> = Vec::new();
@@ -193,6 +257,7 @@ impl DiscoveryManager {
             "registration_endpoint",
             "revocation_endpoint",
             "account_management_uri",
+            "org.matrix.matrix-authentication-service.graphql_endpoint",
         ] {
             if let Some(raw) = metadata.get(key).and_then(Value::as_str)
                 && let Ok(u) = Url::parse(raw)
@@ -213,7 +278,7 @@ impl DiscoveryManager {
             return;
         }
 
-        let mut guard = self.cache.write().await;
+        let mut guard = self.cache.write().unwrap_or_else(|e| e.into_inner());
         let mut snapshot_changed = false;
 
         for orig in observed_origins {
@@ -368,7 +433,7 @@ impl DiscoveryManager {
             .map(ToString::to_string);
 
         let (prev_dyn_auth, prev_dyn_issuer, mut observed_origins) = {
-            let guard = self.cache.read().await;
+            let guard = self.cache.read().unwrap_or_else(|e| e.into_inner());
             (
                 guard.dynamic_auth_url.clone(),
                 guard.dynamic_issuer.clone(),
@@ -462,7 +527,7 @@ impl DiscoveryManager {
             observed_origins.clone(),
         ));
 
-        let mut guard = self.cache.write().await;
+        let mut guard = self.cache.write().unwrap_or_else(|e| e.into_inner());
         guard.resolved = Some(Arc::clone(&resolved));
         guard.last_refresh = Some(Instant::now());
         guard.observed_auth_origins = observed_origins;

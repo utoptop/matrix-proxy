@@ -301,8 +301,7 @@ pub async fn connect_via_proxy(
     configure_tcp_socket(&tcp, tcp_nodelay, tcp_keepalive);
 
     let mut stream: BoxedStream = if proxy_url.scheme().eq_ignore_ascii_case("https") {
-        let proxy_tls_cfg = build_client_tls_config(false, &[b"http/1.1".as_slice()])
-            .unwrap_or_else(|_| Arc::clone(tls_config));
+        let proxy_tls_cfg = cached_https_proxy_tls_config(tls_config);
         let connector = TlsConnector::from(proxy_tls_cfg);
         let sni = ServerName::try_from(proxy_host.to_string())
             .map_err(|_| anyhow!("invalid HTTPS proxy SNI host '{proxy_host_raw}'"))?;
@@ -470,6 +469,16 @@ fn hex_val(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
+}
+
+fn cached_https_proxy_tls_config(
+    fallback: &Arc<rustls::ClientConfig>,
+) -> Arc<rustls::ClientConfig> {
+    static CFG: OnceLock<Option<Arc<rustls::ClientConfig>>> = OnceLock::new();
+    CFG.get_or_init(|| build_client_tls_config(false, &[b"http/1.1".as_slice()]).ok())
+        .as_ref()
+        .map(Arc::clone)
+        .unwrap_or_else(|| Arc::clone(fallback))
 }
 
 fn cached_webpki_root_store() -> Arc<rustls::RootCertStore> {
