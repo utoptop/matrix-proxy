@@ -1056,3 +1056,84 @@ async fn rate_limit_enforced_per_client_ip() {
     let resp_other = app.clone().oneshot(req_other).await.unwrap();
     assert_eq!(resp_other.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn well_known_discovery_follows_301_redirect() {
+    let cluster = spawn_mock_cluster("redir").await;
+    let matrix_url_for_target = cluster.matrix_url.clone();
+
+    let target_app = Router::new().route(
+        "/.well-known/matrix/client",
+        get(move || {
+            let hs = matrix_url_for_target.clone();
+            async move {
+                let body = serde_json::to_vec(&json!({
+                    "m.homeserver": { "base_url": hs },
+                    "m.identity_server": { "base_url": "https://id.example.org" },
+                    "org.matrix.msc4143.rtc_foci": [
+                        { "type": "livekit", "livekit_service_url": "https://rtc.example.org" }
+                    ]
+                }))
+                .unwrap();
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap()
+            }
+        }),
+    );
+    let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(target_listener, target_app).await;
+    });
+
+    let redirect_app = Router::new().route(
+        "/.well-known/matrix/client",
+        get(move || async move {
+            Response::builder()
+                .status(StatusCode::MOVED_PERMANENTLY)
+                .header(
+                    header::LOCATION,
+                    format!("http://{target_addr}/.well-known/matrix/client"),
+                )
+                .body(Body::empty())
+                .unwrap()
+        }),
+    );
+    let redir_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let redir_addr = redir_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(redir_listener, redirect_app).await;
+    });
+
+    let mut cfg = Config::default();
+    cfg.server.public_url = Some("https://proxy.example.com".to_string());
+    cfg.upstream.server_name = Some(format!("http://{redir_addr}"));
+    cfg.upstream.rtc_url = Some("https://rtc.example.org".to_string());
+
+    let app = build_single_listener_app(cfg).await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/matrix/client")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let wk = body_json(resp).await;
+    assert_eq!(wk["m.homeserver"]["base_url"], "https://proxy.example.com");
+    assert_eq!(
+        wk["m.identity_server"]["base_url"],
+        "https://id.example.org"
+    );
+    assert_eq!(
+        wk["org.matrix.msc4143.rtc_foci"][0]["livekit_service_url"],
+        "https://proxy.example.com/_rtc"
+    );
+}

@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use url::Url;
 
 pub fn default_trusted_proxies() -> Vec<String> {
@@ -88,6 +88,12 @@ pub struct ServerConfig {
     pub tcp_nodelay: bool,
     pub ppv2_pool_max_entries: usize,
     pub listen_backlog: u32,
+    /// Enable automatic config file & TLS certificate hot reload (in addition to SIGHUP / POST /_proxy/reload).
+    pub hot_reload: bool,
+    /// File polling interval in seconds for automatic hot reload (minimum 1s; default 2s).
+    pub hot_reload_interval_secs: u64,
+    /// Maximum seconds to wait for in-flight HTTP/2 & WebSocket connections to drain on SIGTERM/SIGINT.
+    pub shutdown_grace_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -113,6 +119,9 @@ impl Default for ServerConfig {
             tcp_nodelay: true,
             ppv2_pool_max_entries: 4096,
             listen_backlog: 4096,
+            hot_reload: true,
+            hot_reload_interval_secs: 2,
+            shutdown_grace_secs: 15,
         }
     }
 }
@@ -352,6 +361,24 @@ impl RuntimeConfig {
             .iter()
             .any(|net| net.contains(&canonical))
     }
+
+    /// Collects all unique configured TLS certificate/key file paths so hot-reload watches cert renewals too.
+    pub fn tls_watched_paths(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for plan in &self.listeners {
+            for p in [&plan.tls_cert_path, &plan.tls_key_path]
+                .into_iter()
+                .flatten()
+            {
+                let trimmed = p.trim();
+                if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+                    out.push(PathBuf::from(trimmed));
+                }
+            }
+        }
+        out
+    }
 }
 
 impl Config {
@@ -447,6 +474,18 @@ impl Config {
         }
         if let Some(v) = env_parse::<usize>("PPV2_POOL_MAX_ENTRIES")? {
             self.server.ppv2_pool_max_entries = v;
+        }
+        if let Some(v) = env_parse::<u32>("LISTEN_BACKLOG")? {
+            self.server.listen_backlog = v;
+        }
+        if let Some(v) = env_bool("HOT_RELOAD")? {
+            self.server.hot_reload = v;
+        }
+        if let Some(v) = env_parse::<u64>("HOT_RELOAD_INTERVAL_SECS")? {
+            self.server.hot_reload_interval_secs = v;
+        }
+        if let Some(v) = env_parse::<u64>("SHUTDOWN_GRACE_SECS")? {
+            self.server.shutdown_grace_secs = v;
         }
 
         if let Some(v) = env_non_empty("MATRIX_UPSTREAM") {

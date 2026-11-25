@@ -20,9 +20,13 @@
    - **可信代理白名单防伪造（`server.trusted_proxies`）**：仅当物理连接对端 IP 属于白名单 CIDR（如本机回环、Docker 网桥、内网 HAProxy）时才采信 `X-Forwarded-For` / `X-Real-IP` / `CF-Connecting-IP` / `Forwarded` / `X-Forwarded-Host`，彻底阻断公网直连伪造 IP 或 Host 注入。
    - **标准 HTTP 头透传（`client_ip_mode = "replace" | "append" | "off"`）**：向上游规范写入 `X-Forwarded-For`、`X-Real-IP` 与 RFC 7239 `Forwarded`。
    - **原生 HAProxy PROXY Protocol v2（`send_proxy_v2` / `matrix_send_proxy_v2` / `auth_send_proxy_v2`）**：支持直连开启 `accept-proxy` 的上游端口（如 `8443`），在 TLS 握手前写入标准二进制 PPv2 头，上游内核级原生获取真实客户端 IP；同时维护**按 `(upstream, client_ip)` 隔离的有界 TLS 1.3 + HTTP/2 多路复用连接池**（同 IP 复用零握手延迟、跨 IP 零串用泄露），亦支持入站 `accept_proxy_v2 = true` 与 WebSocket PPv2 透传。
-4. **极致性能与安全加固**
-   - 全链路 `TCP_NODELAY`、`SO_KEEPALIVE`、高监听队列 `listen_backlog = 4096`、`HTTP/2` 自适应窗口与保活、`Arc` 零拷贝发现缓存、`/_matrix/*` 全程零缓冲流式转发、可选出站 `http://` / `https://` / `socks5://` / `socks5h://` 代理与原生 Rustls TLS。
-   - 内置慢速攻击防护（`header_read_timeout_secs`）、并发信号量背压（`max_concurrent_requests`）、可选按 IP 令牌桶限流（`rate_limit_rps` / `rate_limit_burst`）、RFC 9110 动态 `Connection` hop-by-hop 清洗，以及 `/_proxy/info` 访问隔离（`expose_info = "trusted"`，默认仅允许本机/可信内网访问）。
+4. **零停机热更新（Hot Reload）与优雅排空**
+   - **3 种触发方式**：自动文件与 TLS 证书轮询监控（`hot_reload = true`，默认 2 秒无感生效）、Unix 信号（`docker kill -s HUP matrix-proxy`）、以及可信内网 API（`POST /_proxy/reload`）。
+   - **原子切换与防误配回滚**：重载前先完成全量 TOML 校验、TLS 证书解析、并发上游发现预热与新增端口预绑定；任何校验失败立即报错并**自动保留原配置持续服务**，同端口既有 HTTP/1.1 Keep-Alive 与 HTTP/2 长连接零中断切换。
+   - **优雅退出（`shutdown_grace_secs`）**：收到 `SIGTERM` / `SIGINT` 时主动发送 HTTP/2 `GOAWAY` 并等待在途连接排空。
+5. **极致性能与安全加固**
+   - 全链路 `TCP_NODELAY`、`SO_KEEPALIVE`、高监听队列 `listen_backlog = 4096`、`HTTP/2` 自适应窗口与保活、全局缓存 `webpki` 根证书池、Singleflight 防发现缓存雪崩、`/.well-known/matrix/client` 301/302 自动跟随、PPv2 空闲失效连接自动单次重试、`/_matrix/*` 全程零缓冲流式转发、可选出站 `http://` / `https://` / `socks5://` / `socks5h://` 代理与原生 Rustls TLS。
+   - 内置慢速攻击防护（`header_read_timeout_secs`）、并发信号量背压（`max_concurrent_requests`）、可选按 IP 令牌桶限流（`rate_limit_rps` / `rate_limit_burst`）、RFC 9110 动态 `Connection` hop-by-hop 清洗，以及 `/_proxy/info` / `/_proxy/metrics` / `/_proxy/reload` 访问隔离（`expose_info = "trusted"`，公网返回 `403`）。
 
 ## 快速开始（Docker）
 
@@ -127,10 +131,12 @@ server {
 }
 ```
 
-## 运维探针
+## 运维探针与热更新接口
 
-- `GET /_proxy/health`：轻量存活探针（任何域名/无 `Host` 均返回 `200 OK`，不暴露上游信息）
-- `GET /_proxy/info`：运行状态与已加载上游摘要（默认 `expose_info = "trusted"`，仅本机/可信内网可访问，公网返回 `403`；代理凭证自动脱敏）
+- `GET /_proxy/health`：轻量存活探针（任何域名/无 `Host` 均返回 `200 OK`，含当前 `generation`，不暴露上游信息）
+- `GET /_proxy/info`：运行状态、配置代数、统计指标与已加载上游摘要（受 `expose_info` 保护，默认仅本机/可信内网可访问，公网返回 `403`；代理凭证自动脱敏）
+- `GET /_proxy/metrics`：轻量 Prometheus 指标（请求数、活跃连接、上游错误、PPv2 自动重试、限流与热更新计数；受 `expose_info` 保护）
+- `POST /_proxy/reload`：立即触发零停机配置与 TLS 证书热更新（受 `expose_info` 保护；也可直接修改保存 `config.toml` 自动触发，或执行 `docker kill -s HUP matrix-proxy`）
 
 ## 本地测试与构建
 

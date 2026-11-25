@@ -180,17 +180,10 @@ impl<'a> RewriteEngine<'a> {
         };
 
         let raw_origin = origin_string(&parsed);
-        let matrix_origin = origin_string(&self.upstreams.matrix_url);
-        let auth_origin = origin_string(self.upstreams.effective_auth_url());
-        let rtc_origin = self.upstreams.rtc_url.as_ref().map(origin_string);
-        let wk_hs_origin = self
-            .upstreams
-            .upstream_well_known
-            .as_ref()
-            .and_then(|wk| wk.pointer("/m.homeserver/base_url"))
-            .and_then(Value::as_str)
-            .and_then(|s| Url::parse(s).ok())
-            .map(|u| origin_string(&u));
+        let matrix_origin = self.upstreams.matrix_origin.as_str();
+        let auth_origin = self.upstreams.auth_origin.as_str();
+        let rtc_origin = self.upstreams.rtc_origin.as_deref();
+        let wk_hs_origin = self.upstreams.wk_hs_origin.as_deref();
 
         let matches_extra_auth = self
             .upstreams
@@ -203,31 +196,30 @@ impl<'a> RewriteEngine<'a> {
             .iter()
             .any(|o| o == &raw_origin);
 
-        let target_base =
-            if let (Some(ro), Some(rtc_base)) = (&rtc_origin, &self.public.rtc_base) {
-                if raw_origin == *ro {
-                    Some(normalized_base_url(rtc_base))
-                } else {
-                    None
-                }
+        let target_base = if let (Some(ro), Some(rtc_base)) = (rtc_origin, &self.public.rtc_base) {
+            if raw_origin == ro {
+                Some(normalized_base_url(rtc_base))
             } else {
                 None
             }
-            .or_else(|| {
-                if (raw_origin == auth_origin && (raw_origin != matrix_origin || prefer_auth))
-                    || (prefer_auth && (matches_extra_auth || matches_configured_rewrite))
-                {
-                    Some(normalized_base_url(&self.public.auth_base))
-                } else if raw_origin == matrix_origin
-                    || wk_hs_origin.as_deref() == Some(raw_origin.as_str())
-                    || matches_configured_rewrite
-                    || matches_extra_auth
-                {
-                    Some(normalized_base_url(&self.public.matrix_base))
-                } else {
-                    None
-                }
-            });
+        } else {
+            None
+        }
+        .or_else(|| {
+            if (raw_origin == auth_origin && (raw_origin != matrix_origin || prefer_auth))
+                || (prefer_auth && (matches_extra_auth || matches_configured_rewrite))
+            {
+                Some(normalized_base_url(&self.public.auth_base))
+            } else if raw_origin == matrix_origin
+                || wk_hs_origin == Some(raw_origin.as_str())
+                || matches_configured_rewrite
+                || matches_extra_auth
+            {
+                Some(normalized_base_url(&self.public.matrix_base))
+            } else {
+                None
+            }
+        });
 
         let Some(base) = target_base else {
             return raw.to_string();
@@ -511,13 +503,13 @@ impl<'a> RewriteEngine<'a> {
         let pub_matrix = self.public.matrix_origin();
 
         for orig in self.all_auth_origins() {
-            if orig != pub_auth && result.contains(&orig) {
-                result = result.replace(&orig, &pub_auth);
+            if orig != pub_auth && result.contains(orig) {
+                result = result.replace(orig, &pub_auth);
             }
         }
-        let matrix_origin = origin_string(&self.upstreams.matrix_url);
-        if matrix_origin != pub_matrix && result.contains(&matrix_origin) {
-            result = result.replace(&matrix_origin, &pub_matrix);
+        let matrix_origin = self.upstreams.matrix_origin.as_str();
+        if matrix_origin != pub_matrix && result.contains(matrix_origin) {
+            result = result.replace(matrix_origin, &pub_matrix);
         }
         result
     }
@@ -529,8 +521,8 @@ impl<'a> RewriteEngine<'a> {
 
         for orig in self.all_auth_origins() {
             if orig != pub_auth_base {
-                if out.contains(&orig) {
-                    out = out.replace(&orig, &pub_auth_base);
+                if out.contains(orig) {
+                    out = out.replace(orig, &pub_auth_base);
                 }
                 let escaped_from = orig.replace('/', "\\/");
                 if out.contains(&escaped_from) {
@@ -540,10 +532,10 @@ impl<'a> RewriteEngine<'a> {
             }
         }
 
-        let matrix_origin = origin_string(&self.upstreams.matrix_url);
+        let matrix_origin = self.upstreams.matrix_origin.as_str();
         if matrix_origin != pub_matrix_base {
-            if out.contains(&matrix_origin) {
-                out = out.replace(&matrix_origin, &pub_matrix_base);
+            if out.contains(matrix_origin) {
+                out = out.replace(matrix_origin, &pub_matrix_base);
             }
             let escaped_from = matrix_origin.replace('/', "\\/");
             if out.contains(&escaped_from) {
@@ -555,16 +547,16 @@ impl<'a> RewriteEngine<'a> {
         out
     }
 
-    fn all_auth_origins(&self) -> Vec<String> {
-        let mut list = vec![origin_string(self.upstreams.effective_auth_url())];
+    fn all_auth_origins(&self) -> Vec<&str> {
+        let mut list = vec![self.upstreams.auth_origin.as_str()];
         for o in &self.upstreams.observed_auth_origins {
-            if !list.contains(o) {
-                list.push(o.clone());
+            if !list.contains(&o.as_str()) {
+                list.push(o.as_str());
             }
         }
         for o in &self.profile.parsed_rewrite_origins {
-            if !list.contains(o) {
-                list.push(o.clone());
+            if !list.contains(&o.as_str()) {
+                list.push(o.as_str());
             }
         }
         list

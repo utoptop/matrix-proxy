@@ -31,8 +31,10 @@ services:
       # SEND_PROXY_V2: "${SEND_PROXY_V2:-false}"
       # EXPOSE_INFO: "${EXPOSE_INFO:-trusted}"
     volumes:
-      # 挂载多上游 / 单上游配置文件，容器自动加载
-      - ./config.toml:/app/config.toml:ro
+      # 推荐挂载目录至 `/app/conf:ro`（自动加载 `/app/conf/config.toml`）：
+      # 这样用 vim / SFTP / 面板原子覆盖保存 config.toml 时 inode 变化也能被容器实时感知并自动热更新！
+      # （若单文件挂载 `./config.toml:/app/config.toml:ro` 同样支持自动加载，仅需注意原地覆盖写入）
+      - ./:/app/conf:ro
     # 可选：限制容器日志体积，防止磁盘被撑满
     logging:
       driver: json-file

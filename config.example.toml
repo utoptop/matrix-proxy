@@ -83,6 +83,16 @@ ppv2_pool_max_entries = 4096
 # 监听 socket 的 TCP backlog 队列长度
 listen_backlog = 4096
 
+# ---------------------- 零停机热更新与优雅退出 ----------------------
+# 开启配置文件与 TLS 证书自动热更新（修改保存 config.toml 后自动无感生效，不中断已有连接）
+# 即使设为 false，也始终支持 SIGHUP (`docker kill -s HUP matrix-proxy`) 与 `POST /_proxy/reload` 手动热更新
+# 注意：新配置校验失败时自动保留旧配置继续服务，不会导致服务中断
+hot_reload = true
+# 自动热更新文件轮询间隔（秒，最小 1 秒，默认 2 秒）
+hot_reload_interval_secs = 2
+# 收到 SIGTERM / SIGINT 时等待在途 HTTP/2、/sync 与 WebSocket 连接优雅排空的最长秒数
+shutdown_grace_secs = 15
+
 
 # =============================================================================
 # 示例 1（共享单端口 + 按域名自动路由）：标准 Matrix Homeserver + 独立 Auth / MAS

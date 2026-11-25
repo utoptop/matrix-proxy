@@ -9,7 +9,7 @@ use http_body_util::Empty;
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -368,6 +368,15 @@ pub async fn connect_via_proxy(
     }
 }
 
+fn cached_webpki_root_store() -> Arc<rustls::RootCertStore> {
+    static STORE: OnceLock<Arc<rustls::RootCertStore>> = OnceLock::new();
+    Arc::clone(STORE.get_or_init(|| {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        Arc::new(roots)
+    }))
+}
+
 pub fn build_client_tls_config(
     danger_accept_invalid_certs: bool,
     alpn_protocols: &[&[u8]],
@@ -380,11 +389,9 @@ pub fn build_client_tls_config(
             .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
             .with_no_client_auth()
     } else {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()?
-            .with_root_certificates(roots)
+            .with_root_certificates(cached_webpki_root_store())
             .with_no_client_auth()
     };
 

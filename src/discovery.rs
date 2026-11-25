@@ -5,7 +5,7 @@ use http::{HeaderMap, HeaderValue};
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 use url::Url;
 
@@ -20,18 +20,55 @@ pub struct ResolvedUpstreams {
     /// connects via an internal/PPv2 address like `matrix.example.org:8443` while `auth_metadata`
     /// advertises a public origin like `https://auth.example.org`).
     pub observed_auth_origins: Vec<String>,
+    /// Precomputed normalized origin strings (avoids repeated `Url` formatting on hot paths).
+    pub matrix_origin: String,
+    pub auth_origin: String,
+    pub rtc_origin: Option<String>,
+    pub wk_hs_origin: Option<String>,
 }
 
 impl ResolvedUpstreams {
+    pub fn new(
+        matrix_url: Url,
+        auth_url: Option<Url>,
+        rtc_url: Option<Url>,
+        upstream_well_known: Option<Value>,
+        discovered_issuer: Option<String>,
+        observed_auth_origins: Vec<String>,
+    ) -> Self {
+        let matrix_origin = origin_string(&matrix_url);
+        let auth_origin = auth_url
+            .as_ref()
+            .map(origin_string)
+            .unwrap_or_else(|| matrix_origin.clone());
+        let rtc_origin = rtc_url.as_ref().map(origin_string);
+        let wk_hs_origin = upstream_well_known
+            .as_ref()
+            .and_then(|wk| wk.pointer("/m.homeserver/base_url"))
+            .and_then(Value::as_str)
+            .and_then(|s| Url::parse(s).ok())
+            .map(|u| origin_string(&u));
+
+        Self {
+            matrix_url,
+            auth_url,
+            rtc_url,
+            upstream_well_known,
+            discovered_issuer,
+            observed_auth_origins,
+            matrix_origin,
+            auth_origin,
+            rtc_origin,
+            wk_hs_origin,
+        }
+    }
+
     pub fn effective_auth_url(&self) -> &Url {
         self.auth_url.as_ref().unwrap_or(&self.matrix_url)
     }
 
     pub fn auth_is_separate(&self) -> bool {
-        match &self.auth_url {
-            Some(auth) => origin_string(auth) != origin_string(&self.matrix_url),
-            None => false,
-        }
+        self.auth_url.is_some() && self.auth_origin != self.matrix_origin
     }
 }
 
@@ -46,22 +83,31 @@ struct DiscoveryCache {
 
 pub struct DiscoveryManager {
     profile: Arc<ProxyProfile>,
+    /// Non-redirecting client for auth_metadata probes.
     client: reqwest::Client,
+    /// Redirect-following client (max 3 hops) specifically for `server_name/.well-known/matrix/client`
+    /// (e.g. `mozilla.org/.well-known/matrix/client` -> 301 -> `www.mozilla.org/.well-known/matrix/client`).
+    well_known_client: reqwest::Client,
     ppv2_client: Option<Arc<Ppv2Client>>,
     cache: RwLock<DiscoveryCache>,
+    /// Singleflight mutex preventing concurrent TTL-expiry discovery stampedes.
+    refresh_lock: Mutex<()>,
 }
 
 impl DiscoveryManager {
     pub fn new(
         profile: Arc<ProxyProfile>,
         client: reqwest::Client,
+        well_known_client: reqwest::Client,
         ppv2_client: Option<Arc<Ppv2Client>>,
     ) -> Self {
         Self {
             profile,
             client,
+            well_known_client,
             ppv2_client,
             cache: RwLock::new(DiscoveryCache::default()),
+            refresh_lock: Mutex::new(()),
         }
     }
 
@@ -80,9 +126,20 @@ impl DiscoveryManager {
         Ok(resolved)
     }
 
-    /// Hot-path O(1) `Arc` clone when cache is fresh (zero deep cloning on every request).
+    /// Hot-path O(1) `Arc` clone when cache is fresh; singleflight-coalesced when TTL expires.
     pub async fn get_upstreams(&self) -> Result<Arc<ResolvedUpstreams>> {
         let ttl = Duration::from_secs(self.profile.discovery.cache_ttl_secs.max(1));
+        {
+            let guard = self.cache.read().await;
+            if let (Some(resolved), Some(last)) = (&guard.resolved, guard.last_refresh)
+                && last.elapsed() < ttl
+            {
+                return Ok(Arc::clone(resolved));
+            }
+        }
+
+        // Singleflight: only one concurrent caller refreshes after TTL expiry; others reuse its result.
+        let _refresh_guard = self.refresh_lock.lock().await;
         {
             let guard = self.cache.read().await;
             if let (Some(resolved), Some(last)) = (&guard.resolved, guard.last_refresh)
@@ -193,14 +250,24 @@ impl DiscoveryManager {
         }
 
         if snapshot_changed && let Some(prev) = &guard.resolved {
-            let mut updated = (**prev).clone();
-            updated.observed_auth_origins = guard.observed_auth_origins.clone();
-            if guard.dynamic_issuer.is_some() {
-                updated.discovered_issuer = guard.dynamic_issuer.clone();
-            }
-            if self.profile.upstream.auth_url.is_none() && guard.dynamic_auth_url.is_some() {
-                updated.auth_url = guard.dynamic_auth_url.clone();
-            }
+            let new_auth_url =
+                if self.profile.upstream.auth_url.is_none() && guard.dynamic_auth_url.is_some() {
+                    guard.dynamic_auth_url.clone()
+                } else {
+                    prev.auth_url.clone()
+                };
+            let new_issuer = guard
+                .dynamic_issuer
+                .clone()
+                .or_else(|| prev.discovered_issuer.clone());
+            let updated = ResolvedUpstreams::new(
+                prev.matrix_url.clone(),
+                new_auth_url,
+                prev.rtc_url.clone(),
+                prev.upstream_well_known.clone(),
+                new_issuer,
+                guard.observed_auth_origins.clone(),
+            );
             guard.resolved = Some(Arc::new(updated));
         }
     }
@@ -208,10 +275,11 @@ impl DiscoveryManager {
     async fn refresh_internal(&self, is_startup: bool) -> Result<Arc<ResolvedUpstreams>> {
         let mut upstream_well_known: Option<Value> = None;
 
-        // 1. Try server_name well-known if configured (always standard HTTPS on server_name).
+        // 1. Try server_name well-known if configured (follows up to 3 HTTP/HTTPS redirects,
+        //    e.g. `mozilla.org/.well-known/matrix/client` -> `www.mozilla.org/.well-known/matrix/client`).
         if let Some(server_name) = &self.profile.upstream.server_name {
             let wk_url = build_server_name_well_known_url(server_name)?;
-            match self.fetch_json(&wk_url, false, None).await {
+            match self.fetch_json(&wk_url, false, None, true).await {
                 Ok(json) => {
                     debug!(profile = %self.profile.name, url = %wk_url, "fetched server_name .well-known/matrix/client");
                     upstream_well_known = Some(json);
@@ -257,7 +325,7 @@ impl DiscoveryManager {
             && let Ok(wk_url) = matrix_url.join("/.well-known/matrix/client")
         {
             match self
-                .fetch_json(&wk_url, use_matrix_ppv2, matrix_host_ov)
+                .fetch_json(&wk_url, use_matrix_ppv2, matrix_host_ov, true)
                 .await
             {
                 Ok(json) => {
@@ -351,14 +419,14 @@ impl DiscoveryManager {
             None => None,
         };
 
-        let resolved = Arc::new(ResolvedUpstreams {
+        let resolved = Arc::new(ResolvedUpstreams::new(
             matrix_url,
             auth_url,
             rtc_url,
             upstream_well_known,
             discovered_issuer,
-            observed_auth_origins: observed_origins.clone(),
-        });
+            observed_origins.clone(),
+        ));
 
         let mut guard = self.cache.write().await;
         guard.resolved = Some(Arc::clone(&resolved));
@@ -385,7 +453,7 @@ impl DiscoveryManager {
             "/_matrix/client/unstable/org.matrix.msc2965/auth_metadata",
         ] {
             if let Ok(url) = matrix_url.join(path) {
-                match self.fetch_json(&url, use_ppv2, host_override).await {
+                match self.fetch_json(&url, use_ppv2, host_override, false).await {
                     Ok(json) => {
                         debug!(profile = %self.profile.name, url = %url, "discovered upstream auth_metadata");
                         return Some(json);
@@ -404,6 +472,7 @@ impl DiscoveryManager {
         url: &Url,
         use_ppv2: bool,
         host_override: Option<&str>,
+        follow_redirects: bool,
     ) -> Result<Value> {
         if use_ppv2 && let Some(ppv2) = &self.ppv2_client {
             let mut hdrs = HeaderMap::new();
@@ -421,8 +490,13 @@ impl DiscoveryManager {
                 .with_context(|| format!("invalid JSON from {url}"));
         }
 
-        let mut req = self
-            .client
+        let http_client = if follow_redirects {
+            &self.well_known_client
+        } else {
+            &self.client
+        };
+
+        let mut req = http_client
             .get(url.clone())
             .timeout(Duration::from_secs(10))
             .header(reqwest::header::ACCEPT, "application/json");

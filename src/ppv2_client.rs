@@ -1,5 +1,6 @@
 use crate::client_ip::{encode_ppv2_local, encode_ppv2_proxy};
 use crate::config::ServerConfig;
+use crate::metrics::ProxyMetrics;
 use crate::ws::{build_client_tls_config, connect_via_proxy};
 use anyhow::{Context, Result, anyhow};
 use axum::body::Body;
@@ -11,6 +12,7 @@ use rustls::pki_types::ServerName;
 use socket2::{SockRef, TcpKeepalive};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -60,6 +62,7 @@ pub struct Ppv2Client {
     max_entries: usize,
     h2_pool: Mutex<HashMap<PoolKey, H2Entry>>,
     h1_pool: Mutex<HashMap<PoolKey, Vec<H1Entry>>>,
+    metrics: Option<Arc<ProxyMetrics>>,
 }
 
 impl Ppv2Client {
@@ -68,6 +71,7 @@ impl Ppv2Client {
         outbound_proxy: Option<&str>,
         connect_timeout_secs: u64,
         danger_accept_invalid_certs: bool,
+        metrics: Option<Arc<ProxyMetrics>>,
     ) -> Result<Self> {
         let tls_config = build_client_tls_config(
             danger_accept_invalid_certs,
@@ -87,11 +91,14 @@ impl Ppv2Client {
             max_entries: server.ppv2_pool_max_entries.max(64),
             h2_pool: Mutex::new(HashMap::with_capacity(256)),
             h1_pool: Mutex::new(HashMap::with_capacity(64)),
+            metrics,
         })
     }
 
     /// Sends a streaming HTTP request to `target_url` with a PROXY Protocol v2 header for `client_addr`
     /// (`None` sends a PPv2 `LOCAL` header for proxy-originated discovery probes).
+    /// Automatically retries once on a fresh TCP+PPv2+TLS connection if a pooled idle connection
+    /// became stale before request transmission (eliminates transient 502s after upstream keepalive close).
     pub async fn send_request(
         &self,
         method: Method,
@@ -117,10 +124,7 @@ impl Ppv2Client {
             client_ip: client_addr.map(|s| s.ip()),
         };
 
-        let mut req_builder = Request::builder()
-            .method(method)
-            .uri(path_and_query(target_url));
-
+        let pq = path_and_query(target_url);
         let host_hdr = if let Some(ov) = host_override {
             ov.to_string()
         } else {
@@ -129,50 +133,130 @@ impl Ppv2Client {
                 None => host.clone(),
             }
         };
-        req_builder = req_builder.header(http::header::HOST, host_hdr);
 
-        for (name, val) in &headers {
-            if name == http::header::HOST {
-                continue;
-            }
-            req_builder = req_builder.header(name.clone(), val.clone());
-        }
+        let can_replay_body = matches!(method, Method::GET | Method::HEAD | Method::OPTIONS);
 
-        let req = req_builder
-            .body(body)
-            .context("failed to build upstream PPv2 request")?;
-
-        let conn = self
+        // Try pooled connection first; if stale before transmission (or safe idempotent replay), reconnect once.
+        let (conn, was_reused) = self
             .checkout_or_connect(&key, &host, port, use_tls, client_addr)
             .await?;
 
         match conn {
             SelectedConn::H2(mut sender) => {
+                if let Err(err) = sender.ready().await {
+                    if was_reused {
+                        self.evict_h2(&key);
+                        self.record_retry();
+                        debug!(host = %host, port, error = %err, "stale pooled PPv2 H2 connection evicted before send; reconnecting");
+                        let fresh = self
+                            .connect_fresh(&key, &host, port, use_tls, client_addr)
+                            .await?;
+                        let req = build_hyper_req(&method, &pq, &host_hdr, &headers, body)?;
+                        return self.dispatch_on_conn(&key, fresh, req).await;
+                    }
+                    return Err(err).context("upstream H2 sender not ready");
+                }
+
+                let req = build_hyper_req(&method, &pq, &host_hdr, &headers, body)?;
+                match sender.send_request(req).await {
+                    Ok(resp) => Ok(resp),
+                    Err(err) if was_reused && can_replay_body => {
+                        self.evict_h2(&key);
+                        self.record_retry();
+                        debug!(host = %host, port, error = %err, "pooled PPv2 H2 request failed on idempotent method; retrying once");
+                        let fresh = self
+                            .connect_fresh(&key, &host, port, use_tls, client_addr)
+                            .await?;
+                        let retry_req =
+                            build_hyper_req(&method, &pq, &host_hdr, &headers, Body::empty())?;
+                        self.dispatch_on_conn(&key, fresh, retry_req).await
+                    }
+                    Err(err) => {
+                        self.evict_h2(&key);
+                        Err(err).context("upstream H2 request failed")
+                    }
+                }
+            }
+            SelectedConn::H1(mut sender) => {
+                if let Err(err) = sender.ready().await {
+                    if was_reused {
+                        self.record_retry();
+                        debug!(host = %host, port, error = %err, "stale pooled PPv2 H1 connection evicted before send; reconnecting");
+                        let fresh = self
+                            .connect_fresh(&key, &host, port, use_tls, client_addr)
+                            .await?;
+                        let req = build_hyper_req(&method, &pq, &host_hdr, &headers, body)?;
+                        return self.dispatch_on_conn(&key, fresh, req).await;
+                    }
+                    return Err(err).context("upstream H1 sender not ready");
+                }
+
+                let req = build_hyper_req(&method, &pq, &host_hdr, &headers, body)?;
+                match sender.send_request(req).await {
+                    Ok(resp) => {
+                        if !sender.is_closed() {
+                            self.return_h1(key, sender);
+                        }
+                        Ok(resp)
+                    }
+                    Err(err) if was_reused && can_replay_body => {
+                        self.record_retry();
+                        debug!(host = %host, port, error = %err, "pooled PPv2 H1 request failed on idempotent method; retrying once");
+                        let fresh = self
+                            .connect_fresh(&key, &host, port, use_tls, client_addr)
+                            .await?;
+                        let retry_req =
+                            build_hyper_req(&method, &pq, &host_hdr, &headers, Body::empty())?;
+                        self.dispatch_on_conn(&key, fresh, retry_req).await
+                    }
+                    Err(err) => Err(err).context("upstream H1 request failed"),
+                }
+            }
+        }
+    }
+
+    async fn dispatch_on_conn(
+        &self,
+        key: &PoolKey,
+        conn: SelectedConn,
+        req: Request<Body>,
+    ) -> Result<Response<Incoming>> {
+        match conn {
+            SelectedConn::H2(mut sender) => {
                 sender
                     .ready()
                     .await
-                    .context("upstream H2 sender not ready")?;
-                let resp = sender
+                    .context("fresh upstream H2 sender not ready")?;
+                sender
                     .send_request(req)
                     .await
-                    .context("upstream H2 request failed")?;
-                Ok(resp)
+                    .context("fresh upstream H2 request failed")
             }
             SelectedConn::H1(mut sender) => {
                 sender
                     .ready()
                     .await
-                    .context("upstream H1 sender not ready")?;
+                    .context("fresh upstream H1 sender not ready")?;
                 let resp = sender
                     .send_request(req)
                     .await
-                    .context("upstream H1 request failed")?;
-                // Return reusable H1 sender once response headers arrive (hyper queues pipelining/keepalive safely).
+                    .context("fresh upstream H1 request failed")?;
                 if !sender.is_closed() {
-                    self.return_h1(key, sender);
+                    self.return_h1(key.clone(), sender);
                 }
                 Ok(resp)
             }
+        }
+    }
+
+    fn evict_h2(&self, key: &PoolKey) {
+        let mut pool = self.h2_pool.lock().unwrap_or_else(|e| e.into_inner());
+        pool.remove(key);
+    }
+
+    fn record_retry(&self) {
+        if let Some(m) = &self.metrics {
+            m.ppv2_retries_total.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -241,14 +325,14 @@ impl Ppv2Client {
         port: u16,
         use_tls: bool,
         client_addr: Option<SocketAddr>,
-    ) -> Result<SelectedConn> {
+    ) -> Result<(SelectedConn, bool)> {
         // 1. Fast path: reuse warm multiplexed H2 connection for this `(upstream, client_ip)`.
         {
             let mut pool = self.h2_pool.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(entry) = pool.get_mut(key) {
                 if !entry.sender.is_closed() && entry.last_used.elapsed() < self.idle_timeout {
                     entry.last_used = Instant::now();
-                    return Ok(SelectedConn::H2(entry.sender.clone()));
+                    return Ok((SelectedConn::H2(entry.sender.clone()), true));
                 }
                 pool.remove(key);
             }
@@ -260,7 +344,7 @@ impl Ppv2Client {
             if let Some(vec) = pool.get_mut(key) {
                 while let Some(entry) = vec.pop() {
                     if !entry.sender.is_closed() && entry.last_used.elapsed() < self.idle_timeout {
-                        return Ok(SelectedConn::H1(entry.sender));
+                        return Ok((SelectedConn::H1(entry.sender), true));
                     }
                 }
                 if vec.is_empty() {
@@ -269,7 +353,21 @@ impl Ppv2Client {
             }
         }
 
-        // 3. Cold path: open TCP -> send PPv2 header -> TLS handshake (ALPN h2,http/1.1) -> HTTP handshake.
+        let fresh = self
+            .connect_fresh(key, host, port, use_tls, client_addr)
+            .await?;
+        Ok((fresh, false))
+    }
+
+    async fn connect_fresh(
+        &self,
+        key: &PoolKey,
+        host: &str,
+        port: u16,
+        use_tls: bool,
+        client_addr: Option<SocketAddr>,
+    ) -> Result<SelectedConn> {
+        // Cold path: open TCP -> send PPv2 header -> TLS handshake (ALPN h2,http/1.1) -> HTTP handshake.
         let (stream, is_h2) = tokio::time::timeout(
             self.connect_timeout,
             self.connect_ppv2_stream(host, port, use_tls, client_addr),
@@ -406,6 +504,30 @@ impl Ppv2Client {
             });
         }
     }
+}
+
+fn build_hyper_req(
+    method: &Method,
+    pq: &str,
+    host_hdr: &str,
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<Request<Body>> {
+    let mut req_builder = Request::builder()
+        .method(method.clone())
+        .uri(pq)
+        .header(http::header::HOST, host_hdr);
+
+    for (name, val) in headers {
+        if name == http::header::HOST {
+            continue;
+        }
+        req_builder = req_builder.header(name.clone(), val.clone());
+    }
+
+    req_builder
+        .body(body)
+        .context("failed to build upstream PPv2 request")
 }
 
 pub fn configure_tcp_socket(stream: &TcpStream, nodelay: bool, keepalive: Duration) {
