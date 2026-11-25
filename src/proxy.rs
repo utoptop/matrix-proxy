@@ -810,6 +810,7 @@ fn handle_listener_summary_info(
                 "default": inst.profile.is_default,
                 "matrix_proxy_public_url": inst.profile.matrix_proxy_public_url.as_ref().map(normalized_base_url),
                 "outbound_proxy": inst.profile.upstream.outbound_proxy.as_deref().map(redact_proxy_url),
+                "auth_proxy_mode": inst.profile.discovery.auth_proxy_mode,
                 "upstream_matrix_proxy_protocol": inst.profile.matrix_proxy_protocol(),
                 "upstream_auth_proxy_protocol": inst.profile.auth_proxy_protocol(),
                 "upstream_rtc_proxy_protocol": inst.profile.rtc_proxy_protocol(),
@@ -872,6 +873,7 @@ fn handle_profile_info(
             "upstream_rtc_proxy_protocol": inst.profile.rtc_proxy_protocol(),
         },
         "discovery": {
+            "auth_proxy_mode": inst.profile.discovery.auth_proxy_mode,
             "rewrite_issuer": inst.profile.discovery.rewrite_issuer,
             "rewrite_auth_body": inst.profile.discovery.rewrite_auth_body,
             "observed_auth_origins": upstreams.observed_auth_origins,
@@ -961,7 +963,7 @@ async fn handle_auth_metadata(
                 }
             }
             Err(err) => {
-                warn!(url = %url, error = %err, "auth_metadata upstream fetch error");
+                warn!(url = %url, error = %format!("{err:#}"), "auth_metadata upstream fetch error");
             }
         }
     }
@@ -1034,7 +1036,7 @@ async fn handle_oidc_discovery(
             })
         }
         Err(err) => {
-            warn!(url = %target_url, error = %err, "OIDC discovery upstream fetch failed");
+            warn!(url = %target_url, error = %format!("{err:#}"), "OIDC discovery upstream fetch failed");
             json_error(
                 StatusCode::BAD_GATEWAY,
                 "M_UNKNOWN",
@@ -1315,14 +1317,14 @@ async fn forward_request(
                 .upstream_errors_total
                 .fetch_add(1, Ordering::Relaxed);
             if err.is_timeout() {
-                warn!(profile = %inst.profile.name, target_url = %target_url, error = %err, "upstream request timed out");
+                warn!(profile = %inst.profile.name, target_url = %target_url, error = %format!("{err:#}"), "upstream request timed out");
                 return json_error(
                     StatusCode::GATEWAY_TIMEOUT,
                     "M_UNKNOWN",
                     "Upstream server timed out",
                 );
             }
-            warn!(profile = %inst.profile.name, target_url = %target_url, error = %err, "upstream request failed");
+            warn!(profile = %inst.profile.name, target_url = %target_url, error = %format!("{err:#}"), "upstream request failed");
             return json_error(
                 StatusCode::BAD_GATEWAY,
                 "M_UNKNOWN",

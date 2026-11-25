@@ -28,6 +28,40 @@ pub enum AuthRouteMode {
     Prefix,
 }
 
+/// Controls how OAuth 2.0 / OIDC / MAS endpoints are rewritten and proxied:
+/// - `full` (default): proxy and rewrite ALL Auth endpoints, `issuer`, cookies, CSP, and bodies (best for self-hosted/direct MAS password logins).
+/// - `token_only`: keep `issuer` and browser-interactive pages (`authorization_endpoint`, `account_management_uri`, `graphql_endpoint`, `.well-known` auth)
+///   on the official upstream Auth server so multi-hop third-party IdPs (Mozilla Accounts, Google, Apple, Passkey) work with zero `redirect_uri`/anti-phishing
+///   issues during initial login, while STILL proxying background machine-to-machine endpoints (`token_endpoint`, `revocation_endpoint`, `registration_endpoint`,
+///   `jwks_uri`) for 24/7 uninterrupted token refresh via `matrix-proxy`.
+/// - `direct`: proxy only Matrix Client-Server & RTC; return all Auth metadata and `.well-known` auth fields untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthProxyMode {
+    #[default]
+    Full,
+    #[serde(alias = "token-only", alias = "hybrid")]
+    TokenOnly,
+    #[serde(alias = "passthrough", alias = "off")]
+    Direct,
+}
+
+impl AuthProxyMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::TokenOnly => "token_only",
+            Self::Direct => "direct",
+        }
+    }
+}
+
+impl std::fmt::Display for AuthProxyMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ClientIpMode {
@@ -165,6 +199,7 @@ pub struct ProxyDefaultsConfig {
     pub matrix_extra_prefixes: Option<Vec<String>>,
     pub auth_matrix_prefixes: Option<Vec<String>>,
 
+    pub auth_proxy_mode: Option<AuthProxyMode>,
     pub rewrite_issuer: Option<bool>,
     pub force_msc2965_well_known: Option<bool>,
     pub rewrite_auth_body: Option<bool>,
@@ -378,6 +413,7 @@ impl Default for RoutingConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct DiscoveryConfig {
+    pub auth_proxy_mode: AuthProxyMode,
     pub rewrite_issuer: bool,
     pub force_msc2965_well_known: bool,
     pub rewrite_auth_body: bool,
@@ -389,6 +425,7 @@ pub struct DiscoveryConfig {
 impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
+            auth_proxy_mode: AuthProxyMode::Full,
             rewrite_issuer: true,
             force_msc2965_well_known: false,
             rewrite_auth_body: true,
@@ -474,6 +511,7 @@ pub struct ProxyProfileInput {
     pub matrix_extra_prefixes: Option<Vec<String>>,
     pub auth_matrix_prefixes: Option<Vec<String>>,
 
+    pub auth_proxy_mode: Option<AuthProxyMode>,
     pub rewrite_issuer: Option<bool>,
     pub force_msc2965_well_known: Option<bool>,
     pub rewrite_auth_body: Option<bool>,
@@ -727,6 +765,9 @@ impl Config {
         if let Some(v) = d.auth_matrix_prefixes {
             self.routing.auth_matrix_prefixes = v;
         }
+        if let Some(v) = d.auth_proxy_mode {
+            self.discovery.auth_proxy_mode = v;
+        }
         if let Some(v) = d.rewrite_issuer {
             self.discovery.rewrite_issuer = v;
         }
@@ -959,6 +1000,9 @@ impl Config {
             self.routing.auth_matrix_prefixes = split_csv(&v);
         }
 
+        if let Some(v) = env_non_empty("AUTH_PROXY_MODE") {
+            self.discovery.auth_proxy_mode = parse_auth_proxy_mode(&v)?;
+        }
         if let Some(v) = env_bool("REWRITE_ISSUER")? {
             self.discovery.rewrite_issuer = v;
         }
@@ -1220,6 +1264,9 @@ impl Config {
             let _ = parse_http_url_opt(&format!("proxies[{name}].identity_server_url"), &id_url)?;
 
             let discovery = DiscoveryConfig {
+                auth_proxy_mode: raw
+                    .auth_proxy_mode
+                    .unwrap_or(self.discovery.auth_proxy_mode),
                 rewrite_issuer: raw.rewrite_issuer.unwrap_or(self.discovery.rewrite_issuer),
                 force_msc2965_well_known: raw
                     .force_msc2965_well_known
@@ -1665,6 +1712,15 @@ fn parse_expose_info(raw: &str) -> Result<ExposeInfoMode> {
         "always" | "public" | "true" => Ok(ExposeInfoMode::Always),
         "disabled" | "off" | "false" => Ok(ExposeInfoMode::Disabled),
         other => bail!("invalid EXPOSE_INFO '{other}': expected trusted, always, or disabled"),
+    }
+}
+
+fn parse_auth_proxy_mode(raw: &str) -> Result<AuthProxyMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "full" => Ok(AuthProxyMode::Full),
+        "token_only" | "token-only" | "hybrid" => Ok(AuthProxyMode::TokenOnly),
+        "direct" | "passthrough" | "off" => Ok(AuthProxyMode::Direct),
+        other => bail!("invalid AUTH_PROXY_MODE '{other}': expected full, token_only, or direct"),
     }
 }
 
@@ -2308,6 +2364,54 @@ mod tests {
         assert_eq!(
             runtime.listeners[0].profiles[1].matrix_proxy_protocol(),
             ProxyProtocol::V2
+        );
+    }
+
+    #[test]
+    fn auth_proxy_mode_inherits_defaults_and_overrides_per_profile() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [defaults]
+            auth_proxy_mode = "token_only"
+
+            [[proxies]]
+            name = "inherits-token-only"
+            matrix_proxy_public_url = "https://a.example.com"
+            upstream_matrix_server_url = "https://hs-a.example.org"
+
+            [[proxies]]
+            name = "overrides-full"
+            matrix_proxy_public_url = "https://b.example.com"
+            upstream_matrix_server_url = "https://hs-b.example.org"
+            auth_proxy_mode = "full"
+
+            [[proxies]]
+            name = "overrides-direct"
+            matrix_proxy_public_url = "https://c.example.com"
+            upstream_matrix_server_url = "https://hs-c.example.org"
+            auth_proxy_mode = "direct"
+
+            [[proxies]]
+            name = "alias-hybrid"
+            matrix_proxy_public_url = "https://d.example.com"
+            upstream_matrix_server_url = "https://hs-d.example.org"
+            auth_proxy_mode = "hybrid"
+            "#,
+        )
+        .unwrap()
+        .into_runtime()
+        .unwrap();
+
+        let profiles = &cfg.listeners[0].profiles;
+        assert_eq!(
+            profiles[0].discovery.auth_proxy_mode,
+            AuthProxyMode::TokenOnly
+        );
+        assert_eq!(profiles[1].discovery.auth_proxy_mode, AuthProxyMode::Full);
+        assert_eq!(profiles[2].discovery.auth_proxy_mode, AuthProxyMode::Direct);
+        assert_eq!(
+            profiles[3].discovery.auth_proxy_mode,
+            AuthProxyMode::TokenOnly
         );
     }
 }

@@ -893,10 +893,11 @@ fn run_check_config(config_path: Option<&Path>) -> Result<()> {
                 .or(p.upstream.upstream_matrix_server_name.as_deref())
                 .unwrap_or("<unknown>");
             println!(
-                "    - {} | public={} -> upstream={} | outbound_proxy={} | pp={}/{}/{}",
+                "    - {} | public={} -> upstream={} | auth_proxy={} | outbound_proxy={} | pp={}/{}/{}",
                 p.name,
                 pub_url,
                 hs,
+                p.discovery.auth_proxy_mode,
                 proxy,
                 p.matrix_proxy_protocol(),
                 p.auth_proxy_protocol(),

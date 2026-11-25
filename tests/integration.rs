@@ -199,6 +199,7 @@ async fn spawn_mock_cluster(tag: &'static str) -> MockCluster {
                         "revocation_endpoint": format!("{a}/oauth2/revoke"),
                         "jwks_uri": format!("{a}/oauth2/keys.json"),
                         "account_management_uri": format!("{a}/account"),
+                        "org.matrix.matrix-authentication-service.graphql_endpoint": format!("{a}/account/graphql"),
                         "authorization_response_iss_parameter_supported": true
                     });
                     Response::builder()
@@ -359,6 +360,10 @@ async fn single_domain_root_mode_full_matrix_and_auth_flow() {
         assert_eq!(
             meta["token_endpoint"],
             "https://proxy.example.com/oauth2/token"
+        );
+        assert_eq!(
+            meta["org.matrix.matrix-authentication-service.graphql_endpoint"],
+            "https://proxy.example.com/account/graphql"
         );
     }
 
@@ -1631,4 +1636,216 @@ async fn standard_upstream_timeout_returns_504_gateway_timeout() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+}
+
+#[tokio::test]
+async fn auth_proxy_mode_token_only_and_direct_preserve_interactive_login() {
+    let cluster = spawn_mock_cluster("idp").await;
+
+    let toml_cfg = format!(
+        r#"
+        [server]
+        listen = "0.0.0.0:8080"
+        expose_info = "always"
+
+        [[proxies]]
+        name = "mozilla-like-token-only"
+        matrix_proxy_public_url = "https://token-only.example.com"
+        upstream_matrix_server_url = "{}"
+        upstream_matrix_auth_url = "{}"
+        upstream_matrix_rtc_url = "{}"
+        auth_proxy_mode = "token_only"
+
+        [[proxies]]
+        name = "direct-auth"
+        matrix_proxy_public_url = "https://direct-auth.example.com"
+        upstream_matrix_server_url = "{}"
+        upstream_matrix_auth_url = "{}"
+        upstream_matrix_rtc_url = "{}"
+        auth_proxy_mode = "direct"
+        "#,
+        cluster.matrix_url,
+        cluster.auth_url,
+        cluster.rtc_url,
+        cluster.matrix_url,
+        cluster.auth_url,
+        cluster.rtc_url,
+    );
+
+    let app = build_single_listener_app(Config::from_toml_str(&toml_cfg).unwrap()).await;
+
+    // --- 1. `token_only` mode ---
+    // 1a. /.well-known/matrix/client rewrites homeserver & RTC, preserves official MSC2965 auth
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/matrix/client")
+                .header(header::HOST, "token-only.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let wk = body_json(resp).await;
+    assert_eq!(
+        wk["m.homeserver"]["base_url"],
+        "https://token-only.example.com"
+    );
+    assert_eq!(
+        wk["org.matrix.msc4143.rtc_foci"][0]["livekit_service_url"],
+        "https://token-only.example.com/_rtc"
+    );
+    assert_eq!(
+        wk["org.matrix.msc2965.authentication"]["issuer"],
+        format!("{}/", cluster.auth_url)
+    );
+    assert_eq!(
+        wk["org.matrix.msc2965.authentication"]["account"],
+        format!("{}/account", cluster.auth_url)
+    );
+
+    // 1b. auth_metadata keeps issuer + interactive endpoints on official Auth origin,
+    //     while rewriting background token/registration/revocation/jwks endpoints to proxy
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_matrix/client/v1/auth_metadata")
+                .header(header::HOST, "token-only.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let meta = body_json(resp).await;
+    assert_eq!(meta["issuer"], format!("{}/", cluster.auth_url));
+    assert_eq!(
+        meta["authorization_endpoint"],
+        format!("{}/authorize", cluster.auth_url)
+    );
+    assert_eq!(
+        meta["account_management_uri"],
+        format!("{}/account", cluster.auth_url)
+    );
+    assert_eq!(
+        meta["org.matrix.matrix-authentication-service.graphql_endpoint"],
+        format!("{}/account/graphql", cluster.auth_url)
+    );
+    assert_eq!(
+        meta["token_endpoint"],
+        "https://token-only.example.com/oauth2/token"
+    );
+    assert_eq!(
+        meta["registration_endpoint"],
+        "https://token-only.example.com/oauth2/registration"
+    );
+    assert_eq!(
+        meta["revocation_endpoint"],
+        "https://token-only.example.com/oauth2/revoke"
+    );
+    assert_eq!(
+        meta["jwks_uri"],
+        "https://token-only.example.com/oauth2/keys.json"
+    );
+
+    // 1c. SSO redirect Location stays on official Auth origin (doesn't trap multi-hop IdP)
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_matrix/client/v3/login/sso/redirect")
+                .header(header::HOST, "token-only.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    assert_eq!(
+        resp.headers().get(header::LOCATION).unwrap(),
+        format!("{}/authorize?compat=1", cluster.auth_url).as_str()
+    );
+
+    // 1d. Background token exchange & Matrix sync still proxy seamlessly through matrix-proxy
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/oauth2/token")
+                .header(header::HOST, "token-only.example.com")
+                .body(Body::from("grant_type=refresh_token&refresh_token=rt_1"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["access_token"], "mat_tok_idp");
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_proxy/info")
+                .header(header::HOST, "token-only.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        body_json(resp).await["discovery"]["auth_proxy_mode"],
+        "token_only"
+    );
+
+    // --- 2. `direct` mode ---
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/matrix/client")
+                .header(header::HOST, "direct-auth.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let wk_direct = body_json(resp).await;
+    assert_eq!(
+        wk_direct["m.homeserver"]["base_url"],
+        "https://direct-auth.example.com"
+    );
+    assert_eq!(
+        wk_direct["org.matrix.msc2965.authentication"]["issuer"],
+        format!("{}/", cluster.auth_url)
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_matrix/client/v1/auth_metadata")
+                .header(header::HOST, "direct-auth.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let meta_direct = body_json(resp).await;
+    assert_eq!(meta_direct["issuer"], format!("{}/", cluster.auth_url));
+    assert_eq!(
+        meta_direct["authorization_endpoint"],
+        format!("{}/authorize", cluster.auth_url)
+    );
+    assert_eq!(
+        meta_direct["token_endpoint"],
+        format!("{}/oauth2/token", cluster.auth_url)
+    );
+    assert_eq!(
+        meta_direct["org.matrix.matrix-authentication-service.graphql_endpoint"],
+        format!("{}/account/graphql", cluster.auth_url)
+    );
 }

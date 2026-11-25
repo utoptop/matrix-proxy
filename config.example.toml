@@ -1,5 +1,5 @@
 # =============================================================================
-# matrix-proxy v1.4 — Clean Configuration Reference
+# matrix-proxy v1.4.1 — Clean Configuration Reference
 # =============================================================================
 # THREE SIMPLE LAYERS (Highest -> Lowest Precedence):
 #   1. `[[proxies]]`  — Per-node config (ALWAYS wins over `[defaults]` & `[server]`)
@@ -100,6 +100,15 @@ upstream_proxy_protocol = "off"     # "off" | "v1" | "v2" (MUST stay "off" for p
 
 # Routing, rewriting & discovery defaults:
 auth_mode = "root"                  # "root" (recommended for MAS/OIDC) | "prefix" (`/_auth`)
+# How OAuth 2.0 / OIDC / MAS endpoints are rewritten:
+#   "full"       (default) — proxy both interactive browser login and background token endpoints
+#   "token_only"           — keep interactive login (`issuer`, `authorization_endpoint`, `account_management_uri`,
+#                            MAS `graphql_endpoint`) on the official Auth origin so multi-hop external IdPs
+#                            (Mozilla Accounts, Google, Apple, Passkey) work cleanly, while still proxying
+#                            `token_endpoint`, `registration_endpoint`, `revocation_endpoint`, `jwks_uri`,
+#                            Matrix API and RTC 24/7
+#   "direct"               — pass Auth/OIDC metadata through verbatim; proxy Matrix API & RTC only
+auth_proxy_mode = "full"
 auth_prefix = "/_auth"
 rtc_prefix = "/_rtc"
 proxy_prefix = "/_proxy"
@@ -197,3 +206,18 @@ upstream_rewrite_origins = ["https://public-origin.example.net"]
 # matrix_proxy_public_auth_url = "https://auth-dual.example.com"
 # upstream_matrix_server_url = "https://hs-dual.example.org"
 # upstream_matrix_auth_url = "https://mas-dual.example.org"
+
+
+# -----------------------------------------------------------------------------
+# Node 6 (Optional Multi-Hop Third-Party OIDC IdP — `auth_proxy_mode = "token_only"`)
+# Use when the upstream Matrix Auth redirects to external IdPs (Mozilla Accounts,
+# Google, Apple, Passkey): initial browser login runs on the official Auth origin,
+# while token refresh, Matrix sync/media, and LiveKit RTC stay proxied 24/7.
+# -----------------------------------------------------------------------------
+# [[proxies]]
+# name = "mozilla-chat"
+# matrix_proxy_public_url = "https://mozilla.example.com"
+# upstream_matrix_server_url = "https://mozilla.modular.im"
+# upstream_matrix_auth_url = "https://chat.mozilla.org"
+# upstream_matrix_server_name = "mozilla.org"
+# auth_proxy_mode = "token_only"

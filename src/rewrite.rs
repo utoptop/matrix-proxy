@@ -1,28 +1,40 @@
 use crate::client_ip::ClientInfo;
-use crate::config::{AuthRouteMode, ProxyProfile, normalized_base_url, origin_string};
+use crate::config::{
+    AuthProxyMode, AuthRouteMode, ProxyProfile, normalized_base_url, origin_string,
+};
 use crate::discovery::ResolvedUpstreams;
 use http::HeaderMap;
 use serde_json::{Map, Value, json};
 use url::Url;
 
-/// All OAuth 2.0 / OIDC / Matrix auth_metadata URL fields that must route through the proxy.
-const AUTH_METADATA_ENDPOINT_KEYS: &[&str] = &[
-    "authorization_endpoint",
+/// Non-interactive OAuth 2.0 / OIDC machine-to-machine endpoints called by Matrix clients in the
+/// background (token exchange, silent token refresh, logout revocation, DCR, JWKS).
+/// Rewritten in both `auth_proxy_mode = "full"` and `auth_proxy_mode = "token_only"`.
+const AUTH_METADATA_BACKGROUND_KEYS: &[&str] = &[
     "token_endpoint",
     "registration_endpoint",
     "revocation_endpoint",
     "jwks_uri",
     "userinfo_endpoint",
-    "device_authorization_endpoint",
-    "account_management_uri",
     "pushed_authorization_request_endpoint",
     "introspection_endpoint",
+];
+
+/// Browser-interactive OAuth 2.0 / OIDC / MAS UI endpoints (where third-party IdPs such as
+/// Mozilla Accounts, Google, Apple, or Passkey/WebAuthn run).
+/// Rewritten ONLY in `auth_proxy_mode = "full"`; preserved on the official Auth origin in
+/// `token_only` and `direct` modes to avoid `redirect_uri` mismatch and anti-phishing blocks.
+const AUTH_METADATA_INTERACTIVE_KEYS: &[&str] = &[
+    "authorization_endpoint",
+    "device_authorization_endpoint",
+    "account_management_uri",
     "end_session_endpoint",
     "check_session_iframe",
     "service_documentation",
     "op_policy_uri",
     "op_tos_uri",
     "account",
+    "org.matrix.matrix-authentication-service.graphql_endpoint",
 ];
 
 #[derive(Debug, Clone)]
@@ -250,22 +262,35 @@ impl<'a> RewriteEngine<'a> {
     }
 
     pub fn rewrite_auth_metadata(&self, mut doc: Value) -> Value {
+        let mode = self.profile.discovery.auth_proxy_mode;
+        if mode == AuthProxyMode::Direct {
+            return doc;
+        }
         let Some(obj) = doc.as_object_mut() else {
             return doc;
         };
 
-        for key in AUTH_METADATA_ENDPOINT_KEYS {
+        for key in AUTH_METADATA_BACKGROUND_KEYS {
             if let Some(Value::String(val)) = obj.get(*key) {
                 let rewritten = self.rewrite_url_str(val, true);
                 obj.insert((*key).to_string(), Value::String(rewritten));
             }
         }
 
-        if self.profile.discovery.rewrite_issuer
-            && let Some(Value::String(issuer)) = obj.get("issuer")
-        {
-            let rewritten = self.rewrite_url_str(issuer, true);
-            obj.insert("issuer".to_string(), Value::String(rewritten));
+        if mode == AuthProxyMode::Full {
+            for key in AUTH_METADATA_INTERACTIVE_KEYS {
+                if let Some(Value::String(val)) = obj.get(*key) {
+                    let rewritten = self.rewrite_url_str(val, true);
+                    obj.insert((*key).to_string(), Value::String(rewritten));
+                }
+            }
+
+            if self.profile.discovery.rewrite_issuer
+                && let Some(Value::String(issuer)) = obj.get("issuer")
+            {
+                let rewritten = self.rewrite_url_str(issuer, true);
+                obj.insert("issuer".to_string(), Value::String(rewritten));
+            }
         }
 
         doc
@@ -293,17 +318,20 @@ impl<'a> RewriteEngine<'a> {
         hs_obj.insert("base_url".to_string(), Value::String(public_matrix_base));
         root.insert("m.homeserver".to_string(), Value::Object(hs_obj));
 
+        let rewrite_wk_auth = self.profile.discovery.auth_proxy_mode == AuthProxyMode::Full;
         if let Some(Value::Object(mut auth_obj)) = root.remove("org.matrix.msc2965.authentication")
         {
-            if self.profile.discovery.rewrite_issuer
-                && let Some(Value::String(issuer)) = auth_obj.get("issuer")
-            {
-                let rewritten = self.rewrite_url_str(issuer, true);
-                auth_obj.insert("issuer".to_string(), Value::String(rewritten));
-            }
-            if let Some(Value::String(account)) = auth_obj.get("account") {
-                let rewritten = self.rewrite_url_str(account, true);
-                auth_obj.insert("account".to_string(), Value::String(rewritten));
+            if rewrite_wk_auth {
+                if self.profile.discovery.rewrite_issuer
+                    && let Some(Value::String(issuer)) = auth_obj.get("issuer")
+                {
+                    let rewritten = self.rewrite_url_str(issuer, true);
+                    auth_obj.insert("issuer".to_string(), Value::String(rewritten));
+                }
+                if let Some(Value::String(account)) = auth_obj.get("account") {
+                    let rewritten = self.rewrite_url_str(account, true);
+                    auth_obj.insert("account".to_string(), Value::String(rewritten));
+                }
             }
             root.insert(
                 "org.matrix.msc2965.authentication".to_string(),
@@ -311,7 +339,7 @@ impl<'a> RewriteEngine<'a> {
             );
         } else if self.profile.discovery.force_msc2965_well_known {
             let issuer = if let Some(discovered) = &self.upstreams.discovered_issuer {
-                if self.profile.discovery.rewrite_issuer {
+                if rewrite_wk_auth && self.profile.discovery.rewrite_issuer {
                     self.rewrite_url_str(discovered, true)
                 } else {
                     discovered.clone()
@@ -379,8 +407,27 @@ impl<'a> RewriteEngine<'a> {
             return trimmed.to_string();
         }
 
+        // In `token_only` or `direct` auth modes, keep browser SSO redirects pointing to the official Auth origin.
+        if self.profile.discovery.auth_proxy_mode != AuthProxyMode::Full
+            && !from_auth_upstream
+            && let Ok(parsed) = Url::parse(trimmed)
+        {
+            let loc_origin = origin_string(&parsed);
+            if loc_origin == self.upstreams.auth_origin
+                || self
+                    .upstreams
+                    .observed_auth_origins
+                    .iter()
+                    .any(|o| o == &loc_origin)
+            {
+                return trimmed.to_string();
+            }
+        }
+
         let rewritten_origin = self.rewrite_url_str(trimmed, from_auth_upstream);
-        if !self.profile.discovery.rewrite_issuer {
+        if !self.profile.discovery.rewrite_issuer
+            || self.profile.discovery.auth_proxy_mode != AuthProxyMode::Full
+        {
             return rewritten_origin;
         }
 
