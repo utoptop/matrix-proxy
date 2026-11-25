@@ -48,9 +48,13 @@ struct Cli {
     #[arg(short, long, env = "MATRIX_PROXY_CONFIG")]
     config: Option<PathBuf>,
 
-    /// Perform an HTTP(S) or PPv2 health check against all locally configured proxy listeners and exit 0/1
+    /// Perform an HTTP(S) or PROXY Protocol health check against all locally configured listeners and exit 0/1
     #[arg(long)]
     health_check: bool,
+
+    /// Validate TOML configuration, listener routing rules, outbound proxies, and TLS certificates, then exit 0/1
+    #[arg(long)]
+    check_config: bool,
 }
 
 #[derive(Clone)]
@@ -478,6 +482,10 @@ async fn main() -> Result<()> {
         return run_health_check(resolved_config_path.as_deref()).await;
     }
 
+    if cli.check_config {
+        return run_check_config(resolved_config_path.as_deref());
+    }
+
     init_tracing();
 
     if let Some(path) = &resolved_config_path {
@@ -830,6 +838,57 @@ fn resolve_config_path(explicit: Option<PathBuf>) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn run_check_config(config_path: Option<&Path>) -> Result<()> {
+    let config = Config::load(config_path)?;
+    let runtime = config.into_runtime()?;
+    for plan in &runtime.listeners {
+        if plan.tls_enabled() {
+            let cert = plan.tls_cert_path.as_deref().unwrap();
+            let key = plan.tls_key_path.as_deref().unwrap();
+            let _ = load_tls_acceptor(cert, key)?;
+        }
+    }
+    let src = config_path
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<environment>".to_string());
+    println!(
+        "OK: matrix-proxy v{} configuration valid (source={}, listeners={}, global_outbound_proxy={})",
+        env!("CARGO_PKG_VERSION"),
+        src,
+        runtime.listeners.len(),
+        runtime
+            .server
+            .outbound_proxy
+            .as_deref()
+            .map(redact_proxy_url)
+            .unwrap_or_else(|| "direct".to_string()),
+    );
+    for plan in &runtime.listeners {
+        let profiles: Vec<String> = plan
+            .profiles
+            .iter()
+            .map(|p| {
+                let proxy = if let Some(raw) = &p.upstream.outbound_proxy {
+                    redact_proxy_url(raw)
+                } else if p.upstream.outbound_proxy_direct {
+                    "direct(explicit)".to_string()
+                } else {
+                    "direct".to_string()
+                };
+                format!("{}[proxy={}]", p.name, proxy)
+            })
+            .collect();
+        println!(
+            "  - listen={} tls={} inbound_pp={} profiles={}",
+            plan.listen,
+            plan.tls_enabled(),
+            plan.inbound_proxy_protocol,
+            profiles.join(", "),
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

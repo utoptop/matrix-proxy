@@ -1,7 +1,7 @@
 use crate::client_ip::{ClientInfo, InboundPeer, IpRateLimiter, apply_upstream_client_ip_headers};
 use crate::config::{
     ExposeInfoMode, ListenerPlan, ProxyProfile, ProxyProtocol, RuntimeConfig, ServerConfig,
-    normalized_base_url, redact_proxy_url,
+    normalized_base_url, redact_proxy_url, should_bypass_outbound_proxy,
 };
 use crate::discovery::{DiscoveryManager, ResolvedUpstreams};
 use crate::metrics::ProxyMetrics;
@@ -161,6 +161,11 @@ fn warn_if_pp_on_standard_https_port(profile: &ProxyProfile) {
             "upstream_matrix_auth_url",
             profile.auth_proxy_protocol(),
             profile.upstream.upstream_matrix_auth_url.as_deref(),
+        ),
+        (
+            "upstream_matrix_rtc_url",
+            profile.rtc_proxy_protocol(),
+            profile.upstream.upstream_matrix_rtc_url.as_deref(),
         ),
     ] {
         if proto.is_enabled()
@@ -341,6 +346,7 @@ fn build_http_client(
         .tcp_nodelay(server.tcp_nodelay)
         .http2_adaptive_window(true)
         .http2_keep_alive_interval(Duration::from_secs(30))
+        .http2_keep_alive_timeout(Duration::from_secs(20))
         .http2_keep_alive_while_idle(true);
 
     if server.tcp_keepalive_secs > 0 {
@@ -356,17 +362,24 @@ fn build_http_client(
         builder = builder.no_gzip().no_brotli().no_deflate();
     }
     if let Some(proxy_url) = &profile.upstream.outbound_proxy {
-        let mut proxy = reqwest::Proxy::all(proxy_url).with_context(|| {
+        // Validate proxy URL eagerly and use a unified custom matcher so CIDR/IP/domain
+        // `outbound_no_proxy` rules match 100% identically across HTTP, WebSocket, and PROXY Protocol.
+        let parsed_proxy = Url::parse(proxy_url).with_context(|| {
             format!(
                 "invalid outbound proxy '{}' in profile '{}'",
                 redact_proxy_url(proxy_url),
                 profile.name
             )
         })?;
-        if !profile.upstream.outbound_no_proxy.is_empty() {
-            let csv = profile.upstream.outbound_no_proxy.join(",");
-            proxy = proxy.no_proxy(reqwest::NoProxy::from_string(&csv));
-        }
+        let no_proxy_rules = profile.upstream.outbound_no_proxy.clone();
+        let proxy = reqwest::Proxy::custom(move |target_url| {
+            if let Some(host) = target_url.host_str()
+                && should_bypass_outbound_proxy(host, &no_proxy_rules)
+            {
+                return None;
+            }
+            Some(parsed_proxy.clone())
+        });
         // Explicitly replace ambient env proxies with the configured proxy + no_proxy rules.
         builder = builder.no_proxy().proxy(proxy);
     } else if profile.upstream.outbound_proxy_direct {
@@ -1301,6 +1314,14 @@ async fn forward_request(
                 .metrics
                 .upstream_errors_total
                 .fetch_add(1, Ordering::Relaxed);
+            if err.is_timeout() {
+                warn!(profile = %inst.profile.name, target_url = %target_url, error = %err, "upstream request timed out");
+                return json_error(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "M_UNKNOWN",
+                    "Upstream server timed out",
+                );
+            }
             warn!(profile = %inst.profile.name, target_url = %target_url, error = %err, "upstream request failed");
             return json_error(
                 StatusCode::BAD_GATEWAY,

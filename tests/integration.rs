@@ -1560,4 +1560,75 @@ async fn global_http_and_socks5_outbound_proxies_with_direct_override() {
     assert_eq!(body_json(resp_direct).await["via"], "ok");
     assert_eq!(http_proxy_hits.load(Ordering::SeqCst), http_before_direct);
     assert_eq!(socks_hits.load(Ordering::SeqCst), socks_before_direct);
+
+    // 4. Verify `outbound_no_proxy` CIDR (`127.0.0.0/8`) bypasses the global HTTP proxy via unified matcher
+    let toml_no_proxy = format!(
+        r#"
+        [server]
+        listen = "0.0.0.0:8080"
+        outbound_proxy = "http://{http_proxy_addr}"
+        outbound_no_proxy = ["127.0.0.0/8"]
+
+        [[proxies]]
+        name = "bypassed-by-cidr"
+        matrix_proxy_public_url = "https://cidr-bypass.test"
+        upstream_matrix_server_url = "http://{hs_addr}"
+        merge_upstream_well_known = false
+        "#
+    );
+    let app_cidr = build_single_listener_app(Config::from_toml_str(&toml_no_proxy).unwrap()).await;
+    let hits_before_cidr = http_proxy_hits.load(Ordering::SeqCst);
+    let resp_cidr = app_cidr
+        .oneshot(
+            Request::builder()
+                .uri("/_matrix/client/versions")
+                .header(header::HOST, "cidr-bypass.test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp_cidr.status(), StatusCode::OK);
+    assert_eq!(body_json(resp_cidr).await["via"], "ok");
+    assert_eq!(http_proxy_hits.load(Ordering::SeqCst), hits_before_cidr);
+}
+
+#[tokio::test]
+async fn standard_upstream_timeout_returns_504_gateway_timeout() {
+    let slow_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let slow_addr = slow_listener.local_addr().unwrap();
+    let slow_app = Router::new().route(
+        "/_matrix/client/versions",
+        get(|| async {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            r#"{"versions":["v1.15"]}"#
+        }),
+    );
+    tokio::spawn(async move {
+        let _ = axum::serve(slow_listener, slow_app).await;
+    });
+
+    let toml_cfg = format!(
+        r#"
+        [[proxies]]
+        name = "slow-hs"
+        matrix_proxy_public_url = "https://slow.test"
+        upstream_matrix_server_url = "http://{slow_addr}"
+        request_timeout_secs = 1
+        merge_upstream_well_known = false
+        "#
+    );
+    let app = build_single_listener_app(Config::from_toml_str(&toml_cfg).unwrap()).await;
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/_matrix/client/versions")
+                .header(header::HOST, "slow.test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
 }

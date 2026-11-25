@@ -156,12 +156,24 @@ backend bk_matrix_proxy
     # server matrix_proxy 127.0.0.1:8910 send-proxy-v2 check check-send-proxy inter 10s rise 2 fall 3
 ```
 
-## Management, Metrics & Hot Reload Endpoints
+## Management, Metrics, Validation & Hot Reload
 
+- `matrix-proxy --check-config --config /path/to/config.toml` — Offline config & TLS certificate validator (exits `0` with a listener/profile/outbound-proxy summary, or `1` on syntax/routing/TLS errors — ideal before deploying or reloading).
 - `GET /_proxy/health` — Lightweight liveness probe (`200 OK` with active `generation`, never exposes upstream config).
 - `GET /_proxy/info` — Active listeners, upstream summaries, and runtime stats (gated by `expose_info = "trusted"`; returns `403` publicly; proxy credentials are redacted).
 - `GET /_proxy/metrics` — Prometheus exposition metrics (requests, active connections, upstream errors, PROXY Protocol retries, rate limits, reload counters; gated by `expose_info`).
 - `POST /_proxy/reload` — Trigger an immediate zero-downtime config & TLS certificate reload (gated by `expose_info`; alternatively edit `config.toml` directly or send `SIGHUP`).
+
+## Configuration Precedence
+
+When global settings (`[server]`, `[upstream]`, `[routing]`, `[discovery]`) and per-profile settings (`[[proxies]]`) are both present, **the `[[proxies]]` block always takes precedence**:
+
+1. **`[[proxies]]` explicit fields** (e.g. custom `listen`, `outbound_proxy` including `"direct"`, `outbound_no_proxy`, `tls_cert_path = "off"`, `upstream_matrix_proxy_protocol`, `auth_mode`, timeouts).
+2. **Global default sections** (`[upstream]`, `[routing]`, `[discovery]`).
+3. **Global `[server]` settings** (`listen`, `outbound_proxy`, `outbound_no_proxy`, `inbound_proxy_protocol`, `tls_*`).
+4. **Built-in defaults**.
+
+See [config.example.toml](config.example.toml) for a complete, fully annotated reference covering all five deployment scenarios.
 
 ## Development & Testing
 

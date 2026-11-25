@@ -398,6 +398,7 @@ impl Ppv2Client {
                 .timer(TokioTimer::new())
                 .adaptive_window(true)
                 .keep_alive_interval(Duration::from_secs(30))
+                .keep_alive_timeout(Duration::from_secs(20))
                 .keep_alive_while_idle(true);
 
             let (sender, conn) = h2_builder
@@ -526,6 +527,15 @@ impl Ppv2Client {
                 });
                 !vec.is_empty()
             });
+            if pool.len() >= self.max_entries
+                && let Some(oldest_key) = pool
+                    .iter()
+                    .filter_map(|(k, vec)| vec.iter().map(|e| e.last_used).min().map(|t| (k, t)))
+                    .min_by_key(|(_, t)| *t)
+                    .map(|(k, _)| k.clone())
+            {
+                pool.remove(&oldest_key);
+            }
         }
         let entries = pool.entry(key).or_default();
         if entries.len() < 4 {

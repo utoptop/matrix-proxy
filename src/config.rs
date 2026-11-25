@@ -360,7 +360,7 @@ pub struct ProxyProfileInput {
     #[serde(alias = "rtc_host_header")]
     pub upstream_rtc_host_header: Option<String>,
     #[serde(alias = "rewrite_origins")]
-    pub upstream_rewrite_origins: Vec<String>,
+    pub upstream_rewrite_origins: Option<Vec<String>>,
     /// Optional per-profile outbound proxy override (`http://`, `https://`, `socks5://`, `socks5h://`, or `"direct"` to bypass global `[server].outbound_proxy`).
     pub outbound_proxy: Option<String>,
     /// Optional per-profile `outbound_no_proxy` override (inherits `[server].outbound_no_proxy` when omitted).
@@ -858,13 +858,18 @@ impl Config {
                 format!("invalid listen address '{listen_raw}' in profile '{name}'")
             })?;
 
-            let tls_cert_path = opt_trim(raw.tls_cert_path.as_deref())
-                .or_else(|| opt_trim(self.server.tls_cert_path.as_deref()));
-            let tls_key_path = opt_trim(raw.tls_key_path.as_deref())
-                .or_else(|| opt_trim(self.server.tls_key_path.as_deref()));
+            // Per-profile TLS override: explicit `""` / `"off"` / `"none"` disables TLS even if `[server]` enables it.
+            let tls_cert_path = resolve_optional_tls_path(
+                raw.tls_cert_path.as_deref(),
+                self.server.tls_cert_path.as_deref(),
+            );
+            let tls_key_path = resolve_optional_tls_path(
+                raw.tls_key_path.as_deref(),
+                self.server.tls_key_path.as_deref(),
+            );
             if tls_cert_path.is_some() ^ tls_key_path.is_some() {
                 bail!(
-                    "profile '{name}': tls_cert_path and tls_key_path must both be set or both omitted"
+                    "profile '{name}': tls_cert_path and tls_key_path must both be set or both omitted/disabled"
                 );
             }
             let inbound_proxy_protocol = raw
@@ -922,6 +927,11 @@ impl Config {
                 normalize_no_proxy_list(&self.server.outbound_no_proxy)
             };
 
+            let effective_rewrite_origins = raw
+                .upstream_rewrite_origins
+                .clone()
+                .unwrap_or_else(|| self.upstream.upstream_rewrite_origins.clone());
+
             let mut upstream = UpstreamConfig {
                 upstream_matrix_server_url: raw.upstream_matrix_server_url.clone(),
                 upstream_matrix_auth_url: raw.upstream_matrix_auth_url.clone(),
@@ -930,7 +940,7 @@ impl Config {
                 upstream_matrix_host_header: raw.upstream_matrix_host_header.clone(),
                 upstream_auth_host_header: raw.upstream_auth_host_header.clone(),
                 upstream_rtc_host_header: raw.upstream_rtc_host_header.clone(),
-                upstream_rewrite_origins: raw.upstream_rewrite_origins.clone(),
+                upstream_rewrite_origins: effective_rewrite_origins,
                 outbound_proxy: effective_outbound_proxy,
                 outbound_no_proxy: effective_outbound_no_proxy,
                 outbound_proxy_direct: false,
@@ -1159,6 +1169,12 @@ fn group_into_listeners(profiles: Vec<ProxyProfile>) -> Result<Vec<ListenerPlan>
             if p.inbound_proxy_protocol != first_inbound_pp {
                 bail!(
                     "listener {listen}: profiles sharing the same port must use identical inbound_proxy_protocol setting (conflict in '{}')",
+                    p.name
+                );
+            }
+            if p.routing.proxy_prefix != first_proxy_prefix {
+                bail!(
+                    "listener {listen}: profiles sharing the same port must use identical proxy_prefix setting (conflict in '{}')",
                     p.name
                 );
             }
@@ -1446,6 +1462,26 @@ fn opt_trim(opt: Option<&str>) -> Option<String> {
     opt.map(str::trim)
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
+}
+
+fn resolve_optional_tls_path(
+    profile_val: Option<&str>,
+    global_val: Option<&str>,
+) -> Option<String> {
+    match profile_val {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty()
+                || trimmed.eq_ignore_ascii_case("off")
+                || trimmed.eq_ignore_ascii_case("none")
+            {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        None => opt_trim(global_val),
+    }
 }
 
 fn normalize_opt_string(opt: &mut Option<String>) {
@@ -1849,6 +1885,120 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("duplicate routing host"));
+    }
+
+    #[test]
+    fn profile_fields_always_override_global_defaults() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [server]
+            listen = "0.0.0.0:8080"
+            tls_cert_path = "/etc/certs/global.pem"
+            tls_key_path = "/etc/certs/global.key"
+            outbound_proxy = "http://127.0.0.1:7890"
+            outbound_no_proxy = ["127.0.0.1", "10.0.0.0/8"]
+
+            [upstream]
+            client_ip_mode = "append"
+            connect_timeout_secs = 20
+            request_timeout_secs = 120
+            upstream_rewrite_origins = ["https://global-origin.example.org"]
+
+            [routing]
+            auth_mode = "prefix"
+            auth_prefix = "/_auth"
+
+            [discovery]
+            cache_ttl_secs = 120
+
+            [[proxies]]
+            name = "inherits-all"
+            matrix_proxy_public_url = "https://inherit.example.com"
+            upstream_matrix_server_url = "https://hs1.example.org"
+
+            [[proxies]]
+            name = "overrides-all"
+            listen = "0.0.0.0:8081"
+            tls_cert_path = "off"
+            tls_key_path = "off"
+            matrix_proxy_public_url = "http://100.64.0.10:8081"
+            upstream_matrix_server_url = "https://hs2.example.org"
+            outbound_proxy = "socks5h://user:pass@127.0.0.1:1080"
+            outbound_no_proxy = ["100.64.0.0/10"]
+            upstream_rewrite_origins = ["https://profile-only.example.org"]
+            client_ip_mode = "replace"
+            connect_timeout_secs = 5
+            request_timeout_secs = 0
+            auth_mode = "root"
+            cache_ttl_secs = 30
+            "#,
+        )
+        .unwrap()
+        .into_runtime()
+        .unwrap();
+
+        assert_eq!(cfg.listeners.len(), 2);
+        let l0 = &cfg.listeners[0];
+        let p0 = &l0.profiles[0];
+        assert_eq!(l0.listen.port(), 8080);
+        assert!(l0.tls_enabled());
+        assert_eq!(
+            p0.upstream.outbound_proxy.as_deref(),
+            Some("http://127.0.0.1:7890")
+        );
+        assert_eq!(
+            p0.upstream.outbound_no_proxy,
+            vec!["127.0.0.1", "10.0.0.0/8"]
+        );
+        assert_eq!(
+            p0.parsed_rewrite_origins,
+            vec!["https://global-origin.example.org"]
+        );
+        assert_eq!(p0.upstream.client_ip_mode, ClientIpMode::Append);
+        assert_eq!(p0.upstream.connect_timeout_secs, 20);
+        assert_eq!(p0.upstream.request_timeout_secs, 120);
+        assert_eq!(p0.routing.auth_mode, AuthRouteMode::Prefix);
+        assert_eq!(p0.discovery.cache_ttl_secs, 120);
+
+        let l1 = &cfg.listeners[1];
+        let p1 = &l1.profiles[0];
+        assert_eq!(l1.listen.port(), 8081);
+        assert!(!l1.tls_enabled());
+        assert_eq!(
+            p1.upstream.outbound_proxy.as_deref(),
+            Some("socks5h://user:pass@127.0.0.1:1080")
+        );
+        assert_eq!(p1.upstream.outbound_no_proxy, vec!["100.64.0.0/10"]);
+        assert_eq!(
+            p1.parsed_rewrite_origins,
+            vec!["https://profile-only.example.org"]
+        );
+        assert_eq!(p1.upstream.client_ip_mode, ClientIpMode::Replace);
+        assert_eq!(p1.upstream.connect_timeout_secs, 5);
+        assert_eq!(p1.upstream.request_timeout_secs, 0);
+        assert_eq!(p1.routing.auth_mode, AuthRouteMode::Root);
+        assert_eq!(p1.discovery.cache_ttl_secs, 30);
+    }
+
+    #[test]
+    fn shared_port_conflicting_proxy_prefix_is_rejected() {
+        let err = Config::from_toml_str(
+            r#"
+            [[proxies]]
+            name = "p1"
+            matrix_proxy_public_url = "https://a.example.com"
+            upstream_matrix_server_url = "https://hs1.example.com"
+            proxy_prefix = "/_proxy"
+
+            [[proxies]]
+            name = "p2"
+            matrix_proxy_public_url = "https://b.example.com"
+            upstream_matrix_server_url = "https://hs2.example.com"
+            proxy_prefix = "/_admin"
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("identical proxy_prefix"));
     }
 
     #[test]
