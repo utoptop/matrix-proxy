@@ -251,6 +251,52 @@ async fn spawn_mock_cluster(tag: &'static str) -> MockCluster {
             ),
         )
         .route(
+            "/_matrix/client/v3/keys/device_signing/upload",
+            post(
+                |State(st): State<Arc<(String, String, String, &'static str)>>,
+                 headers: HeaderMap| async move {
+                    let a = &st.1;
+                    let doc = json!({
+                        "session": "uia_sess_reset_1",
+                        "flows": [{ "stages": ["m.oauth"] }],
+                        "params": {
+                            "m.oauth": {
+                                "url": format!("{a}/account/?action=org.matrix.cross_signing_reset")
+                            },
+                            "org.matrix.cross_signing_reset": {
+                                "approval_url": format!("{a}/account/reset-approval")
+                            }
+                        }
+                    });
+                    let body_bytes = doc.to_string().into_bytes();
+                    let wants_gzip = headers
+                        .get(header::ACCEPT_ENCODING)
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(|v| v.contains("gzip"));
+                    if wants_gzip {
+                        use flate2::Compression;
+                        use flate2::write::GzEncoder;
+                        use std::io::Write;
+                        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+                        enc.write_all(&body_bytes).unwrap();
+                        let gz = enc.finish().unwrap();
+                        Response::builder()
+                            .status(StatusCode::UNAUTHORIZED)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .header(header::CONTENT_ENCODING, "gzip")
+                            .body(Body::from(gz))
+                            .unwrap()
+                    } else {
+                        Response::builder()
+                            .status(StatusCode::UNAUTHORIZED)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(body_bytes))
+                            .unwrap()
+                    }
+                },
+            ),
+        )
+        .route(
             "/_matrix/media/v3/upload",
             post(|body: Body| async move {
                 let bytes = body.collect().await.unwrap().to_bytes();
@@ -1926,4 +1972,82 @@ async fn auth_metadata_cache_coalesces_upstream_fetches_and_preserves_dynamic_ho
     }
 
     assert_eq!(hits.load(Ordering::SeqCst) - hits_after_startup, 1);
+}
+
+#[tokio::test]
+async fn matrix_401_uia_cross_signing_reset_rewrites_oauth_approval_url() {
+    let cluster = spawn_mock_cluster("uia").await;
+
+    let toml_cfg = format!(
+        r#"
+        [[proxies]]
+        name = "full-node"
+        matrix_proxy_public_url = "https://full-uia.example.com"
+        upstream_matrix_server_url = "{}"
+        upstream_matrix_auth_url = "{}"
+        auth_proxy_mode = "full"
+
+        [[proxies]]
+        name = "token-only-node"
+        matrix_proxy_public_url = "https://token-uia.example.com"
+        upstream_matrix_server_url = "{}"
+        upstream_matrix_auth_url = "{}"
+        auth_proxy_mode = "token_only"
+        "#,
+        cluster.matrix_url, cluster.auth_url, cluster.matrix_url, cluster.auth_url
+    );
+
+    let app = build_single_listener_app(Config::from_toml_str(&toml_cfg).unwrap()).await;
+
+    // 1. In `full` mode, Matrix 401 UIA `m.oauth.url` & `approval_url` (even gzipped!) are rewritten to proxy
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/_matrix/client/v3/keys/device_signing/upload")
+                .header(header::HOST, "full-uia.example.com")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT_ENCODING, "gzip, br")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(resp.headers().get(header::CONTENT_ENCODING).is_none());
+    let uia = body_json(resp).await;
+    assert_eq!(uia["session"], "uia_sess_reset_1");
+    assert_eq!(
+        uia["params"]["m.oauth"]["url"],
+        "https://full-uia.example.com/account/?action=org.matrix.cross_signing_reset"
+    );
+    assert_eq!(
+        uia["params"]["org.matrix.cross_signing_reset"]["approval_url"],
+        "https://full-uia.example.com/account/reset-approval"
+    );
+
+    // 2. In `token_only` mode, Matrix 401 UIA interactive OAuth URL stays on official Auth origin
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/_matrix/client/v3/keys/device_signing/upload")
+                .header(header::HOST, "token-uia.example.com")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let uia_tok = body_json(resp).await;
+    assert_eq!(
+        uia_tok["params"]["m.oauth"]["url"],
+        format!(
+            "{}/account/?action=org.matrix.cross_signing_reset",
+            cluster.auth_url
+        )
+    );
 }

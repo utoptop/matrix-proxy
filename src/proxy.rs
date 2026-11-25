@@ -1250,9 +1250,11 @@ async fn forward_request(
 
     let (parts, body) = req.into_parts();
     let is_auth = kind == ForwardKind::Auth;
-    let should_maybe_rewrite_body = is_auth
-        && inst.profile.discovery.rewrite_auth_body
-        && inst.profile.discovery.auth_proxy_mode == AuthProxyMode::Full;
+    let is_full_auth_mode = inst.profile.discovery.auth_proxy_mode == AuthProxyMode::Full;
+    let should_maybe_rewrite_body =
+        is_auth && inst.profile.discovery.rewrite_auth_body && is_full_auth_mode;
+    let restrict_uia_encoding =
+        kind == ForwardKind::Matrix && is_full_auth_mode && is_uia_matrix_path(target_url.path());
 
     // Collect dynamic hop-by-hop headers declared via RFC 9110 `Connection: ...`.
     let dynamic_req_hop = collect_connection_headers(&parts.headers);
@@ -1266,7 +1268,9 @@ async fn forward_request(
         {
             continue;
         }
-        if should_maybe_rewrite_body && name == http::header::ACCEPT_ENCODING {
+        if (should_maybe_rewrite_body || restrict_uia_encoding)
+            && name == http::header::ACCEPT_ENCODING
+        {
             continue;
         }
         if (name == http::header::ORIGIN || name == http::header::REFERER)
@@ -1285,6 +1289,13 @@ async fn forward_request(
         out_headers.insert(
             http::header::ACCEPT_ENCODING,
             HeaderValue::from_static("identity"),
+        );
+    } else if restrict_uia_encoding {
+        // Ensure UIA `401`/`403` JSON responses (e.g. cross-signing reset `m.oauth.url`) arrive
+        // in gzip or identity encoding so they can always be decoded and rewritten.
+        out_headers.insert(
+            http::header::ACCEPT_ENCODING,
+            HeaderValue::from_static("gzip, identity"),
         );
     }
 
@@ -1425,6 +1436,57 @@ async fn forward_request(
     .await
 }
 
+const MAX_MATRIX_UIA_REWRITE_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyRewriteMode {
+    None,
+    AuthText,
+    MatrixUiaJson,
+}
+
+fn is_uia_matrix_path(path: &str) -> bool {
+    path.contains("/keys/device_signing/upload")
+        || path.contains("/delete_devices")
+        || path.contains("/devices/")
+        || path.contains("/account/")
+}
+
+fn is_json_content_type(ct: &str) -> bool {
+    ct.starts_with("application/json") || ct.starts_with("application/problem+json")
+}
+
+fn is_decodable_encoding(ce: &str) -> bool {
+    ce.is_empty() || ce == "identity" || ce == "gzip" || ce == "x-gzip" || ce == "deflate"
+}
+
+fn apply_buffered_body_rewrite(
+    mode: BodyRewriteMode,
+    rewriter: &RewriteEngine<'_>,
+    content_encoding: &str,
+    bytes: Vec<u8>,
+) -> Vec<u8> {
+    let decoded = maybe_gunzip(content_encoding, &bytes).unwrap_or(bytes);
+    match mode {
+        BodyRewriteMode::None => decoded,
+        BodyRewriteMode::AuthText => match String::from_utf8(decoded) {
+            Ok(text) => rewriter.rewrite_auth_text_body(&text).into_bytes(),
+            Err(err) => err.into_bytes(),
+        },
+        BodyRewriteMode::MatrixUiaJson => match serde_json::from_slice::<Value>(&decoded) {
+            Ok(val) => {
+                let (rewritten, changed) = rewriter.rewrite_matrix_uia_json(val);
+                if changed {
+                    serde_json::to_vec(&rewritten).unwrap_or(decoded)
+                } else {
+                    decoded
+                }
+            }
+            Err(_) => decoded,
+        },
+    }
+}
+
 async fn finish_hyper_response(
     server_cfg: &ServerConfig,
     rewriter: &RewriteEngine<'_>,
@@ -1437,11 +1499,15 @@ async fn finish_hyper_response(
     let status = upstream_resp.status();
     let resp_headers = upstream_resp.headers().clone();
 
-    let (do_body_rewrite, content_encoding) = check_body_rewrite(
+    let (rewrite_mode, content_encoding, max_bytes) = check_body_rewrite(
+        kind,
+        status,
         &resp_headers,
+        rewriter.profile.discovery.auth_proxy_mode,
         should_maybe_rewrite_body,
         server_cfg.max_rewrite_body_bytes,
     );
+    let do_body_rewrite = rewrite_mode != BodyRewriteMode::None;
 
     let out_builder = build_rewritten_response_headers(
         status,
@@ -1454,30 +1520,19 @@ async fn finish_hyper_response(
     );
 
     if do_body_rewrite {
-        match read_bounded_incoming(upstream_resp.into_body(), server_cfg.max_rewrite_body_bytes)
-            .await
-        {
+        match read_bounded_incoming(upstream_resp.into_body(), max_bytes).await {
             Ok(BoundedBody::Buffered(bytes)) => {
-                let decoded = maybe_gunzip(&content_encoding, &bytes).unwrap_or(bytes);
-                match String::from_utf8(decoded) {
-                    Ok(text) => {
-                        let rewritten = rewriter.rewrite_auth_text_body(&text);
-                        out_builder.body(Body::from(rewritten)).unwrap_or_else(|_| {
-                            json_error(StatusCode::BAD_GATEWAY, "M_UNKNOWN", "response error")
-                        })
-                    }
-                    Err(err) => out_builder
-                        .body(Body::from(err.into_bytes()))
-                        .unwrap_or_else(|_| {
-                            json_error(StatusCode::BAD_GATEWAY, "M_UNKNOWN", "response error")
-                        }),
-                }
+                let out =
+                    apply_buffered_body_rewrite(rewrite_mode, rewriter, &content_encoding, bytes);
+                out_builder.body(Body::from(out)).unwrap_or_else(|_| {
+                    json_error(StatusCode::BAD_GATEWAY, "M_UNKNOWN", "response error")
+                })
             }
             Ok(BoundedBody::Overflowed(body)) => out_builder.body(body).unwrap_or_else(|_| {
                 json_error(StatusCode::BAD_GATEWAY, "M_UNKNOWN", "response error")
             }),
             Err(err) => {
-                warn!(error = %err, "error reading PPv2 auth response body");
+                warn!(error = %err, "error reading PPv2 response body");
                 json_error(StatusCode::BAD_GATEWAY, "M_UNKNOWN", "Upstream read error")
             }
         }
@@ -1500,11 +1555,15 @@ async fn finish_reqwest_response(
     let status = upstream_resp.status();
     let resp_headers = upstream_resp.headers().clone();
 
-    let (do_body_rewrite, _) = check_body_rewrite(
+    let (rewrite_mode, content_encoding, max_bytes) = check_body_rewrite(
+        kind,
+        status,
         &resp_headers,
+        rewriter.profile.discovery.auth_proxy_mode,
         should_maybe_rewrite_body,
         server_cfg.max_rewrite_body_bytes,
     );
+    let do_body_rewrite = rewrite_mode != BodyRewriteMode::None;
 
     let out_builder = build_rewritten_response_headers(
         status,
@@ -1517,25 +1576,25 @@ async fn finish_reqwest_response(
     );
 
     if do_body_rewrite {
-        match read_bounded_reqwest(upstream_resp, server_cfg.max_rewrite_body_bytes).await {
-            Ok(BoundedBody::Buffered(bytes)) => match String::from_utf8(bytes) {
-                Ok(text) => {
-                    let rewritten = rewriter.rewrite_auth_text_body(&text);
-                    out_builder.body(Body::from(rewritten)).unwrap_or_else(|_| {
-                        json_error(StatusCode::BAD_GATEWAY, "M_UNKNOWN", "response error")
-                    })
-                }
-                Err(err) => out_builder
-                    .body(Body::from(err.into_bytes()))
-                    .unwrap_or_else(|_| {
-                        json_error(StatusCode::BAD_GATEWAY, "M_UNKNOWN", "response error")
-                    }),
-            },
+        match read_bounded_reqwest(upstream_resp, max_bytes).await {
+            Ok(BoundedBody::Buffered(bytes)) => {
+                // `rewrite_client` auto-decompresses Auth responses, while `stream_client` preserves
+                // upstream Content-Encoding on Matrix UIA `401`/`403` responses (decoded here via `maybe_gunzip`).
+                let effective_enc = if rewrite_mode == BodyRewriteMode::MatrixUiaJson {
+                    content_encoding.as_str()
+                } else {
+                    ""
+                };
+                let out = apply_buffered_body_rewrite(rewrite_mode, rewriter, effective_enc, bytes);
+                out_builder.body(Body::from(out)).unwrap_or_else(|_| {
+                    json_error(StatusCode::BAD_GATEWAY, "M_UNKNOWN", "response error")
+                })
+            }
             Ok(BoundedBody::Overflowed(body)) => out_builder.body(body).unwrap_or_else(|_| {
                 json_error(StatusCode::BAD_GATEWAY, "M_UNKNOWN", "response error")
             }),
             Err(err) => {
-                warn!(error = %err, "error reading auth response body");
+                warn!(error = %err, "error reading upstream response body");
                 json_error(StatusCode::BAD_GATEWAY, "M_UNKNOWN", "Upstream read error")
             }
         }
@@ -1548,10 +1607,13 @@ async fn finish_reqwest_response(
 }
 
 fn check_body_rewrite(
+    kind: ForwardKind,
+    status: StatusCode,
     resp_headers: &HeaderMap,
+    auth_proxy_mode: AuthProxyMode,
     should_maybe_rewrite_body: bool,
-    max_bytes: usize,
-) -> (bool, String) {
+    max_auth_bytes: usize,
+) -> (BodyRewriteMode, String, usize) {
     let content_type = resp_headers
         .get(http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -1567,10 +1629,30 @@ fn check_body_rewrite(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<usize>().ok());
 
-    let do_rewrite = should_maybe_rewrite_body
+    if should_maybe_rewrite_body
         && is_rewritable_auth_content_type(&content_type)
-        && content_len.map(|n| n <= max_bytes).unwrap_or(true);
-    (do_rewrite, content_encoding)
+        && content_len.map(|n| n <= max_auth_bytes).unwrap_or(true)
+    {
+        return (BodyRewriteMode::AuthText, content_encoding, max_auth_bytes);
+    }
+
+    if kind == ForwardKind::Matrix
+        && auth_proxy_mode == AuthProxyMode::Full
+        && matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+        && is_json_content_type(&content_type)
+        && is_decodable_encoding(&content_encoding)
+        && content_len
+            .map(|n| n <= MAX_MATRIX_UIA_REWRITE_BYTES)
+            .unwrap_or(true)
+    {
+        return (
+            BodyRewriteMode::MatrixUiaJson,
+            content_encoding,
+            MAX_MATRIX_UIA_REWRITE_BYTES,
+        );
+    }
+
+    (BodyRewriteMode::None, content_encoding, 0)
 }
 
 fn build_rewritten_response_headers(

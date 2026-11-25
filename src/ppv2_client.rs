@@ -689,13 +689,20 @@ pub fn configure_tcp_socket(stream: &TcpStream, nodelay: bool, keepalive: Durati
 }
 
 pub fn maybe_gunzip(content_encoding: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Read;
     if content_encoding.contains("gzip") {
-        use std::io::Read;
         let mut decoder = flate2::read::GzDecoder::new(bytes);
         let mut out = Vec::new();
         decoder
             .read_to_end(&mut out)
             .context("failed to gunzip upstream response")?;
+        Ok(out)
+    } else if content_encoding.contains("deflate") {
+        let mut decoder = flate2::read::ZlibDecoder::new(bytes);
+        let mut out = Vec::new();
+        decoder
+            .read_to_end(&mut out)
+            .context("failed to inflate upstream response")?;
         Ok(out)
     } else {
         Ok(bytes.to_vec())

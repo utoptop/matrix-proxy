@@ -296,6 +296,69 @@ impl<'a> RewriteEngine<'a> {
         doc
     }
 
+    /// Rewrites upstream Auth/Matrix URLs embedded inside Matrix Client-Server UIA `401`/`403` JSON
+    /// responses (e.g. MSC4312 `m.oauth` `url`, `org.matrix.cross_signing_reset` `approval_url`,
+    /// `consent_uri`) so in-app account/cross-signing resets stay on the proxy domain in `full` mode.
+    pub fn rewrite_matrix_uia_json(&self, mut doc: Value) -> (Value, bool) {
+        if self.profile.discovery.auth_proxy_mode != AuthProxyMode::Full {
+            return (doc, false);
+        }
+
+        let mut changed = false;
+        let Some(root) = doc.as_object_mut() else {
+            return (doc, false);
+        };
+
+        for key in [
+            "url",
+            "uri",
+            "approval_url",
+            "consent_uri",
+            "account_management_uri",
+            "redirect_url",
+            "fallback_url",
+        ] {
+            if let Some(Value::String(s)) = root.get_mut(key) {
+                let rewritten = self.rewrite_url_str(s, true);
+                if rewritten != *s {
+                    *s = rewritten;
+                    changed = true;
+                }
+            }
+        }
+
+        if let Some(params) = root.get_mut("params") {
+            self.rewrite_json_urls_recursive(params, &mut changed);
+        }
+
+        (doc, changed)
+    }
+
+    fn rewrite_json_urls_recursive(&self, val: &mut Value, changed: &mut bool) {
+        match val {
+            Value::String(s) => {
+                if s.starts_with("http://") || s.starts_with("https://") {
+                    let rewritten = self.rewrite_url_str(s, true);
+                    if rewritten != *s {
+                        *s = rewritten;
+                        *changed = true;
+                    }
+                }
+            }
+            Value::Array(arr) => {
+                for item in arr {
+                    self.rewrite_json_urls_recursive(item, changed);
+                }
+            }
+            Value::Object(map) => {
+                for v in map.values_mut() {
+                    self.rewrite_json_urls_recursive(v, changed);
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn build_well_known_client(&self) -> Value {
         let mut root: Map<String, Value> = if self.profile.discovery.merge_upstream_well_known {
             self.upstreams
@@ -425,18 +488,25 @@ impl<'a> RewriteEngine<'a> {
         }
 
         let rewritten_origin = self.rewrite_url_str(trimmed, from_auth_upstream);
-        if !self.profile.discovery.rewrite_issuer
-            || self.profile.discovery.auth_proxy_mode != AuthProxyMode::Full
-        {
+        if self.profile.discovery.auth_proxy_mode != AuthProxyMode::Full {
             return rewritten_origin;
         }
 
-        self.rewrite_iss_param_in_url(&rewritten_origin)
+        self.rewrite_redirect_query_params(&rewritten_origin)
     }
 
-    fn rewrite_iss_param_in_url(&self, raw: &str) -> String {
+    fn rewrite_redirect_query_params(&self, raw: &str) -> String {
         let Ok(mut parsed) = Url::parse(raw) else {
             return raw.to_string();
+        };
+
+        let rewrite_iss = self.profile.discovery.rewrite_issuer;
+        let is_rewritable_param = |k: &str| {
+            (k == "iss" && rewrite_iss)
+                || matches!(
+                    k,
+                    "next" | "redirect" | "redirect_to" | "continue" | "return_to"
+                )
         };
 
         let mut changed = false;
@@ -445,7 +515,7 @@ impl<'a> RewriteEngine<'a> {
             let pairs: Vec<(String, String)> = parsed
                 .query_pairs()
                 .map(|(k, v)| {
-                    if k == "iss" {
+                    if is_rewritable_param(&k) {
                         let new_v = self.rewrite_url_str(&v, true);
                         if new_v != v {
                             changed = true;
@@ -467,12 +537,12 @@ impl<'a> RewriteEngine<'a> {
         }
 
         if let Some(fragment) = parsed.fragment().map(ToString::to_string)
-            && fragment.contains("iss=")
+            && (fragment.contains("iss=") || fragment.contains("next="))
         {
             let mut frag_changed = false;
             let pairs: Vec<(String, String)> = url::form_urlencoded::parse(fragment.as_bytes())
                 .map(|(k, v)| {
-                    if k == "iss" {
+                    if is_rewritable_param(&k) {
                         let new_v = self.rewrite_url_str(&v, true);
                         if new_v != v {
                             frag_changed = true;
@@ -584,27 +654,13 @@ impl<'a> RewriteEngine<'a> {
 
         for orig in self.all_auth_origins() {
             if orig != pub_auth_base {
-                if out.contains(orig) {
-                    out = out.replace(orig, &pub_auth_base);
-                }
-                let escaped_from = orig.replace('/', "\\/");
-                if out.contains(&escaped_from) {
-                    let escaped_to = pub_auth_base.replace('/', "\\/");
-                    out = out.replace(&escaped_from, &escaped_to);
-                }
+                replace_origin_variants(&mut out, orig, &pub_auth_base);
             }
         }
 
         let matrix_origin = self.upstreams.matrix_origin.as_str();
         if matrix_origin != pub_matrix_base {
-            if out.contains(matrix_origin) {
-                out = out.replace(matrix_origin, &pub_matrix_base);
-            }
-            let escaped_from = matrix_origin.replace('/', "\\/");
-            if out.contains(&escaped_from) {
-                let escaped_to = pub_matrix_base.replace('/', "\\/");
-                out = out.replace(&escaped_from, &escaped_to);
-            }
+            replace_origin_variants(&mut out, matrix_origin, &pub_matrix_base);
         }
 
         out
@@ -654,6 +710,43 @@ impl<'a> RewriteEngine<'a> {
             }
         }
         None
+    }
+}
+
+fn replace_origin_variants(out: &mut String, from: &str, to: &str) {
+    // 1. Plain URL (`https://auth.example.org`)
+    if out.contains(from) {
+        *out = out.replace(from, to);
+    }
+    // 2. JSON-escaped URL (`https:\/\/auth.example.org`)
+    let json_from = from.replace('/', "\\/");
+    if out.contains(&json_from) {
+        let json_to = to.replace('/', "\\/");
+        *out = out.replace(&json_from, &json_to);
+    }
+    // 3. HTML-entity-escaped URL used by MAS MiniJinja templates (`https:&#x2f;&#x2f;auth.example.org`)
+    let html_lower_from = from.replace('/', "&#x2f;");
+    if out.contains(&html_lower_from) {
+        let html_lower_to = to.replace('/', "&#x2f;");
+        *out = out.replace(&html_lower_from, &html_lower_to);
+    }
+    let html_upper_from = from.replace('/', "&#x2F;");
+    if out.contains(&html_upper_from) {
+        let html_upper_to = to.replace('/', "&#x2F;");
+        *out = out.replace(&html_upper_from, &html_upper_to);
+    }
+    // 4. Percent-encoded URL in query parameters (`https%3A%2F%2Fauth.example.org`)
+    let pct_upper_from: String = url::form_urlencoded::byte_serialize(from.as_bytes()).collect();
+    if out.contains(&pct_upper_from) {
+        let pct_upper_to: String = url::form_urlencoded::byte_serialize(to.as_bytes()).collect();
+        *out = out.replace(&pct_upper_from, &pct_upper_to);
+    }
+    let pct_lower_from = pct_upper_from.to_ascii_lowercase();
+    if pct_lower_from != pct_upper_from && out.contains(&pct_lower_from) {
+        let pct_lower_to: String = url::form_urlencoded::byte_serialize(to.as_bytes())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        *out = out.replace(&pct_lower_from, &pct_lower_to);
     }
 }
 
@@ -767,5 +860,28 @@ mod tests {
         assert!(!is_safe_host_header("evil.com/path"));
         assert!(!is_safe_host_header("user@evil.com"));
         assert!(!is_safe_host_header("evil.com\r\nX-Injected: 1"));
+    }
+
+    #[test]
+    fn origin_variants_rewrites_plain_json_html_entity_and_percent_encoded() {
+        let mut html = concat!(
+            r#"plain=https://account.matrix.org/account "#,
+            r#"json=https:\/\/account.matrix.org\/graphql "#,
+            r#"html=https:&#x2f;&#x2f;account.matrix.org&#x2f;recover "#,
+            r#"pct=https%3A%2F%2Faccount.matrix.org%2Faccount "#,
+            r#"pct_low=https%3a%2f%2faccount.matrix.org%2freset"#,
+        )
+        .to_string();
+        replace_origin_variants(
+            &mut html,
+            "https://account.matrix.org",
+            "https://matrix.example.com",
+        );
+        assert!(!html.contains("account.matrix.org"));
+        assert!(html.contains("plain=https://matrix.example.com/account"));
+        assert!(html.contains(r#"json=https:\/\/matrix.example.com\/graphql"#));
+        assert!(html.contains("html=https:&#x2f;&#x2f;matrix.example.com&#x2f;recover"));
+        assert!(html.contains("pct=https%3A%2F%2Fmatrix.example.com%2Faccount"));
+        assert!(html.contains("pct_low=https%3a%2f%2fmatrix.example.com%2freset"));
     }
 }
