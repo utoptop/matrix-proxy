@@ -1,5 +1,5 @@
-use crate::client_ip::{ClientInfo, apply_upstream_client_ip_headers, encode_ppv2_proxy};
-use crate::config::{ProxyProfile, ServerConfig};
+use crate::client_ip::{ClientInfo, apply_upstream_client_ip_headers, encode_proxy_protocol_proxy};
+use crate::config::{ProxyProfile, ProxyProtocol, ServerConfig};
 use crate::ppv2_client::{BoxedStream, configure_tcp_socket};
 use crate::rewrite::RewriteEngine;
 use anyhow::{Context, Result, anyhow, bail};
@@ -44,7 +44,7 @@ pub async fn proxy_websocket(
     req: Request<Body>,
     target_url: Url,
     host_override: Option<&str>,
-    send_ppv2: bool,
+    outbound_proxy_protocol: ProxyProtocol,
     strip_auth_prefix: bool,
 ) -> Result<Response<Body>> {
     let host = target_url
@@ -65,7 +65,8 @@ pub async fn proxy_websocket(
             &host,
             port,
             use_tls,
-            if send_ppv2 {
+            outbound_proxy_protocol,
+            if outbound_proxy_protocol.is_enabled() {
                 Some(client.client_socket_addr())
             } else {
                 None
@@ -197,6 +198,7 @@ fn is_dropped_upgrade_resp_header(name: &HeaderName) -> bool {
     name == http::header::TRANSFER_ENCODING || name == http::header::CONTENT_LENGTH
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect_upstream_ws_stream(
     server_cfg: &ServerConfig,
     outbound_proxy: Option<&str>,
@@ -204,7 +206,8 @@ async fn connect_upstream_ws_stream(
     target_host: &str,
     target_port: u16,
     use_tls: bool,
-    ppv2_client_addr: Option<SocketAddr>,
+    proxy_protocol: ProxyProtocol,
+    pp_client_addr: Option<SocketAddr>,
 ) -> Result<BoxedStream> {
     let mut tcp = if let Some(proxy_raw) = outbound_proxy {
         let proxy_url = Url::parse(proxy_raw).context("invalid outbound_proxy URL")?;
@@ -221,14 +224,16 @@ async fn connect_upstream_ws_stream(
         Duration::from_secs(server_cfg.tcp_keepalive_secs),
     );
 
-    if let Some(src_addr) = ppv2_client_addr {
+    if proxy_protocol.is_enabled()
+        && let Some(src_addr) = pp_client_addr
+    {
         let dst_addr = tcp
             .peer_addr()
             .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], target_port)));
-        let ppv2_hdr = encode_ppv2_proxy(src_addr, dst_addr);
-        tcp.write_all(&ppv2_hdr)
-            .await
-            .context("failed to write PROXY Protocol v2 header for websocket")?;
+        let pp_hdr = encode_proxy_protocol_proxy(proxy_protocol, src_addr, dst_addr);
+        tcp.write_all(&pp_hdr).await.with_context(|| {
+            format!("failed to write PROXY Protocol {proxy_protocol} header for websocket")
+        })?;
     }
 
     if !use_tls {

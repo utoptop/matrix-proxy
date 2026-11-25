@@ -13,7 +13,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM debian:bookworm-slim AS runtime
 LABEL org.opencontainers.image.title="matrix-proxy" \
       org.opencontainers.image.description="High-performance multi-tenant Rust reverse proxy for Matrix Client-Server and Matrix Auth (MAS/OIDC) with auto-discovery and real client IP forwarding" \
-      org.opencontainers.image.version="1.1.0" \
+      org.opencontainers.image.version="1.2.0" \
       org.opencontainers.image.source="https://github.com/utoptop/matrix-proxy" \
       org.opencontainers.image.licenses="MIT"
 

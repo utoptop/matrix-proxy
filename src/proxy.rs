@@ -1,7 +1,7 @@
 use crate::client_ip::{ClientInfo, InboundPeer, IpRateLimiter, apply_upstream_client_ip_headers};
 use crate::config::{
-    ExposeInfoMode, ListenerPlan, ProxyProfile, RuntimeConfig, ServerConfig, normalized_base_url,
-    redact_proxy_url,
+    ExposeInfoMode, ListenerPlan, ProxyProfile, ProxyProtocol, RuntimeConfig, ServerConfig,
+    normalized_base_url, redact_proxy_url,
 };
 use crate::discovery::{DiscoveryManager, ResolvedUpstreams};
 use crate::metrics::ProxyMetrics;
@@ -112,20 +112,19 @@ impl ProxyInstance {
         let rewrite_client = build_http_client(server, &profile, true, false)?;
         let well_known_client = build_http_client(server, &profile, true, true)?;
 
-        warn_if_ppv2_on_standard_https_port(&profile);
+        warn_if_pp_on_standard_https_port(&profile);
 
-        let ppv2_client =
-            if profile.matrix_uses_ppv2() || profile.auth_uses_ppv2() || profile.rtc_uses_ppv2() {
-                Some(Arc::new(Ppv2Client::new(
-                    server,
-                    profile.upstream.outbound_proxy.as_deref(),
-                    profile.upstream.connect_timeout_secs,
-                    profile.upstream.danger_accept_invalid_certs,
-                    metrics,
-                )?))
-            } else {
-                None
-            };
+        let ppv2_client = if profile.uses_outbound_proxy_protocol() {
+            Some(Arc::new(Ppv2Client::new(
+                server,
+                profile.upstream.outbound_proxy.as_deref(),
+                profile.upstream.connect_timeout_secs,
+                profile.upstream.danger_accept_invalid_certs,
+                metrics,
+            )?))
+        } else {
+            None
+        };
 
         let ws_tls_config = build_client_tls_config(
             profile.upstream.danger_accept_invalid_certs,
@@ -150,20 +149,20 @@ impl ProxyInstance {
     }
 }
 
-fn warn_if_ppv2_on_standard_https_port(profile: &ProxyProfile) {
-    for (label, enabled, raw_url) in [
+fn warn_if_pp_on_standard_https_port(profile: &ProxyProfile) {
+    for (label, proto, raw_url) in [
         (
             "matrix_url",
-            profile.matrix_uses_ppv2(),
+            profile.matrix_proxy_protocol(),
             profile.upstream.matrix_url.as_deref(),
         ),
         (
             "auth_url",
-            profile.auth_uses_ppv2(),
+            profile.auth_proxy_protocol(),
             profile.upstream.auth_url.as_deref(),
         ),
     ] {
-        if enabled
+        if proto.is_enabled()
             && let Some(raw) = raw_url
             && let Ok(u) = Url::parse(raw)
             && u.scheme().eq_ignore_ascii_case("https")
@@ -172,8 +171,9 @@ fn warn_if_ppv2_on_standard_https_port(profile: &ProxyProfile) {
             warn!(
                 profile = %profile.name,
                 field = label,
+                proxy_protocol = %proto,
                 upstream = %raw,
-                "outbound PROXY Protocol v2 is enabled on default HTTPS port 443; ensure the remote server explicitly enables HAProxy `accept-proxy` (public third-party Matrix servers will reject PPv2 with TLS handshake errors)"
+                "outbound PROXY Protocol is enabled on default HTTPS port 443; ensure the upstream proxy (Nginx `proxy_protocol` / HAProxy `accept-proxy` / Envoy) explicitly expects PROXY Protocol on 443 (public third-party Matrix servers will reject it with TLS handshake errors)"
             );
         }
     }
@@ -768,7 +768,7 @@ fn runtime_metrics_json(state: &ListenerState, metrics: &ProxyMetrics) -> Value 
         "requests_total": metrics.requests_total.load(Ordering::Relaxed),
         "requests_active": metrics.requests_active.load(Ordering::Relaxed),
         "upstream_errors_total": metrics.upstream_errors_total.load(Ordering::Relaxed),
-        "ppv2_retries_total": metrics.ppv2_retries_total.load(Ordering::Relaxed),
+        "proxy_protocol_retries_total": metrics.proxy_protocol_retries_total.load(Ordering::Relaxed),
         "hot_reload_enabled": state.runtime.server.hot_reload,
     })
 }
@@ -788,8 +788,9 @@ fn handle_listener_summary_info(
                 "domains": inst.profile.domains,
                 "default": inst.profile.is_default,
                 "public_url": inst.profile.public_url.as_ref().map(normalized_base_url),
-                "matrix_send_proxy_v2": inst.profile.matrix_uses_ppv2(),
-                "auth_send_proxy_v2": inst.profile.auth_uses_ppv2(),
+                "matrix_proxy_protocol": inst.profile.matrix_proxy_protocol(),
+                "auth_proxy_protocol": inst.profile.auth_proxy_protocol(),
+                "rtc_proxy_protocol": inst.profile.rtc_proxy_protocol(),
                 "client_ip_mode": inst.profile.upstream.client_ip_mode,
             })
         })
@@ -801,6 +802,7 @@ fn handle_listener_summary_info(
             "service": "matrix-proxy",
             "version": env!("CARGO_PKG_VERSION"),
             "listener": state.plan.listen.to_string(),
+            "inbound_proxy_protocol": state.plan.inbound_proxy_protocol,
             "shared_port": state.vhost.is_shared_port(),
             "seen_client_ip": client.client_ip.to_string(),
             "runtime": runtime_metrics_json(state, metrics),
@@ -823,6 +825,7 @@ fn handle_profile_info(
         "version": env!("CARGO_PKG_VERSION"),
         "profile": inst.profile.name,
         "domains": inst.profile.domains,
+        "inbound_proxy_protocol": state.plan.inbound_proxy_protocol,
         "seen_client_ip": client.client_ip.to_string(),
         "runtime": runtime_metrics_json(state, metrics),
         "public": {
@@ -840,9 +843,9 @@ fn handle_profile_info(
             "rtc_url": upstreams.rtc_url.as_ref().map(normalized_base_url),
             "outbound_proxy": inst.profile.upstream.outbound_proxy.as_deref().map(redact_proxy_url),
             "client_ip_mode": inst.profile.upstream.client_ip_mode,
-            "matrix_send_proxy_v2": inst.profile.matrix_uses_ppv2(),
-            "auth_send_proxy_v2": inst.profile.auth_uses_ppv2(),
-            "rtc_send_proxy_v2": inst.profile.rtc_uses_ppv2(),
+            "matrix_proxy_protocol": inst.profile.matrix_proxy_protocol(),
+            "auth_proxy_protocol": inst.profile.auth_proxy_protocol(),
+            "rtc_proxy_protocol": inst.profile.rtc_proxy_protocol(),
         },
         "discovery": {
             "rewrite_issuer": inst.profile.discovery.rewrite_issuer,
@@ -867,20 +870,20 @@ async fn handle_auth_metadata(
         "/_matrix/client/v1/auth_metadata"
     };
 
-    let matrix_ppv2 = inst.profile.matrix_uses_ppv2();
+    let matrix_pp = inst.profile.matrix_proxy_protocol();
     let matrix_host_ov = inst.profile.upstream.matrix_host_header.as_deref();
-    let auth_ppv2 = inst.profile.auth_uses_ppv2();
+    let auth_pp = inst.profile.auth_proxy_protocol();
     let auth_host_ov = inst.profile.upstream.auth_host_header.as_deref();
 
-    let mut candidates: Vec<(Url, bool, Option<&str>)> = vec![
+    let mut candidates: Vec<(Url, ProxyProtocol, Option<&str>)> = vec![
         (
             build_upstream_target_url(&upstreams.matrix_url, requested_path),
-            matrix_ppv2,
+            matrix_pp,
             matrix_host_ov,
         ),
         (
             build_upstream_target_url(&upstreams.matrix_url, fallback_path),
-            matrix_ppv2,
+            matrix_pp,
             matrix_host_ov,
         ),
     ];
@@ -889,25 +892,25 @@ async fn handle_auth_metadata(
         let auth_base = upstreams.effective_auth_url();
         candidates.push((
             build_upstream_target_url(auth_base, requested_path),
-            auth_ppv2,
+            auth_pp,
             auth_host_ov,
         ));
         candidates.push((
             build_upstream_target_url(auth_base, "/.well-known/oauth-authorization-server"),
-            auth_ppv2,
+            auth_pp,
             auth_host_ov,
         ));
         candidates.push((
             build_upstream_target_url(auth_base, "/.well-known/openid-configuration"),
-            auth_ppv2,
+            auth_pp,
             auth_host_ov,
         ));
     }
 
     let mut last_non_200: Option<(StatusCode, Vec<u8>, Option<HeaderValue>)> = None;
 
-    for (url, use_ppv2, host_ov) in candidates {
-        match fetch_metadata_json(inst, client, &url, use_ppv2, host_ov, req_headers).await {
+    for (url, pp, host_ov) in candidates {
+        match fetch_metadata_json(inst, client, &url, pp, host_ov, req_headers).await {
             Ok((status, body_bytes, content_type)) if status.is_success() => {
                 match serde_json::from_slice::<Value>(&body_bytes) {
                     Ok(json_val) => {
@@ -967,10 +970,10 @@ async fn handle_oidc_discovery(
 ) -> Response<Body> {
     let auth_base = upstreams.effective_auth_url();
     let target_url = build_upstream_target_url(auth_base, upstream_path);
-    let use_ppv2 = inst.profile.auth_uses_ppv2();
+    let auth_pp = inst.profile.auth_proxy_protocol();
     let host_ov = inst.profile.upstream.auth_host_header.as_deref();
 
-    match fetch_metadata_json(inst, client, &target_url, use_ppv2, host_ov, req_headers).await {
+    match fetch_metadata_json(inst, client, &target_url, auth_pp, host_ov, req_headers).await {
         Ok((status, body_bytes, content_type)) if status.is_success() => {
             match serde_json::from_slice::<Value>(&body_bytes) {
                 Ok(json_val) => {
@@ -1021,7 +1024,7 @@ async fn fetch_metadata_json(
     inst: &ProxyInstance,
     client: &ClientInfo,
     url: &Url,
-    use_ppv2: bool,
+    proxy_protocol: ProxyProtocol,
     host_override: Option<&str>,
     incoming_headers: &HeaderMap,
 ) -> Result<(StatusCode, Vec<u8>, Option<HeaderValue>)> {
@@ -1039,13 +1042,16 @@ async fn fetch_metadata_json(
         inst.profile.upstream.client_ip_mode,
     );
 
-    if use_ppv2 && let Some(ppv2) = &inst.ppv2_client {
+    if proxy_protocol.is_enabled()
+        && let Some(ppv2) = &inst.ppv2_client
+    {
         return ppv2
             .get_bytes_for_client(
                 url,
                 host_override,
                 out_headers,
                 Duration::from_secs(15),
+                proxy_protocol,
                 Some(client.client_socket_addr()),
             )
             .await;
@@ -1092,17 +1098,17 @@ async fn forward_request(
 ) -> Response<Body> {
     let server_cfg = &state.runtime.server;
     let rewriter = RewriteEngine::new(&inst.profile, public, upstreams);
-    let (use_ppv2, host_override) = match kind {
+    let (outbound_pp, host_override) = match kind {
         ForwardKind::Matrix => (
-            inst.profile.matrix_uses_ppv2(),
+            inst.profile.matrix_proxy_protocol(),
             inst.profile.upstream.matrix_host_header.as_deref(),
         ),
         ForwardKind::Auth => (
-            inst.profile.auth_uses_ppv2(),
+            inst.profile.auth_proxy_protocol(),
             inst.profile.upstream.auth_host_header.as_deref(),
         ),
         ForwardKind::Rtc => (
-            inst.profile.rtc_uses_ppv2(),
+            inst.profile.rtc_proxy_protocol(),
             inst.profile.upstream.rtc_host_header.as_deref(),
         ),
     };
@@ -1117,7 +1123,7 @@ async fn forward_request(
             req,
             target_url,
             host_override,
-            use_ppv2,
+            outbound_pp,
             strip_auth_prefix,
         )
         .await
@@ -1192,8 +1198,10 @@ async fn forward_request(
             .unwrap_or(false)
         || parts.headers.contains_key(http::header::TRANSFER_ENCODING);
 
-    // Path A: Native Hyper HTTP/2+HTTP/1.1 with HAProxy PROXY Protocol v2 carrying real client IP!
-    if use_ppv2 && let Some(ppv2) = &inst.ppv2_client {
+    // Path A: Native Hyper HTTP/2+HTTP/1.1 with standard PROXY Protocol v1/v2 carrying real client IP!
+    if outbound_pp.is_enabled()
+        && let Some(ppv2) = &inst.ppv2_client
+    {
         let req_body = if has_body { body } else { Body::empty() };
         let upstream_fut = ppv2.send_request(
             parts.method,
@@ -1201,6 +1209,7 @@ async fn forward_request(
             host_override,
             out_headers,
             req_body,
+            outbound_pp,
             Some(client.client_socket_addr()),
         );
         let upstream_resp = if inst.profile.upstream.request_timeout_secs > 0 {

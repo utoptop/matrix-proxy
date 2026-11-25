@@ -1,4 +1,4 @@
-use crate::config::{ClientIpMode, RuntimeConfig, canonical_ip};
+use crate::config::{ClientIpMode, ProxyProtocol, RuntimeConfig, canonical_ip};
 use anyhow::{Context, Result, bail};
 use http::{HeaderMap, HeaderValue};
 use std::collections::HashMap;
@@ -262,13 +262,143 @@ fn parse_forwarded_proto(raw: &str) -> Option<String> {
 }
 
 // =============================================================================
-// HAProxy PROXY Protocol v2 Codec (Outbound Encoder + Inbound Decoder)
-// Spec: https://www.haproxy.org/download/2.8/doc/proxy-protocol.txt (Section 2.2)
+// Standard PROXY Protocol v1 & v2 Codec (Outbound Encoder + Inbound Decoder)
+// Spec: https://www.haproxy.org/download/2.8/doc/proxy-protocol.txt
+// Supported by Nginx (`proxy_protocol`), HAProxy, Envoy, Traefik, AWS NLB, etc.
 // =============================================================================
 
 pub const PPV2_SIGNATURE: [u8; 12] = [
     0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
 ];
+
+/// Encodes a PROXY Protocol `LOCAL`/`UNKNOWN` header for proxy-originated probes/health checks.
+pub fn encode_proxy_protocol_local(proto: ProxyProtocol) -> Vec<u8> {
+    match proto {
+        ProxyProtocol::Off => Vec::new(),
+        ProxyProtocol::V1 => b"PROXY UNKNOWN\r\n".to_vec(),
+        ProxyProtocol::V2 => encode_ppv2_local(),
+    }
+}
+
+/// Encodes a PROXY Protocol v1 or v2 header carrying the verified real client IP & port.
+pub fn encode_proxy_protocol_proxy(
+    proto: ProxyProtocol,
+    src: SocketAddr,
+    dst: SocketAddr,
+) -> Vec<u8> {
+    match proto {
+        ProxyProtocol::Off => Vec::new(),
+        ProxyProtocol::V1 => encode_ppv1_proxy(src, dst),
+        ProxyProtocol::V2 => encode_ppv2_proxy(src, dst),
+    }
+}
+
+/// Encodes a standard PROXY Protocol v1 ASCII header (`PROXY TCP4/TCP6 ... \r\n`).
+pub fn encode_ppv1_proxy(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
+    let src_ip = canonical_ip(src.ip());
+    let dst_ip = canonical_ip(dst.ip());
+    let src_port = if src.port() == 0 { 1 } else { src.port() };
+    let dst_port = dst.port();
+
+    match src_ip {
+        IpAddr::V4(src_v4) => {
+            let dst_v4 = match dst_ip {
+                IpAddr::V4(v4) => v4,
+                IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
+            };
+            format!("PROXY TCP4 {src_v4} {dst_v4} {src_port} {dst_port}\r\n").into_bytes()
+        }
+        IpAddr::V6(src_v6) => {
+            let dst_v6 = match dst_ip {
+                IpAddr::V6(v6) => v6,
+                IpAddr::V4(v4) => v4.to_ipv6_mapped(),
+            };
+            format!("PROXY TCP6 {src_v6} {dst_v6} {src_port} {dst_port}\r\n").into_bytes()
+        }
+    }
+}
+
+/// Decodes an inbound PROXY Protocol v1 or v2 header according to `proto`.
+pub async fn read_proxy_protocol_header<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    proto: ProxyProtocol,
+) -> Result<Option<SocketAddr>> {
+    match proto {
+        ProxyProtocol::Off => Ok(None),
+        ProxyProtocol::V1 => read_ppv1_header(reader).await,
+        ProxyProtocol::V2 => read_ppv2_header(reader).await,
+    }
+}
+
+/// Decodes an inbound PROXY Protocol v1 ASCII header (max 107 bytes ending with `\r\n`).
+pub async fn read_ppv1_header<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<SocketAddr>> {
+    let mut buf = Vec::with_capacity(64);
+    let mut byte = [0u8; 1];
+    loop {
+        reader
+            .read_exact(&mut byte)
+            .await
+            .context("failed to read PROXY Protocol v1 header")?;
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n") {
+            break;
+        }
+        if buf.len() >= 107 {
+            bail!("PROXY Protocol v1 header exceeds 107-byte specification limit");
+        }
+    }
+
+    let line = std::str::from_utf8(&buf[..buf.len() - 2])
+        .context("PROXY Protocol v1 header is not valid UTF-8/ASCII")?;
+    let parts: Vec<&str> = line.split(' ').collect();
+    if parts.len() < 2 || parts[0] != "PROXY" {
+        bail!("invalid PROXY Protocol v1 prefix");
+    }
+
+    match parts[1] {
+        "UNKNOWN" => Ok(None),
+        "TCP4" => {
+            if parts.len() != 6 {
+                bail!("malformed PROXY v1 TCP4 header");
+            }
+            let src_ip: Ipv4Addr = parts[2]
+                .parse()
+                .context("invalid IPv4 source address in PROXY v1 header")?;
+            let _dst_ip: Ipv4Addr = parts[3]
+                .parse()
+                .context("invalid IPv4 destination address in PROXY v1 header")?;
+            let src_port: u16 = parts[4]
+                .parse()
+                .context("invalid source port in PROXY v1 header")?;
+            let _dst_port: u16 = parts[5]
+                .parse()
+                .context("invalid destination port in PROXY v1 header")?;
+            Ok(Some(SocketAddr::new(IpAddr::V4(src_ip), src_port)))
+        }
+        "TCP6" => {
+            if parts.len() != 6 {
+                bail!("malformed PROXY v1 TCP6 header");
+            }
+            let src_ip: Ipv6Addr = parts[2]
+                .parse()
+                .context("invalid IPv6 source address in PROXY v1 header")?;
+            let _dst_ip: Ipv6Addr = parts[3]
+                .parse()
+                .context("invalid IPv6 destination address in PROXY v1 header")?;
+            let src_port: u16 = parts[4]
+                .parse()
+                .context("invalid source port in PROXY v1 header")?;
+            let _dst_port: u16 = parts[5]
+                .parse()
+                .context("invalid destination port in PROXY v1 header")?;
+            Ok(Some(SocketAddr::new(
+                canonical_ip(IpAddr::V6(src_ip)),
+                src_port,
+            )))
+        }
+        other => bail!("unsupported PROXY Protocol v1 transport '{other}'"),
+    }
+}
 
 /// Encodes a PROXY Protocol v2 `LOCAL` header (16 bytes) for proxy-originated probes.
 pub fn encode_ppv2_local() -> Vec<u8> {
@@ -528,6 +658,38 @@ mod tests {
         assert_eq!(local.len(), 16);
         let mut cursor_l = std::io::Cursor::new(local);
         assert_eq!(read_ppv2_header(&mut cursor_l).await.unwrap(), None);
+
+        // PROXY Protocol v1 roundtrip (IPv4, IPv6, and UNKNOWN)
+        let v1_4 = encode_proxy_protocol_proxy(ProxyProtocol::V1, src4, dst4);
+        assert_eq!(
+            std::str::from_utf8(&v1_4).unwrap(),
+            "PROXY TCP4 198.51.100.42 203.0.113.10 54321 8443\r\n"
+        );
+        let mut c_v1_4 = std::io::Cursor::new(v1_4);
+        assert_eq!(
+            read_proxy_protocol_header(&mut c_v1_4, ProxyProtocol::V1)
+                .await
+                .unwrap(),
+            Some(src4)
+        );
+
+        let v1_6 = encode_proxy_protocol_proxy(ProxyProtocol::V1, src6, dst6);
+        let mut c_v1_6 = std::io::Cursor::new(v1_6);
+        assert_eq!(
+            read_proxy_protocol_header(&mut c_v1_6, ProxyProtocol::V1)
+                .await
+                .unwrap(),
+            Some(src6)
+        );
+
+        let v1_u = encode_proxy_protocol_local(ProxyProtocol::V1);
+        let mut c_v1_u = std::io::Cursor::new(v1_u);
+        assert_eq!(
+            read_proxy_protocol_header(&mut c_v1_u, ProxyProtocol::V1)
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

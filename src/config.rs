@@ -52,6 +52,43 @@ pub enum ExposeInfoMode {
     Disabled,
 }
 
+/// Standard PROXY Protocol transport version (vendor-neutral framing supported by Nginx, HAProxy,
+/// Envoy, Traefik, Caddy, AWS NLB, and other L4/L7 reverse proxies).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyProtocol {
+    /// Disabled — standard TCP / HTTP(S) transport.
+    #[default]
+    #[serde(alias = "none", alias = "disabled", alias = "false")]
+    Off,
+    /// PROXY Protocol v1 (human-readable text header: `PROXY TCP4/TCP6 ...`).
+    #[serde(alias = "1", alias = "ppv1")]
+    V1,
+    /// PROXY Protocol v2 (compact binary header — recommended when supported).
+    #[serde(alias = "2", alias = "ppv2")]
+    V2,
+}
+
+impl ProxyProtocol {
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+        }
+    }
+}
+
+impl std::fmt::Display for ProxyProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
@@ -73,7 +110,11 @@ pub struct ServerConfig {
     pub public_auth_url: Option<String>,
     pub tls_cert_path: Option<String>,
     pub tls_key_path: Option<String>,
-    pub accept_proxy_v2: bool,
+    /// Inbound PROXY Protocol framing on accepted TCP connections (`"off"` | `"v1"` | `"v2"`).
+    pub inbound_proxy_protocol: ProxyProtocol,
+    /// Deprecated v1.1 alias for `inbound_proxy_protocol = "v2"`.
+    #[serde(skip_serializing)]
+    pub accept_proxy_v2: Option<bool>,
     pub trust_forwarded_headers: bool,
     pub trusted_proxies: Vec<String>,
     pub expose_info: ExposeInfoMode,
@@ -86,7 +127,8 @@ pub struct ServerConfig {
     pub pool_idle_timeout_secs: u64,
     pub tcp_keepalive_secs: u64,
     pub tcp_nodelay: bool,
-    pub ppv2_pool_max_entries: usize,
+    #[serde(alias = "ppv2_pool_max_entries")]
+    pub proxy_protocol_pool_max_entries: usize,
     pub listen_backlog: u32,
     /// Enable automatic config file & TLS certificate hot reload (in addition to SIGHUP / POST /_proxy/reload).
     pub hot_reload: bool,
@@ -94,6 +136,18 @@ pub struct ServerConfig {
     pub hot_reload_interval_secs: u64,
     /// Maximum seconds to wait for in-flight HTTP/2 & WebSocket connections to drain on SIGTERM/SIGINT.
     pub shutdown_grace_secs: u64,
+}
+
+impl ServerConfig {
+    pub fn effective_inbound_proxy_protocol(&self) -> ProxyProtocol {
+        if self.inbound_proxy_protocol.is_enabled() {
+            self.inbound_proxy_protocol
+        } else if self.accept_proxy_v2 == Some(true) {
+            ProxyProtocol::V2
+        } else {
+            ProxyProtocol::Off
+        }
+    }
 }
 
 impl Default for ServerConfig {
@@ -104,7 +158,8 @@ impl Default for ServerConfig {
             public_auth_url: None,
             tls_cert_path: None,
             tls_key_path: None,
-            accept_proxy_v2: false,
+            inbound_proxy_protocol: ProxyProtocol::Off,
+            accept_proxy_v2: None,
             trust_forwarded_headers: true,
             trusted_proxies: default_trusted_proxies(),
             expose_info: ExposeInfoMode::Trusted,
@@ -117,7 +172,7 @@ impl Default for ServerConfig {
             pool_idle_timeout_secs: 90,
             tcp_keepalive_secs: 30,
             tcp_nodelay: true,
-            ppv2_pool_max_entries: 4096,
+            proxy_protocol_pool_max_entries: 4096,
             listen_backlog: 4096,
             hot_reload: true,
             hot_reload_interval_secs: 2,
@@ -139,9 +194,22 @@ pub struct UpstreamConfig {
     pub rewrite_origins: Vec<String>,
     pub outbound_proxy: Option<String>,
     pub client_ip_mode: ClientIpMode,
-    pub send_proxy_v2: bool,
+    /// Outbound PROXY Protocol default for this upstream (`"off"` | `"v1"` | `"v2"`).
+    pub proxy_protocol: ProxyProtocol,
+    /// Optional per-service outbound PROXY Protocol override for the Matrix homeserver.
+    pub matrix_proxy_protocol: Option<ProxyProtocol>,
+    /// Optional per-service outbound PROXY Protocol override for the Matrix auth server (MAS/OIDC).
+    pub auth_proxy_protocol: Option<ProxyProtocol>,
+    /// Optional per-service outbound PROXY Protocol override for the LiveKit RTC JWT service.
+    pub rtc_proxy_protocol: Option<ProxyProtocol>,
+    /// Deprecated v1.1 aliases for `*_proxy_protocol = "v2"`.
+    #[serde(skip_serializing)]
+    pub send_proxy_v2: Option<bool>,
+    #[serde(skip_serializing)]
     pub matrix_send_proxy_v2: Option<bool>,
+    #[serde(skip_serializing)]
     pub auth_send_proxy_v2: Option<bool>,
+    #[serde(skip_serializing)]
     pub rtc_send_proxy_v2: Option<bool>,
     pub connect_timeout_secs: u64,
     pub request_timeout_secs: u64,
@@ -161,7 +229,11 @@ impl Default for UpstreamConfig {
             rewrite_origins: Vec::new(),
             outbound_proxy: None,
             client_ip_mode: ClientIpMode::Replace,
-            send_proxy_v2: false,
+            proxy_protocol: ProxyProtocol::Off,
+            matrix_proxy_protocol: None,
+            auth_proxy_protocol: None,
+            rtc_proxy_protocol: None,
+            send_proxy_v2: None,
             matrix_send_proxy_v2: None,
             auth_send_proxy_v2: None,
             rtc_send_proxy_v2: None,
@@ -238,6 +310,8 @@ pub struct ProxyProfileInput {
     pub public_auth_url: Option<String>,
     pub tls_cert_path: Option<String>,
     pub tls_key_path: Option<String>,
+    pub inbound_proxy_protocol: Option<ProxyProtocol>,
+    #[serde(skip_serializing)]
     pub accept_proxy_v2: Option<bool>,
 
     pub matrix_url: Option<String>,
@@ -250,9 +324,17 @@ pub struct ProxyProfileInput {
     pub rewrite_origins: Vec<String>,
     pub outbound_proxy: Option<String>,
     pub client_ip_mode: Option<ClientIpMode>,
+    pub proxy_protocol: Option<ProxyProtocol>,
+    pub matrix_proxy_protocol: Option<ProxyProtocol>,
+    pub auth_proxy_protocol: Option<ProxyProtocol>,
+    pub rtc_proxy_protocol: Option<ProxyProtocol>,
+    #[serde(skip_serializing)]
     pub send_proxy_v2: Option<bool>,
+    #[serde(skip_serializing)]
     pub matrix_send_proxy_v2: Option<bool>,
+    #[serde(skip_serializing)]
     pub auth_send_proxy_v2: Option<bool>,
+    #[serde(skip_serializing)]
     pub rtc_send_proxy_v2: Option<bool>,
     pub connect_timeout_secs: Option<u64>,
     pub request_timeout_secs: Option<u64>,
@@ -283,7 +365,7 @@ pub struct ProxyProfile {
     pub strict_host_match: bool,
     pub tls_cert_path: Option<String>,
     pub tls_key_path: Option<String>,
-    pub accept_proxy_v2: bool,
+    pub inbound_proxy_protocol: ProxyProtocol,
 
     pub public_url: Option<Url>,
     pub public_auth_url: Option<Url>,
@@ -305,22 +387,28 @@ impl ProxyProfile {
                 .is_some_and(|s| !s.trim().is_empty())
     }
 
-    pub fn matrix_uses_ppv2(&self) -> bool {
+    pub fn matrix_proxy_protocol(&self) -> ProxyProtocol {
         self.upstream
-            .matrix_send_proxy_v2
-            .unwrap_or(self.upstream.send_proxy_v2)
+            .matrix_proxy_protocol
+            .unwrap_or(self.upstream.proxy_protocol)
     }
 
-    pub fn auth_uses_ppv2(&self) -> bool {
+    pub fn auth_proxy_protocol(&self) -> ProxyProtocol {
         self.upstream
-            .auth_send_proxy_v2
-            .unwrap_or(self.upstream.send_proxy_v2)
+            .auth_proxy_protocol
+            .unwrap_or(self.upstream.proxy_protocol)
     }
 
-    pub fn rtc_uses_ppv2(&self) -> bool {
+    pub fn rtc_proxy_protocol(&self) -> ProxyProtocol {
         self.upstream
-            .rtc_send_proxy_v2
-            .unwrap_or(self.upstream.send_proxy_v2)
+            .rtc_proxy_protocol
+            .unwrap_or(self.upstream.proxy_protocol)
+    }
+
+    pub fn uses_outbound_proxy_protocol(&self) -> bool {
+        self.matrix_proxy_protocol().is_enabled()
+            || self.auth_proxy_protocol().is_enabled()
+            || self.rtc_proxy_protocol().is_enabled()
     }
 }
 
@@ -330,7 +418,7 @@ pub struct ListenerPlan {
     pub listen: SocketAddr,
     pub tls_cert_path: Option<String>,
     pub tls_key_path: Option<String>,
-    pub accept_proxy_v2: bool,
+    pub inbound_proxy_protocol: ProxyProtocol,
     pub proxy_prefix: String,
     pub profiles: Vec<ProxyProfile>,
 }
@@ -433,8 +521,14 @@ impl Config {
         if let Some(v) = env_non_empty("TLS_KEY_PATH") {
             self.server.tls_key_path = Some(v);
         }
-        if let Some(v) = env_bool("ACCEPT_PROXY_V2")? {
-            self.server.accept_proxy_v2 = v;
+        if let Some(v) = env_non_empty("INBOUND_PROXY_PROTOCOL") {
+            self.server.inbound_proxy_protocol = parse_proxy_protocol(&v)?;
+        } else if let Some(v) = env_bool("ACCEPT_PROXY_V2")? {
+            self.server.inbound_proxy_protocol = if v {
+                ProxyProtocol::V2
+            } else {
+                ProxyProtocol::Off
+            };
         }
         if let Some(v) = env_bool("TRUST_FORWARDED_HEADERS")? {
             self.server.trust_forwarded_headers = v;
@@ -472,8 +566,11 @@ impl Config {
         if let Some(v) = env_bool("TCP_NODELAY")? {
             self.server.tcp_nodelay = v;
         }
-        if let Some(v) = env_parse::<usize>("PPV2_POOL_MAX_ENTRIES")? {
-            self.server.ppv2_pool_max_entries = v;
+        if let Some(v) =
+            env_parse::<usize>("PROXY_PROTOCOL_POOL_MAX_ENTRIES")?
+                .or(env_parse::<usize>("PPV2_POOL_MAX_ENTRIES")?)
+        {
+            self.server.proxy_protocol_pool_max_entries = v;
         }
         if let Some(v) = env_parse::<u32>("LISTEN_BACKLOG")? {
             self.server.listen_backlog = v;
@@ -518,17 +615,25 @@ impl Config {
         if let Some(v) = env_non_empty("CLIENT_IP_MODE") {
             self.upstream.client_ip_mode = parse_client_ip_mode(&v)?;
         }
-        if let Some(v) = env_bool("SEND_PROXY_V2")? {
-            self.upstream.send_proxy_v2 = v;
+        if let Some(v) = env_non_empty("PROXY_PROTOCOL") {
+            self.upstream.proxy_protocol = parse_proxy_protocol(&v)?;
+        } else if let Some(v) = env_bool("SEND_PROXY_V2")? {
+            self.upstream.proxy_protocol = bool_to_ppv2(v);
         }
-        if let Some(v) = env_bool("MATRIX_SEND_PROXY_V2")? {
-            self.upstream.matrix_send_proxy_v2 = Some(v);
+        if let Some(v) = env_non_empty("MATRIX_PROXY_PROTOCOL") {
+            self.upstream.matrix_proxy_protocol = Some(parse_proxy_protocol(&v)?);
+        } else if let Some(v) = env_bool("MATRIX_SEND_PROXY_V2")? {
+            self.upstream.matrix_proxy_protocol = Some(bool_to_ppv2(v));
         }
-        if let Some(v) = env_bool("AUTH_SEND_PROXY_V2")? {
-            self.upstream.auth_send_proxy_v2 = Some(v);
+        if let Some(v) = env_non_empty("AUTH_PROXY_PROTOCOL") {
+            self.upstream.auth_proxy_protocol = Some(parse_proxy_protocol(&v)?);
+        } else if let Some(v) = env_bool("AUTH_SEND_PROXY_V2")? {
+            self.upstream.auth_proxy_protocol = Some(bool_to_ppv2(v));
         }
-        if let Some(v) = env_bool("RTC_SEND_PROXY_V2")? {
-            self.upstream.rtc_send_proxy_v2 = Some(v);
+        if let Some(v) = env_non_empty("RTC_PROXY_PROTOCOL") {
+            self.upstream.rtc_proxy_protocol = Some(parse_proxy_protocol(&v)?);
+        } else if let Some(v) = env_bool("RTC_SEND_PROXY_V2")? {
+            self.upstream.rtc_proxy_protocol = Some(bool_to_ppv2(v));
         }
         if let Some(v) = env_parse::<u64>("CONNECT_TIMEOUT_SECS")? {
             self.upstream.connect_timeout_secs = v;
@@ -674,7 +779,10 @@ impl Config {
                     "profile '{name}': tls_cert_path and tls_key_path must both be set or both omitted"
                 );
             }
-            let accept_proxy_v2 = raw.accept_proxy_v2.unwrap_or(self.server.accept_proxy_v2);
+            let inbound_proxy_protocol = raw
+                .inbound_proxy_protocol
+                .or_else(|| raw.accept_proxy_v2.map(bool_to_ppv2))
+                .unwrap_or_else(|| self.server.effective_inbound_proxy_protocol());
 
             let mut public_url_str = raw.public_url.clone();
             normalize_http_url_opt(&mut public_url_str);
@@ -687,6 +795,31 @@ impl Config {
                 &format!("proxies[{name}].public_auth_url"),
                 &public_auth_url_str,
             )?;
+
+            let default_outbound_pp = resolve_outbound_pp(
+                raw.proxy_protocol,
+                raw.send_proxy_v2,
+                resolve_outbound_pp(
+                    Some(self.upstream.proxy_protocol).filter(|p| p.is_enabled()),
+                    self.upstream.send_proxy_v2,
+                    ProxyProtocol::Off,
+                ),
+            );
+            let matrix_proxy_protocol = raw
+                .matrix_proxy_protocol
+                .or_else(|| raw.matrix_send_proxy_v2.map(bool_to_ppv2))
+                .or(self.upstream.matrix_proxy_protocol)
+                .or_else(|| self.upstream.matrix_send_proxy_v2.map(bool_to_ppv2));
+            let auth_proxy_protocol = raw
+                .auth_proxy_protocol
+                .or_else(|| raw.auth_send_proxy_v2.map(bool_to_ppv2))
+                .or(self.upstream.auth_proxy_protocol)
+                .or_else(|| self.upstream.auth_send_proxy_v2.map(bool_to_ppv2));
+            let rtc_proxy_protocol = raw
+                .rtc_proxy_protocol
+                .or_else(|| raw.rtc_send_proxy_v2.map(bool_to_ppv2))
+                .or(self.upstream.rtc_proxy_protocol)
+                .or_else(|| self.upstream.rtc_send_proxy_v2.map(bool_to_ppv2));
 
             let mut upstream = UpstreamConfig {
                 matrix_url: raw.matrix_url.clone(),
@@ -702,12 +835,14 @@ impl Config {
                     .clone()
                     .or_else(|| self.upstream.outbound_proxy.clone()),
                 client_ip_mode: raw.client_ip_mode.unwrap_or(self.upstream.client_ip_mode),
-                send_proxy_v2: raw.send_proxy_v2.unwrap_or(self.upstream.send_proxy_v2),
-                matrix_send_proxy_v2: raw
-                    .matrix_send_proxy_v2
-                    .or(self.upstream.matrix_send_proxy_v2),
-                auth_send_proxy_v2: raw.auth_send_proxy_v2.or(self.upstream.auth_send_proxy_v2),
-                rtc_send_proxy_v2: raw.rtc_send_proxy_v2.or(self.upstream.rtc_send_proxy_v2),
+                proxy_protocol: default_outbound_pp,
+                matrix_proxy_protocol,
+                auth_proxy_protocol,
+                rtc_proxy_protocol,
+                send_proxy_v2: None,
+                matrix_send_proxy_v2: None,
+                auth_send_proxy_v2: None,
+                rtc_send_proxy_v2: None,
                 connect_timeout_secs: raw
                     .connect_timeout_secs
                     .unwrap_or(self.upstream.connect_timeout_secs),
@@ -793,7 +928,7 @@ impl Config {
                 strict_host_match: raw.strict_host_match,
                 tls_cert_path,
                 tls_key_path,
-                accept_proxy_v2,
+                inbound_proxy_protocol,
                 public_url,
                 public_auth_url,
                 upstream,
@@ -817,6 +952,20 @@ impl Config {
             parse_http_url_opt("server.public_auth_url", &self.server.public_auth_url)?;
 
         let mut upstream = self.upstream.clone();
+        upstream.proxy_protocol = resolve_outbound_pp(
+            Some(upstream.proxy_protocol).filter(|p| p.is_enabled()),
+            upstream.send_proxy_v2,
+            ProxyProtocol::Off,
+        );
+        upstream.matrix_proxy_protocol = upstream
+            .matrix_proxy_protocol
+            .or_else(|| upstream.matrix_send_proxy_v2.map(bool_to_ppv2));
+        upstream.auth_proxy_protocol = upstream
+            .auth_proxy_protocol
+            .or_else(|| upstream.auth_send_proxy_v2.map(bool_to_ppv2));
+        upstream.rtc_proxy_protocol = upstream
+            .rtc_proxy_protocol
+            .or_else(|| upstream.rtc_send_proxy_v2.map(bool_to_ppv2));
         let parsed_rewrite_origins = validate_upstream("upstream", &mut upstream)?;
         let _ = parse_http_url_opt(
             "discovery.identity_server_url",
@@ -833,7 +982,7 @@ impl Config {
             strict_host_match: false,
             tls_cert_path: self.server.tls_cert_path.clone(),
             tls_key_path: self.server.tls_key_path.clone(),
-            accept_proxy_v2: self.server.accept_proxy_v2,
+            inbound_proxy_protocol: self.server.effective_inbound_proxy_protocol(),
             public_url,
             public_auth_url,
             upstream,
@@ -880,7 +1029,7 @@ fn group_into_listeners(profiles: Vec<ProxyProfile>) -> Result<Vec<ListenerPlan>
     for (listen, group) in by_addr {
         let first_tls_cert = group[0].tls_cert_path.clone();
         let first_tls_key = group[0].tls_key_path.clone();
-        let first_ppv2 = group[0].accept_proxy_v2;
+        let first_inbound_pp = group[0].inbound_proxy_protocol;
         let first_proxy_prefix = group[0].routing.proxy_prefix.clone();
 
         let is_shared = group.len() > 1;
@@ -894,9 +1043,9 @@ fn group_into_listeners(profiles: Vec<ProxyProfile>) -> Result<Vec<ListenerPlan>
                     p.name
                 );
             }
-            if p.accept_proxy_v2 != first_ppv2 {
+            if p.inbound_proxy_protocol != first_inbound_pp {
                 bail!(
-                    "listener {listen}: profiles sharing the same port must use identical accept_proxy_v2 setting (conflict in '{}')",
+                    "listener {listen}: profiles sharing the same port must use identical inbound_proxy_protocol setting (conflict in '{}')",
                     p.name
                 );
             }
@@ -928,7 +1077,7 @@ fn group_into_listeners(profiles: Vec<ProxyProfile>) -> Result<Vec<ListenerPlan>
             listen,
             tls_cert_path: first_tls_cert,
             tls_key_path: first_tls_key,
-            accept_proxy_v2: first_ppv2,
+            inbound_proxy_protocol: first_inbound_pp,
             proxy_prefix: first_proxy_prefix,
             profiles: group,
         });
@@ -1054,6 +1203,33 @@ pub fn canonical_ip(ip: IpAddr) -> IpAddr {
             }
         }
         v4 => v4,
+    }
+}
+
+fn bool_to_ppv2(enabled: bool) -> ProxyProtocol {
+    if enabled {
+        ProxyProtocol::V2
+    } else {
+        ProxyProtocol::Off
+    }
+}
+
+fn resolve_outbound_pp(
+    explicit: Option<ProxyProtocol>,
+    legacy_v2: Option<bool>,
+    fallback: ProxyProtocol,
+) -> ProxyProtocol {
+    explicit
+        .or_else(|| legacy_v2.map(bool_to_ppv2))
+        .unwrap_or(fallback)
+}
+
+fn parse_proxy_protocol(raw: &str) -> Result<ProxyProtocol> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" | "disabled" | "false" | "0" => Ok(ProxyProtocol::Off),
+        "v1" | "1" | "ppv1" => Ok(ProxyProtocol::V1),
+        "v2" | "2" | "ppv2" => Ok(ProxyProtocol::V2),
+        other => bail!("invalid proxy_protocol '{other}': expected 'off', 'v1', or 'v2'"),
     }
 }
 
@@ -1282,7 +1458,7 @@ mod tests {
             name = "site-a"
             public_url = "https://a.example.com"
             matrix_url = "https://hs-a.internal:8443"
-            send_proxy_v2 = true
+            proxy_protocol = "v2"
             rewrite_origins = ["https://hs-public.example.org"]
 
             [[proxies]]
@@ -1291,6 +1467,8 @@ mod tests {
             public_url = "https://b.example.com"
             matrix_url = "https://hs-b.internal"
             auth_url = "https://auth-b.internal"
+            matrix_proxy_protocol = "v1"
+            auth_proxy_protocol = "off"
 
             [[proxies]]
             name = "site-c-dedicated"
@@ -1309,7 +1487,18 @@ mod tests {
             runtime.listeners[0].profiles[0].domains,
             vec!["a.example.com"]
         );
-        assert!(runtime.listeners[0].profiles[0].matrix_uses_ppv2());
+        assert_eq!(
+            runtime.listeners[0].profiles[0].matrix_proxy_protocol(),
+            ProxyProtocol::V2
+        );
+        assert_eq!(
+            runtime.listeners[0].profiles[1].matrix_proxy_protocol(),
+            ProxyProtocol::V1
+        );
+        assert_eq!(
+            runtime.listeners[0].profiles[1].auth_proxy_protocol(),
+            ProxyProtocol::Off
+        );
         assert_eq!(
             runtime.listeners[0].profiles[0].parsed_rewrite_origins,
             vec!["https://hs-public.example.org"]
@@ -1318,6 +1507,40 @@ mod tests {
         assert_eq!(runtime.listeners[1].listen.port(), 8081);
         assert_eq!(runtime.listeners[1].profiles.len(), 1);
         assert_eq!(runtime.listeners[1].profiles[0].name, "site-c-dedicated");
+    }
+
+    #[test]
+    fn legacy_ppv2_booleans_remain_backward_compatible() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [server]
+            listen = "0.0.0.0:8080"
+            accept_proxy_v2 = true
+            ppv2_pool_max_entries = 2048
+
+            [[proxies]]
+            name = "legacy"
+            domains = ["legacy.example.com"]
+            matrix_url = "https://hs.example.org:8443"
+            matrix_send_proxy_v2 = true
+            auth_send_proxy_v2 = false
+            "#,
+        )
+        .unwrap();
+        let runtime = cfg.into_runtime().unwrap();
+        assert_eq!(runtime.server.proxy_protocol_pool_max_entries, 2048);
+        assert_eq!(
+            runtime.listeners[0].inbound_proxy_protocol,
+            ProxyProtocol::V2
+        );
+        assert_eq!(
+            runtime.listeners[0].profiles[0].matrix_proxy_protocol(),
+            ProxyProtocol::V2
+        );
+        assert_eq!(
+            runtime.listeners[0].profiles[0].auth_proxy_protocol(),
+            ProxyProtocol::Off
+        );
     }
 
     #[test]
@@ -1348,5 +1571,13 @@ mod tests {
             .expect("config.example.toml must build valid RuntimeConfig");
         assert_eq!(runtime.listeners.len(), 1);
         assert_eq!(runtime.listeners[0].profiles.len(), 2);
+        assert_eq!(
+            runtime.listeners[0].profiles[0].matrix_proxy_protocol(),
+            ProxyProtocol::Off
+        );
+        assert_eq!(
+            runtime.listeners[0].profiles[1].matrix_proxy_protocol(),
+            ProxyProtocol::V2
+        );
     }
 }

@@ -1,41 +1,40 @@
 # =============================================================================
-# matrix-proxy Docker Compose 部署示例
-# 推荐：复制 config.example.toml 为 config.toml 后直接 `docker compose up -d`
-#      镜像启动时会自动检测并加载 `/app/config.toml`（无需额外指定 command）。
+# matrix-proxy — Hardened Docker Compose Example
+# Quick start:
+#   cp config.example.toml config.toml
+#   docker compose up -d
 # =============================================================================
 services:
   matrix-proxy:
     image: utoptop/matrix-proxy:1.0
     container_name: matrix-proxy
     restart: unless-stopped
-    # 安全加固：只读根文件系统 + 丢弃全部 Linux Capabilities + 禁止提权
+    # Security hardening: read-only rootfs, drop all Linux capabilities, prevent privilege escalation
     read_only: true
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    # 推荐仅绑定 127.0.0.1，由宿主机 HAProxy / Nginx / Caddy 统一终止 TLS
-    # 若在 config.toml 中为多个 [[proxies]] 配置了独立端口（例如 8081），请同步追加映射
+    # Bind to localhost only and terminate TLS via Nginx, HAProxy, Caddy, or Envoy.
+    # Add extra port mappings if any [[proxies]] block uses a dedicated `listen` port (e.g. 8081).
     ports:
       - "127.0.0.1:8910:8080"
       # - "127.0.0.1:8911:8081"
     environment:
       RUST_LOG: "${RUST_LOG:-matrix_proxy=info}"
-      # 若不使用 config.toml，可改用纯环境变量部署单上游（取消下方注释并移除 volumes）：
+      # For zero-TOML single-upstream deployments, uncomment below and remove `volumes`:
       # PUBLIC_URL: "${PUBLIC_URL:-https://proxy.example.com}"
       # MATRIX_UPSTREAM: "${MATRIX_UPSTREAM:-https://matrix.example.org}"
       # AUTH_UPSTREAM: "${AUTH_UPSTREAM:-https://auth.example.org}"
       # RTC_UPSTREAM: "${RTC_UPSTREAM:-}"
       # UPSTREAM_PROXY: "${UPSTREAM_PROXY:-}"
       # CLIENT_IP_MODE: "${CLIENT_IP_MODE:-replace}"
-      # SEND_PROXY_V2: "${SEND_PROXY_V2:-false}"
+      # PROXY_PROTOCOL: "${PROXY_PROTOCOL:-off}"
       # EXPOSE_INFO: "${EXPOSE_INFO:-trusted}"
     volumes:
-      # 推荐挂载目录至 `/app/conf:ro`（自动加载 `/app/conf/config.toml`）：
-      # 这样用 vim / SFTP / 面板原子覆盖保存 config.toml 时 inode 变化也能被容器实时感知并自动热更新！
-      # （若单文件挂载 `./config.toml:/app/config.toml:ro` 同样支持自动加载，仅需注意原地覆盖写入）
+      # Mounting the directory to `/app/conf:ro` (auto-loads `/app/conf/config.toml`) ensures
+      # editors/SFTP clients that perform atomic write+rename trigger automatic hot reload cleanly.
       - ./:/app/conf:ro
-    # 可选：限制容器日志体积，防止磁盘被撑满
     logging:
       driver: json-file
       options:

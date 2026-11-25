@@ -957,7 +957,7 @@ async fn outbound_proxy_protocol_v2_passes_real_client_ip_and_isolates_clients()
         auth_url = "http://{ppv2_addr}"
         matrix_host_header = "matrix.example.org"
         auth_host_header = "matrix.example.org"
-        send_proxy_v2 = true
+        proxy_protocol = "v2"
         rewrite_origins = ["https://auth.example.org"]
         "#
     );

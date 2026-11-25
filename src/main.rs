@@ -6,8 +6,12 @@ use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
 use hyper_util::service::TowerToHyperService;
-use matrix_proxy::client_ip::{InboundPeer, encode_ppv2_local, read_ppv2_header};
-use matrix_proxy::config::{Config, ListenerPlan, RuntimeConfig, canonical_ip, redact_proxy_url};
+use matrix_proxy::client_ip::{
+    InboundPeer, encode_proxy_protocol_local, read_proxy_protocol_header,
+};
+use matrix_proxy::config::{
+    Config, ListenerPlan, ProxyProtocol, RuntimeConfig, canonical_ip, redact_proxy_url,
+};
 use matrix_proxy::metrics::ProxyMetrics;
 use matrix_proxy::ppv2_client::configure_tcp_socket;
 use matrix_proxy::proxy::{
@@ -53,7 +57,7 @@ struct Cli {
 struct AcceptConfig {
     runtime: Arc<RuntimeConfig>,
     tls_acceptor: Option<TlsAcceptor>,
-    accept_proxy_v2: bool,
+    inbound_proxy_protocol: ProxyProtocol,
     header_timeout: Duration,
     keepalive: Duration,
     tcp_nodelay: bool,
@@ -69,7 +73,7 @@ impl AcceptConfig {
             header_timeout: Duration::from_secs(runtime.server.header_read_timeout_secs.max(1)),
             keepalive: Duration::from_secs(runtime.server.tcp_keepalive_secs),
             tcp_nodelay: runtime.server.tcp_nodelay,
-            accept_proxy_v2: plan.accept_proxy_v2,
+            inbound_proxy_protocol: plan.inbound_proxy_protocol,
             tls_acceptor,
             runtime,
         }
@@ -273,7 +277,7 @@ impl ReloadCoordinator {
                 info!(
                     listen = %listen_addr,
                     tls = plan.tls_enabled(),
-                    accept_proxy_v2 = plan.accept_proxy_v2,
+                    inbound_proxy_protocol = %plan.inbound_proxy_protocol,
                     profiles = ?plan.profiles.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
                     "listener hot-reloaded in place"
                 );
@@ -385,7 +389,7 @@ impl ReloadCoordinator {
         info!(
             listen = %listen_addr,
             tls = has_tls,
-            accept_proxy_v2 = plan.accept_proxy_v2,
+            inbound_proxy_protocol = %plan.inbound_proxy_protocol,
             profiles = ?profile_names,
             outbound_proxies = ?outbound_proxies,
             "listener ready"
@@ -672,31 +676,31 @@ async fn serve_listener(
 
                 tokio::spawn(async move {
                     let _conn_guard = conn_guard;
-                    let ppv2_client = if cfg.accept_proxy_v2 {
-                        // Anti-spoofing guard: only accept inbound PROXY Protocol v2 from trusted_proxies
-                        // (analogous to HAProxy `fc_src` whitelist).
+                    let ppv2_client = if cfg.inbound_proxy_protocol.is_enabled() {
+                        // Anti-spoofing guard: only accept inbound PROXY Protocol from trusted_proxies.
                         let physical_ip = canonical_ip(physical_peer.ip());
                         if !cfg.runtime.is_trusted_proxy(physical_ip) {
                             warn!(
                                 peer = %physical_peer,
                                 listen = %listen_addr,
-                                "rejected inbound PROXY Protocol v2 connection from untrusted peer"
+                                proxy_protocol = %cfg.inbound_proxy_protocol,
+                                "rejected inbound PROXY Protocol connection from untrusted peer"
                             );
                             return;
                         }
                         match tokio::time::timeout(
                             Duration::from_secs(5),
-                            read_ppv2_header(&mut tcp_stream),
+                            read_proxy_protocol_header(&mut tcp_stream, cfg.inbound_proxy_protocol),
                         )
                         .await
                         {
                             Ok(Ok(real_src)) => real_src,
                             Ok(Err(err)) => {
-                                debug!(peer = %physical_peer, error = %err, "rejected invalid inbound PROXY Protocol v2 header");
+                                debug!(peer = %physical_peer, proxy_protocol = %cfg.inbound_proxy_protocol, error = %err, "rejected invalid inbound PROXY Protocol header");
                                 return;
                             }
                             Err(_) => {
-                                debug!(peer = %physical_peer, "timed out reading inbound PROXY Protocol v2 header");
+                                debug!(peer = %physical_peer, proxy_protocol = %cfg.inbound_proxy_protocol, "timed out reading inbound PROXY Protocol header");
                                 return;
                             }
                         }
@@ -832,7 +836,7 @@ struct HealthCheckTarget {
     connect_addr: SocketAddr,
     proxy_prefix: String,
     tls: bool,
-    accept_proxy_v2: bool,
+    inbound_proxy_protocol: ProxyProtocol,
 }
 
 impl HealthCheckTarget {
@@ -840,7 +844,7 @@ impl HealthCheckTarget {
         listen: &str,
         proxy_prefix: &str,
         tls: bool,
-        accept_proxy_v2: bool,
+        inbound_proxy_protocol: ProxyProtocol,
     ) -> Result<Self> {
         let addr: SocketAddr = listen
             .parse()
@@ -858,7 +862,7 @@ impl HealthCheckTarget {
             connect_addr: SocketAddr::new(connect_ip, addr.port()),
             proxy_prefix: proxy_prefix.trim_end_matches('/').to_string(),
             tls,
-            accept_proxy_v2,
+            inbound_proxy_protocol,
         })
     }
 
@@ -886,8 +890,8 @@ async fn run_health_check(config_path: Option<&Path>) -> Result<()> {
         .build()?;
 
     for target in targets {
-        if target.accept_proxy_v2 {
-            probe_ppv2_health(&target).await?;
+        if target.inbound_proxy_protocol.is_enabled() {
+            probe_proxy_protocol_health(&target).await?;
         } else {
             let url = target.url();
             let resp = client
@@ -905,28 +909,28 @@ async fn run_health_check(config_path: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-async fn probe_ppv2_health(target: &HealthCheckTarget) -> Result<()> {
+async fn probe_proxy_protocol_health(target: &HealthCheckTarget) -> Result<()> {
     let timeout = Duration::from_secs(4);
     let mut tcp = tokio::time::timeout(timeout, TcpStream::connect(target.connect_addr))
         .await
         .with_context(|| {
             format!(
-                "PPv2 health check connect timed out for {}",
+                "PROXY Protocol health check connect timed out for {}",
                 target.connect_addr
             )
         })?
         .with_context(|| {
             format!(
-                "PPv2 health check connect failed for {}",
+                "PROXY Protocol health check connect failed for {}",
                 target.connect_addr
             )
         })?;
 
-    let ppv2_local = encode_ppv2_local();
-    tokio::time::timeout(timeout, tcp.write_all(&ppv2_local))
+    let pp_local = encode_proxy_protocol_local(target.inbound_proxy_protocol);
+    tokio::time::timeout(timeout, tcp.write_all(&pp_local))
         .await
-        .context("PPv2 health check write header timed out")?
-        .context("PPv2 health check write header failed")?;
+        .context("PROXY Protocol health check write header timed out")?
+        .context("PROXY Protocol health check write header failed")?;
 
     let req = format!(
         "GET {}/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
@@ -941,32 +945,33 @@ async fn probe_ppv2_health(target: &HealthCheckTarget) -> Result<()> {
             .map_err(|_| anyhow!("invalid health check SNI"))?;
         let mut tls = tokio::time::timeout(timeout, connector.connect(sni, tcp))
             .await
-            .context("PPv2 TLS health check handshake timed out")?
-            .context("PPv2 TLS health check handshake failed")?;
+            .context("PROXY Protocol TLS health check handshake timed out")?
+            .context("PROXY Protocol TLS health check handshake failed")?;
         tokio::time::timeout(timeout, tls.write_all(req.as_bytes()))
             .await
-            .context("PPv2 TLS health check write timed out")?
-            .context("PPv2 TLS health check write failed")?;
+            .context("PROXY Protocol TLS health check write timed out")?
+            .context("PROXY Protocol TLS health check write failed")?;
         tokio::time::timeout(timeout, tls.read(&mut resp_buf))
             .await
-            .context("PPv2 TLS health check read timed out")?
-            .context("PPv2 TLS health check read failed")?
+            .context("PROXY Protocol TLS health check read timed out")?
+            .context("PROXY Protocol TLS health check read failed")?
     } else {
         tokio::time::timeout(timeout, tcp.write_all(req.as_bytes()))
             .await
-            .context("PPv2 health check write timed out")?
-            .context("PPv2 health check write failed")?;
+            .context("PROXY Protocol health check write timed out")?
+            .context("PROXY Protocol health check write failed")?;
         tokio::time::timeout(timeout, tcp.read(&mut resp_buf))
             .await
-            .context("PPv2 health check read timed out")?
-            .context("PPv2 health check read failed")?
+            .context("PROXY Protocol health check read timed out")?
+            .context("PROXY Protocol health check read failed")?
     };
 
     let head = String::from_utf8_lossy(&resp_buf[..n]);
     let status_line = head.lines().next().unwrap_or_default().trim();
     if !status_line.starts_with("HTTP/1.1 200") && !status_line.starts_with("HTTP/1.0 200") {
         anyhow::bail!(
-            "PPv2 health check to {} returned unexpected status: '{status_line}'",
+            "PROXY Protocol {} health check to {} returned unexpected status: '{status_line}'",
+            target.inbound_proxy_protocol,
             target.connect_addr
         );
     }
@@ -982,7 +987,7 @@ fn non_empty_env(key: &str) -> Option<String> {
 }
 
 fn collect_health_check_targets(config_path: Option<&Path>) -> Result<Vec<HealthCheckTarget>> {
-    // Prefer full Config::load -> RuntimeConfig so ALL listeners (including accept_proxy_v2) are checked.
+    // Prefer full Config::load -> RuntimeConfig so ALL listeners (including inbound PROXY Protocol) are checked.
     if let Ok(cfg) = Config::load(config_path)
         && let Ok(runtime) = cfg.into_runtime()
     {
@@ -992,7 +997,7 @@ fn collect_health_check_targets(config_path: Option<&Path>) -> Result<Vec<Health
                 &listener.listen.to_string(),
                 &listener.proxy_prefix,
                 listener.tls_enabled(),
-                listener.accept_proxy_v2,
+                listener.inbound_proxy_protocol,
             )?);
         }
         if !targets.is_empty() {
@@ -1013,16 +1018,16 @@ fn collect_health_check_targets(config_path: Option<&Path>) -> Result<Vec<Health
         .unwrap_or_else(|| "/_proxy".to_string());
     let tls = (non_empty_env("TLS_CERT_PATH").is_some() && non_empty_env("TLS_KEY_PATH").is_some())
         || file_cfg.as_ref().is_some_and(Config::tls_enabled);
-    let accept_ppv2 = file_cfg
+    let inbound_pp = file_cfg
         .as_ref()
-        .map(|c| c.server.accept_proxy_v2)
-        .unwrap_or(false);
+        .map(|c| c.server.effective_inbound_proxy_protocol())
+        .unwrap_or(ProxyProtocol::Off);
 
     Ok(vec![HealthCheckTarget::from_parts(
         &listen,
         &proxy_prefix,
         tls,
-        accept_ppv2,
+        inbound_pp,
     )?])
 }
 
@@ -1078,50 +1083,52 @@ mod tests {
             &raw_cfg.server.listen,
             &raw_cfg.routing.proxy_prefix,
             raw_cfg.tls_enabled(),
-            raw_cfg.server.accept_proxy_v2,
+            raw_cfg.server.effective_inbound_proxy_protocol(),
         )
         .unwrap();
         assert_eq!(target.url(), "http://127.0.0.1:8080/_proxy/health");
-        assert!(!target.accept_proxy_v2);
+        assert_eq!(target.inbound_proxy_protocol, ProxyProtocol::Off);
     }
 
     #[tokio::test]
-    async fn ppv2_health_check_probes_accept_proxy_v2_listener() {
-        let cfg = Config::from_toml_str(
-            r#"
-            [server]
-            listen = "127.0.0.1:0"
-            accept_proxy_v2 = true
-            expose_info = "trusted"
+    async fn proxy_protocol_health_check_probes_v1_and_v2_listeners() {
+        for (proto_str, proto) in [("v1", ProxyProtocol::V1), ("v2", ProxyProtocol::V2)] {
+            let cfg = Config::from_toml_str(&format!(
+                r#"
+                [server]
+                listen = "127.0.0.1:0"
+                inbound_proxy_protocol = "{proto_str}"
+                expose_info = "trusted"
 
-            [[proxies]]
-            name = "test"
-            domains = ["proxy.example.com"]
-            matrix_url = "https://matrix.example.org"
-            "#,
-        )
-        .unwrap();
-        let runtime = Arc::new(cfg.into_runtime().unwrap());
-        let plan = runtime.listeners[0].clone();
-        let state = ListenerState::build(Arc::clone(&runtime), plan.clone()).unwrap();
-        let live = LiveListener::static_only(state);
-        let app = build_live_listener_router(live);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+                [[proxies]]
+                name = "test"
+                domains = ["proxy.example.com"]
+                matrix_url = "https://matrix.example.org"
+                "#
+            ))
+            .unwrap();
+            let runtime = Arc::new(cfg.into_runtime().unwrap());
+            let plan = runtime.listeners[0].clone();
+            let state = ListenerState::build(Arc::clone(&runtime), plan.clone()).unwrap();
+            let live = LiveListener::static_only(state);
+            let app = build_live_listener_router(live);
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
 
-        let accept_cfg = Arc::new(RwLock::new(AcceptConfig::from_plan(runtime, &plan, None)));
-        let tracker = Arc::new(ConnectionTracker::default());
-        let (tx, rx) = watch::channel(false);
-        let server_task = tokio::spawn(async move {
-            let _ = serve_listener(addr, listener, accept_cfg, app, tracker, rx).await;
-        });
+            let accept_cfg = Arc::new(RwLock::new(AcceptConfig::from_plan(runtime, &plan, None)));
+            let tracker = Arc::new(ConnectionTracker::default());
+            let (tx, rx) = watch::channel(false);
+            let server_task = tokio::spawn(async move {
+                let _ = serve_listener(addr, listener, accept_cfg, app, tracker, rx).await;
+            });
 
-        let target =
-            HealthCheckTarget::from_parts(&addr.to_string(), "/_proxy", false, true).unwrap();
-        probe_ppv2_health(&target).await.unwrap();
+            let target =
+                HealthCheckTarget::from_parts(&addr.to_string(), "/_proxy", false, proto).unwrap();
+            probe_proxy_protocol_health(&target).await.unwrap();
 
-        let _ = tx.send(true);
-        let _ = server_task.await;
+            let _ = tx.send(true);
+            let _ = server_task.await;
+        }
     }
 
     #[tokio::test]

@@ -1,4 +1,4 @@
-use crate::config::{ProxyProfile, origin_string};
+use crate::config::{ProxyProfile, ProxyProtocol, origin_string};
 use crate::ppv2_client::Ppv2Client;
 use anyhow::{Context, Result, anyhow};
 use http::{HeaderMap, HeaderValue};
@@ -119,8 +119,8 @@ impl DiscoveryManager {
             auth_upstream = %resolved.effective_auth_url(),
             auth_separate = resolved.auth_is_separate(),
             rtc_upstream = ?resolved.rtc_url.as_ref().map(|u| u.as_str()),
-            matrix_ppv2 = self.profile.matrix_uses_ppv2(),
-            auth_ppv2 = self.profile.auth_uses_ppv2(),
+            matrix_proxy_protocol = %self.profile.matrix_proxy_protocol(),
+            auth_proxy_protocol = %self.profile.auth_proxy_protocol(),
             "upstream discovery initialized"
         );
         Ok(resolved)
@@ -279,7 +279,10 @@ impl DiscoveryManager {
         //    e.g. `mozilla.org/.well-known/matrix/client` -> `www.mozilla.org/.well-known/matrix/client`).
         if let Some(server_name) = &self.profile.upstream.server_name {
             let wk_url = build_server_name_well_known_url(server_name)?;
-            match self.fetch_json(&wk_url, false, None, true).await {
+            match self
+                .fetch_json(&wk_url, ProxyProtocol::Off, None, true)
+                .await
+            {
                 Ok(json) => {
                     debug!(profile = %self.profile.name, url = %wk_url, "fetched server_name .well-known/matrix/client");
                     upstream_well_known = Some(json);
@@ -316,7 +319,7 @@ impl DiscoveryManager {
             ));
         };
 
-        let use_matrix_ppv2 = self.profile.matrix_uses_ppv2();
+        let matrix_pp = self.profile.matrix_proxy_protocol();
         let matrix_host_ov = self.profile.upstream.matrix_host_header.as_deref();
 
         // 3. Fallback well-known fetch from matrix_url if needed.
@@ -325,7 +328,7 @@ impl DiscoveryManager {
             && let Ok(wk_url) = matrix_url.join("/.well-known/matrix/client")
         {
             match self
-                .fetch_json(&wk_url, use_matrix_ppv2, matrix_host_ov, true)
+                .fetch_json(&wk_url, matrix_pp, matrix_host_ov, true)
                 .await
             {
                 Ok(json) => {
@@ -377,7 +380,7 @@ impl DiscoveryManager {
         if (auth_url.is_none() || discovered_issuer.is_none() || observed_origins.is_empty())
             && (is_startup || self.profile.upstream.auth_url.is_none())
             && let Some(meta) = self
-                .probe_auth_metadata(&matrix_url, use_matrix_ppv2, matrix_host_ov)
+                .probe_auth_metadata(&matrix_url, matrix_pp, matrix_host_ov)
                 .await
         {
             if let Some(issuer) = meta.get("issuer").and_then(Value::as_str) {
@@ -445,7 +448,7 @@ impl DiscoveryManager {
     async fn probe_auth_metadata(
         &self,
         matrix_url: &Url,
-        use_ppv2: bool,
+        proxy_protocol: ProxyProtocol,
         host_override: Option<&str>,
     ) -> Option<Value> {
         for path in [
@@ -453,7 +456,10 @@ impl DiscoveryManager {
             "/_matrix/client/unstable/org.matrix.msc2965/auth_metadata",
         ] {
             if let Ok(url) = matrix_url.join(path) {
-                match self.fetch_json(&url, use_ppv2, host_override, false).await {
+                match self
+                    .fetch_json(&url, proxy_protocol, host_override, false)
+                    .await
+                {
                     Ok(json) => {
                         debug!(profile = %self.profile.name, url = %url, "discovered upstream auth_metadata");
                         return Some(json);
@@ -470,21 +476,29 @@ impl DiscoveryManager {
     async fn fetch_json(
         &self,
         url: &Url,
-        use_ppv2: bool,
+        proxy_protocol: ProxyProtocol,
         host_override: Option<&str>,
         follow_redirects: bool,
     ) -> Result<Value> {
-        if use_ppv2 && let Some(ppv2) = &self.ppv2_client {
+        if proxy_protocol.is_enabled()
+            && let Some(ppv2) = &self.ppv2_client
+        {
             let mut hdrs = HeaderMap::new();
             hdrs.insert(
                 http::header::ACCEPT,
                 HeaderValue::from_static("application/json"),
             );
             let (status, bytes, _) = ppv2
-                .get_bytes(url, host_override, hdrs, Duration::from_secs(10))
+                .get_bytes(
+                    url,
+                    host_override,
+                    hdrs,
+                    Duration::from_secs(10),
+                    proxy_protocol,
+                )
                 .await?;
             if !status.is_success() {
-                anyhow::bail!("GET {url} (PPv2) returned HTTP {status}");
+                anyhow::bail!("GET {url} (PROXY Protocol {proxy_protocol}) returned HTTP {status}");
             }
             return serde_json::from_slice(&bytes)
                 .with_context(|| format!("invalid JSON from {url}"));

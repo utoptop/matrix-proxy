@@ -1,5 +1,5 @@
-use crate::client_ip::{encode_ppv2_local, encode_ppv2_proxy};
-use crate::config::ServerConfig;
+use crate::client_ip::{encode_proxy_protocol_local, encode_proxy_protocol_proxy};
+use crate::config::{ProxyProtocol, ServerConfig};
 use crate::metrics::ProxyMetrics;
 use crate::ws::{build_client_tls_config, connect_via_proxy};
 use anyhow::{Context, Result, anyhow};
@@ -30,6 +30,7 @@ struct PoolKey {
     scheme: String,
     host: String,
     port: u16,
+    proto: ProxyProtocol,
     client_ip: Option<IpAddr>,
 }
 
@@ -88,17 +89,18 @@ impl Ppv2Client {
             idle_timeout: Duration::from_secs(server.pool_idle_timeout_secs.max(10)),
             tcp_keepalive: Duration::from_secs(server.tcp_keepalive_secs),
             tcp_nodelay: server.tcp_nodelay,
-            max_entries: server.ppv2_pool_max_entries.max(64),
+            max_entries: server.proxy_protocol_pool_max_entries.max(64),
             h2_pool: Mutex::new(HashMap::with_capacity(256)),
             h1_pool: Mutex::new(HashMap::with_capacity(64)),
             metrics,
         })
     }
 
-    /// Sends a streaming HTTP request to `target_url` with a PROXY Protocol v2 header for `client_addr`
-    /// (`None` sends a PPv2 `LOCAL` header for proxy-originated discovery probes).
-    /// Automatically retries once on a fresh TCP+PPv2+TLS connection if a pooled idle connection
+    /// Sends a streaming HTTP request to `target_url` with a PROXY Protocol v1/v2 header for `client_addr`
+    /// (`None` sends a LOCAL/UNKNOWN header for proxy-originated discovery probes).
+    /// Automatically retries once on a fresh TCP+PROXY+TLS connection if a pooled idle connection
     /// became stale before request transmission (eliminates transient 502s after upstream keepalive close).
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_request(
         &self,
         method: Method,
@@ -106,6 +108,7 @@ impl Ppv2Client {
         host_override: Option<&str>,
         headers: HeaderMap,
         body: Body,
+        proto: ProxyProtocol,
         client_addr: Option<SocketAddr>,
     ) -> Result<Response<Incoming>> {
         let host = target_url
@@ -121,6 +124,7 @@ impl Ppv2Client {
             scheme: target_url.scheme().to_ascii_lowercase(),
             host: host.clone(),
             port,
+            proto,
             client_ip: client_addr.map(|s| s.ip()),
         };
 
@@ -138,7 +142,7 @@ impl Ppv2Client {
 
         // Try pooled connection first; if stale before transmission (or safe idempotent replay), reconnect once.
         let (conn, was_reused) = self
-            .checkout_or_connect(&key, &host, port, use_tls, client_addr)
+            .checkout_or_connect(&key, &host, port, use_tls, proto, client_addr)
             .await?;
 
         match conn {
@@ -147,9 +151,9 @@ impl Ppv2Client {
                     if was_reused {
                         self.evict_h2(&key);
                         self.record_retry();
-                        debug!(host = %host, port, error = %err, "stale pooled PPv2 H2 connection evicted before send; reconnecting");
+                        debug!(host = %host, port, error = %err, "stale pooled PROXY Protocol H2 connection evicted before send; reconnecting");
                         let fresh = self
-                            .connect_fresh(&key, &host, port, use_tls, client_addr)
+                            .connect_fresh(&key, &host, port, use_tls, proto, client_addr)
                             .await?;
                         let req = build_hyper_req(&method, &pq, &host_hdr, &headers, body)?;
                         return self.dispatch_on_conn(&key, fresh, req).await;
@@ -163,9 +167,9 @@ impl Ppv2Client {
                     Err(err) if was_reused && can_replay_body => {
                         self.evict_h2(&key);
                         self.record_retry();
-                        debug!(host = %host, port, error = %err, "pooled PPv2 H2 request failed on idempotent method; retrying once");
+                        debug!(host = %host, port, error = %err, "pooled PROXY Protocol H2 request failed on idempotent method; retrying once");
                         let fresh = self
-                            .connect_fresh(&key, &host, port, use_tls, client_addr)
+                            .connect_fresh(&key, &host, port, use_tls, proto, client_addr)
                             .await?;
                         let retry_req =
                             build_hyper_req(&method, &pq, &host_hdr, &headers, Body::empty())?;
@@ -181,9 +185,9 @@ impl Ppv2Client {
                 if let Err(err) = sender.ready().await {
                     if was_reused {
                         self.record_retry();
-                        debug!(host = %host, port, error = %err, "stale pooled PPv2 H1 connection evicted before send; reconnecting");
+                        debug!(host = %host, port, error = %err, "stale pooled PROXY Protocol H1 connection evicted before send; reconnecting");
                         let fresh = self
-                            .connect_fresh(&key, &host, port, use_tls, client_addr)
+                            .connect_fresh(&key, &host, port, use_tls, proto, client_addr)
                             .await?;
                         let req = build_hyper_req(&method, &pq, &host_hdr, &headers, body)?;
                         return self.dispatch_on_conn(&key, fresh, req).await;
@@ -201,9 +205,9 @@ impl Ppv2Client {
                     }
                     Err(err) if was_reused && can_replay_body => {
                         self.record_retry();
-                        debug!(host = %host, port, error = %err, "pooled PPv2 H1 request failed on idempotent method; retrying once");
+                        debug!(host = %host, port, error = %err, "pooled PROXY Protocol H1 request failed on idempotent method; retrying once");
                         let fresh = self
-                            .connect_fresh(&key, &host, port, use_tls, client_addr)
+                            .connect_fresh(&key, &host, port, use_tls, proto, client_addr)
                             .await?;
                         let retry_req =
                             build_hyper_req(&method, &pq, &host_hdr, &headers, Body::empty())?;
@@ -256,29 +260,32 @@ impl Ppv2Client {
 
     fn record_retry(&self) {
         if let Some(m) = &self.metrics {
-            m.ppv2_retries_total.fetch_add(1, Ordering::Relaxed);
+            m.proxy_protocol_retries_total
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    /// Convenience helper for buffered discovery/metadata GET requests over PROXY Protocol v2 (LOCAL command).
+    /// Convenience helper for buffered discovery/metadata GET requests over PROXY Protocol (LOCAL/UNKNOWN).
     pub async fn get_bytes(
         &self,
         url: &Url,
         host_override: Option<&str>,
         headers: HeaderMap,
         timeout: Duration,
+        proto: ProxyProtocol,
     ) -> Result<(StatusCode, Vec<u8>, Option<HeaderValue>)> {
-        self.get_bytes_for_client(url, host_override, headers, timeout, None)
+        self.get_bytes_for_client(url, host_override, headers, timeout, proto, None)
             .await
     }
 
-    /// Buffered GET over PROXY Protocol v2, optionally carrying the real client address in the PPv2 header.
+    /// Buffered GET over PROXY Protocol v1/v2, optionally carrying the real client address in the header.
     pub async fn get_bytes_for_client(
         &self,
         url: &Url,
         host_override: Option<&str>,
         mut headers: HeaderMap,
         timeout: Duration,
+        proto: ProxyProtocol,
         client_addr: Option<SocketAddr>,
     ) -> Result<(StatusCode, Vec<u8>, Option<HeaderValue>)> {
         headers.insert(
@@ -294,11 +301,12 @@ impl Ppv2Client {
                 host_override,
                 headers,
                 Body::empty(),
+                proto,
                 client_addr,
             ),
         )
         .await
-        .with_context(|| format!("timed out fetching {url} over PPv2"))??;
+        .with_context(|| format!("timed out fetching {url} over PROXY Protocol {proto}"))??;
 
         let status = resp.status();
         let content_type = resp.headers().get(http::header::CONTENT_TYPE).cloned();
@@ -324,9 +332,10 @@ impl Ppv2Client {
         host: &str,
         port: u16,
         use_tls: bool,
+        proto: ProxyProtocol,
         client_addr: Option<SocketAddr>,
     ) -> Result<(SelectedConn, bool)> {
-        // 1. Fast path: reuse warm multiplexed H2 connection for this `(upstream, client_ip)`.
+        // 1. Fast path: reuse warm multiplexed H2 connection for this `(upstream, proto, client_ip)`.
         {
             let mut pool = self.h2_pool.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(entry) = pool.get_mut(key) {
@@ -338,7 +347,7 @@ impl Ppv2Client {
             }
         }
 
-        // 2. Fast path: reuse idle H1 connection for this `(upstream, client_ip)`.
+        // 2. Fast path: reuse idle H1 connection for this `(upstream, proto, client_ip)`.
         {
             let mut pool = self.h1_pool.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(vec) = pool.get_mut(key) {
@@ -354,7 +363,7 @@ impl Ppv2Client {
         }
 
         let fresh = self
-            .connect_fresh(key, host, port, use_tls, client_addr)
+            .connect_fresh(key, host, port, use_tls, proto, client_addr)
             .await?;
         Ok((fresh, false))
     }
@@ -365,15 +374,16 @@ impl Ppv2Client {
         host: &str,
         port: u16,
         use_tls: bool,
+        proto: ProxyProtocol,
         client_addr: Option<SocketAddr>,
     ) -> Result<SelectedConn> {
-        // Cold path: open TCP -> send PPv2 header -> TLS handshake (ALPN h2,http/1.1) -> HTTP handshake.
+        // Cold path: open TCP -> send PROXY Protocol header -> TLS handshake (ALPN h2,http/1.1) -> HTTP handshake.
         let (stream, is_h2) = tokio::time::timeout(
             self.connect_timeout,
-            self.connect_ppv2_stream(host, port, use_tls, client_addr),
+            self.connect_pp_stream(host, port, use_tls, proto, client_addr),
         )
         .await
-        .with_context(|| format!("PPv2 connect timeout to {host}:{port}"))??;
+        .with_context(|| format!("PROXY Protocol {proto} connect timeout to {host}:{port}"))??;
 
         let io = TokioIo::new(stream);
 
@@ -392,7 +402,7 @@ impl Ppv2Client {
 
             tokio::spawn(async move {
                 if let Err(err) = conn.await {
-                    debug!(error = %err, "PPv2 H2 upstream connection closed");
+                    debug!(error = %err, "PROXY Protocol H2 upstream connection closed");
                 }
             });
 
@@ -405,7 +415,7 @@ impl Ppv2Client {
 
             tokio::spawn(async move {
                 if let Err(err) = conn.await {
-                    debug!(error = %err, "PPv2 H1 upstream connection closed");
+                    debug!(error = %err, "PROXY Protocol H1 upstream connection closed");
                 }
             });
 
@@ -413,11 +423,12 @@ impl Ppv2Client {
         }
     }
 
-    async fn connect_ppv2_stream(
+    async fn connect_pp_stream(
         &self,
         host: &str,
         port: u16,
         use_tls: bool,
+        proto: ProxyProtocol,
         client_addr: Option<SocketAddr>,
     ) -> Result<(BoxedStream, bool)> {
         let mut tcp = if let Some(proxy_url) = &self.outbound_proxy {
@@ -434,13 +445,15 @@ impl Ppv2Client {
             .peer_addr()
             .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], port)));
 
-        let ppv2_hdr = match client_addr {
-            Some(src) => encode_ppv2_proxy(src, dst_addr),
-            None => encode_ppv2_local(),
+        let pp_hdr = match client_addr {
+            Some(src) => encode_proxy_protocol_proxy(proto, src, dst_addr),
+            None => encode_proxy_protocol_local(proto),
         };
-        tcp.write_all(&ppv2_hdr)
-            .await
-            .context("failed to write PROXY Protocol v2 header to upstream")?;
+        if !pp_hdr.is_empty() {
+            tcp.write_all(&pp_hdr).await.with_context(|| {
+                format!("failed to write PROXY Protocol {proto} header to upstream")
+            })?;
+        }
 
         if !use_tls {
             return Ok((Box::new(tcp), false));
@@ -449,10 +462,9 @@ impl Ppv2Client {
         let connector = TlsConnector::from(Arc::clone(&self.tls_config));
         let sni = ServerName::try_from(host.to_string())
             .map_err(|_| anyhow!("invalid TLS SNI host '{host}'"))?;
-        let tls_stream = connector
-            .connect(sni, tcp)
-            .await
-            .with_context(|| format!("TLS handshake to {host}:{port} failed after PPv2 header"))?;
+        let tls_stream = connector.connect(sni, tcp).await.with_context(|| {
+            format!("TLS handshake to {host}:{port} failed after PROXY Protocol {proto} header")
+        })?;
 
         let negotiated_h2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
         Ok((Box::new(tls_stream), negotiated_h2))

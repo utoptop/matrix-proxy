@@ -1,42 +1,41 @@
 # =============================================================================
-# matrix-proxy 配置文件模板（v1.1.0）
+# matrix-proxy v1.2 — Full Configuration Reference
 # =============================================================================
-# 加载优先级：
-#   1. 命令行 `--config <路径>` 或环境变量 `MATRIX_PROXY_CONFIG`
-#   2. 若未指定，启动时自动检测容器内 `/app/config.toml` 或当前目录 `./config.toml`
-#   3. 所有全局环境变量均可覆盖对应的全局配置项
+# Deployment modes (both can be combined in a single process):
+#   1. Shared single port + host-based routing (Virtual Host):
+#      Multiple `[[proxies]]` blocks omit `listen` and share `[server].listen`.
+#      Your edge proxy (Nginx / HAProxy / Caddy / Envoy) forwards multiple proxy
+#      domains to one port and matrix-proxy routes by `X-Forwarded-Host` / `Host`.
+#   2. Dedicated port per upstream:
+#      Each `[[proxies]]` block specifies its own `listen = "0.0.0.0:8081"`, etc.
 #
-# 多上游架构说明（支持在同一配置文件中混排两种模式）：
-#   - 模式 A（统一单端口 + 按域名自动分流）：
-#       多个 `[[proxies]]` 块省略 `listen`（默认共享 `server.listen`），
-#       前置 HAProxy/Nginx 将多个代理域名统一转发至同一端口，matrix-proxy 按
-#       `X-Forwarded-Host` / `Host` 做 O(1) 自动路由。
-#   - 模式 B（每个上游自定义独立端口）：
-#       在 `[[proxies]]` 块内单独指定 `listen = "0.0.0.0:8081"` 等端口，
-#       前置 HAProxy/Nginx 可按不同域名分别代理到不同的后端端口。
-#   - 向下兼容：不写 `[[proxies]]` 时，仍兼容单上游 `[upstream]` + 环境变量模式。
+# Quick start:
+#   cp config.example.toml config.toml
+#   docker compose up -d
 # =============================================================================
 
 [server]
-# 默认监听地址：当 `[[proxies]]` 块未单独设置 `listen` 时统一复用此端口
+# Default listen address shared by all `[[proxies]]` blocks that omit `listen`.
 listen = "0.0.0.0:8080"
 
-# 可选原生 TLS 证书与私钥路径（前置 HAProxy / Nginx / Caddy / Cloudflare 卸载 TLS 时保持留空）
+# Optional native TLS termination (leave empty when terminating TLS at Nginx / HAProxy / Caddy).
 tls_cert_path = ""
 tls_key_path = ""
 
-# 是否在入站 TCP 连接上解析 HAProxy PROXY Protocol v2：
-# - 设为 true 时，仅放行来自下方 `trusted_proxies` 物理对端的连接，同时保留真实客户端 IP/端口
-#   以及 HAProxy 传入的 `X-Forwarded-Proto` / `X-Forwarded-Host`，内置 `--health-check` 也会自动走 PPv2 LOCAL 探测。
-# - 对应 HAProxy backend 必须同时配置 `send-proxy-v2` 与 `check-send-proxy`（且务必保持 `http-reuse safe`）。
-accept_proxy_v2 = false
+# Inbound PROXY Protocol framing on accepted TCP connections:
+#   - "off" (default, recommended behind local L7 HTTP proxies such as Nginx / HAProxy HTTP mode)
+#   - "v1"  (standard ASCII PROXY Protocol v1 header)
+#   - "v2"  (standard binary PROXY Protocol v2 header, e.g. L4 TCP passthrough / AWS NLB)
+# Note: Only physical peers matching `trusted_proxies` are allowed to send PROXY Protocol frames.
+#       Built-in `--health-check` automatically speaks v1/v2 when enabled.
+inbound_proxy_protocol = "off"
 
-# ---------------------- 安全与真实客户端 IP 校验 ----------------------
-# 是否信任前置反向代理传入的 X-Forwarded-For / X-Real-IP / X-Forwarded-Host / X-Forwarded-Proto
-# 注意：仅当物理 TCP 对端 IP 命中下方 `trusted_proxies` 白名单时才会采信，防止公网直连伪造源 IP
+# ---------------------- Security & Real Client IP Trust ----------------------
+# Trust `X-Forwarded-For`, `X-Real-IP`, `Forwarded`, `X-Forwarded-Host`, and `X-Forwarded-Proto`
+# ONLY when the physical TCP peer belongs to `trusted_proxies` (anti-spoofing protection).
 trust_forwarded_headers = true
 
-# 受信任的前置代理 IP / CIDR 白名单（覆盖本机回环、Docker 网桥、内网代理）
+# Trusted reverse-proxy IP / CIDR allowlist (loopback, Docker bridges, private LANs).
 trusted_proxies = [
   "127.0.0.1/32",
   "::1/128",
@@ -47,132 +46,131 @@ trusted_proxies = [
   "fe80::/10",
 ]
 
-# `/_proxy/info` 状态接口的访问控制策略：
-#   - "trusted"（推荐默认）：仅允许来自 `trusted_proxies` 的本机/内网请求访问，公网返回 403
-#   - "always"             ：允许任何来源访问（不建议对公网暴露上游架构信息）
-#   - "disabled"           ：完全关闭 `/_proxy/info`（返回 404）
-# 注：`/_proxy/health` 存活探针始终返回 200 OK 且不泄露任何上游地址。
+# Access control for management endpoints (`/_proxy/info`, `/_proxy/metrics`, `POST /_proxy/reload`):
+#   - "trusted"  (recommended default): allow only requests from `trusted_proxies`; return 403 publicly
+#   - "always"   : allow from any source (not recommended on public endpoints)
+#   - "disabled" : disable management endpoints (return 404)
+# Note: `/_proxy/health` always returns 200 OK without leaking upstream details.
 expose_info = "trusted"
 
-# ---------------------- 性能与抗攻击调优 ----------------------
-# Auth 登录页 HTML/JSON/JS/CSS 文本重写的最大缓冲上限（字节，默认 4 MiB）
-# 注意：`/_matrix/*` 聊天、/sync 与媒体上传下载全程零缓冲流式透传，不受此限制
+# ---------------------- Performance & Abuse Protection ----------------------
+# Max body buffer size (bytes, default 4 MiB) for rewriting Auth HTML/JSON/JS/CSS responses.
+# `/_matrix/*` sync, events, and media uploads/downloads always stream with zero buffering.
 max_rewrite_body_bytes = 4194304
 
-# 单监听端口最大并发请求数（达到上限快速返回 503 + Retry-After，防止突发流量打爆内存；0 表示不限制）
+# Max concurrent in-flight requests per listener (returns 503 + Retry-After when saturated; 0 = unlimited).
 max_concurrent_requests = 10000
 
-# 可选单客户端 IP 令牌桶限流（每秒请求数；0 表示关闭，适合已由前置 HAProxy 统一限流的场景）
+# Optional per-client-IP token-bucket rate limit (requests/sec; 0 = disabled, ideal when edge proxy limits).
 rate_limit_rps = 0
-# 单 IP 突发容量（仅在 rate_limit_rps > 0 时生效）
 rate_limit_burst = 200
 
-# HTTP/1.1 请求头读取超时（秒），防御 Slowloris 慢连接攻击
+# HTTP/1.1 request header read timeout in seconds (Slowloris defense).
 header_read_timeout_secs = 15
 
-# 标准 HTTP/HTTPS 客户端每个上游 Host 的最大空闲连接池大小
+# Standard HTTP/HTTPS upstream connection pool tuning.
 pool_max_idle_per_host = 128
-# 上游连接池空闲回收时间（秒）
 pool_idle_timeout_secs = 90
-# TCP Keep-Alive 探测间隔（秒），防止移动端 NAT/防火墙静默掐断长连接
+
+# TCP socket tuning (`TCP_NODELAY` reduces Matrix JSON /sync latency; keepalive prevents silent NAT drops).
 tcp_keepalive_secs = 30
-# 启用 TCP_NODELAY（禁用 Nagle 算法），显著降低 Matrix JSON /sync 与小包 RTT 延迟
 tcp_nodelay = true
-# 出站 PROXY Protocol v2 按 `(上游地址, 真实客户端IP)` 隔离的 HTTP/2 连接池最大条目上限
-ppv2_pool_max_entries = 4096
-# 监听 socket 的 TCP backlog 队列长度
+
+# Max isolated `(upstream, protocol, client_ip)` entries in the outbound PROXY Protocol H2/H1 pool.
+proxy_protocol_pool_max_entries = 4096
+
+# TCP listen socket backlog size.
 listen_backlog = 4096
 
-# ---------------------- 零停机热更新与优雅退出 ----------------------
-# 开启配置文件与 TLS 证书自动热更新（修改保存 config.toml 后自动无感生效，不中断已有连接）
-# 即使设为 false，也始终支持 SIGHUP (`docker kill -s HUP matrix-proxy`) 与 `POST /_proxy/reload` 手动热更新
-# 注意：新配置校验失败时自动保留旧配置继续服务，不会导致服务中断
+# ---------------------- Zero-Downtime Hot Reload & Drain ----------------------
+# Automatically watch `config.toml` and any native TLS cert/key files for changes and reload in place.
+# Invalid configs are rejected safely while keeping the previous active configuration serving traffic.
+# Even if false, `SIGHUP` (`docker kill -s HUP matrix-proxy`) and `POST /_proxy/reload` remain available.
 hot_reload = true
-# 自动热更新文件轮询间隔（秒，最小 1 秒，默认 2 秒）
 hot_reload_interval_secs = 2
-# 收到 SIGTERM / SIGINT 时等待在途 HTTP/2、/sync 与 WebSocket 连接优雅排空的最长秒数
+
+# Max seconds to wait for in-flight HTTP/2, /sync, and WebSocket connections to drain on SIGTERM/SIGINT.
 shutdown_grace_secs = 15
 
 
 # =============================================================================
-# 示例 1（共享单端口 + 按域名自动路由）：标准 Matrix Homeserver + 独立 Auth / MAS
+# Example 1 (Shared Port + Virtual Host): Matrix Homeserver + Separate Auth/MAS
 # =============================================================================
 [[proxies]]
-# 配置块唯一名称（用于日志和 `/_proxy/info` 标识）
 name = "matrix-primary"
 
-# 省略 `listen` 即自动共享 `[server].listen`（0.0.0.0:8080）
-# 共享端口模式下用于匹配 Host / X-Forwarded-Host 的域名列表（支持通配符如 "*.proxy.example.com"）
-# 若留空会自动从 `public_url` 与 `public_auth_url` 提取主机名
-domains = ["proxy1.example.com"]
+# Omit `listen` to share `[server].listen` (`0.0.0.0:8080`).
+# Domains routed to this upstream (exact match or wildcard `*.example.com`).
+domains = ["matrix1.example.com"]
 
-# 用户在 Matrix 客户端（Element X / Element Web / Cinny 等）输入的单代理域名
-public_url = "https://proxy1.example.com"
+# External single proxy URL entered in Matrix clients (https:// prefix is optional).
+public_url = "https://matrix1.example.com"
 
-# 上游 Matrix Client-Server 地址（省略协议头时默认补全 https://）
-matrix_url = "https://matrix.example.org"
-# 上游独立的 Matrix Auth / MAS / OIDC 服务地址
-# 若留空，matrix-proxy 会在启动及请求时自动从上游 `auth_metadata` / `.well-known` 发现
-auth_url = "https://auth.example.org"
-# 可选：上游 Matrix server_name（用于拉取并合并上游 `/.well-known/matrix/client` 扩展字段）
+# Upstream Matrix Client-Server URL.
+matrix_url = "https://matrix-client.example.org"
+
+# Upstream Matrix Auth / MAS / OIDC URL (omit to auto-discover from `auth_metadata`).
+auth_url = "https://account.example.org"
+
+# Optional Matrix server_name for `.well-known/matrix/client` merging (follows up to 3 redirects).
 server_name = "example.org"
-# 可选：上游 LiveKit JWT / RTC 服务地址（配置后自动通过 `/_rtc` 代理并重写 `rtc_foci`）
-rtc_url = "https://rtc.example.org"
 
-# 真实客户端 IP 透传模式（HTTP 头层面）：
-#   - "replace"（推荐默认）：覆盖写入权威的 `X-Forwarded-For`、`X-Real-IP` 与 RFC 7239 `Forwarded`
-#   - "append"             ：在受信任的 `X-Forwarded-For` 链末尾追加本跳 IP 并设置 `X-Real-IP`
-#   - "off"                ：匿名代理模式，不向上游传递客户端 IP 头
+# Optional LiveKit JWT / Element Call RTC endpoint (automatically proxied via `/_rtc`).
+rtc_url = "https://livekit-jwt.example.org"
+
+# Standard HTTP client IP headers forwarded upstream:
+#   - "replace" (recommended): overwrite X-Forwarded-For, X-Real-IP, and RFC 7239 Forwarded with real client IP
+#   - "append"               : append trusted hop to existing X-Forwarded-For chain
+#   - "off"                  : do not emit forwarded IP headers
 client_ip_mode = "replace"
 
-# 单域名路由模式：
-#   - "root"（推荐默认）：`/.well-known/matrix/*`、`/_matrix/*`、`/_synapse/*`、`/_conduwuit/*` -> `matrix_url`；
-#                         其余路径（`/authorize`、`/oauth2/*`、`/login`、`/account`、`/assets/*`、
-#                         `/.well-known/openid-configuration` 等）-> `auth_url`，零前端资源路径破坏。
-#   - "prefix"          ：仅 `auth_prefix`（默认 `/_auth/*`）转发至 `auth_url`，其余全部走 `matrix_url`。
-auth_mode = "root"
-auth_prefix = "/_auth"
-rtc_prefix = "/_rtc"
-proxy_prefix = "/_proxy"
+# Outbound PROXY Protocol framing toward upstream reverse proxies ("off" | "v1" | "v2").
+# MUST be "off" for public third-party HTTPS servers that do not expect PROXY Protocol.
+matrix_proxy_protocol = "off"
+auth_proxy_protocol = "off"
+rtc_proxy_protocol = "off"
 
-# 重写 `auth_metadata` / `openid-configuration` 中的 `issuer` 字段以及 RFC 9207 重定向回调中的 `iss` 参数：
-#   - true（推荐默认）：确保 Element X / Element Web / MAS / Tuwunel OAuth2 全程走代理不绕过
-#   - false           ：保留上游原始 `issuer`，仅重写各 endpoint 地址（适用于强校验 JWT `id_token.iss` 场景）
+# Single-domain routing mode: "root" (recommended for MAS/OIDC) or "prefix" (mounts auth under `/_auth`).
+auth_mode = "root"
+
+# Rewrite OIDC `issuer`, discovery endpoints, redirects, cookies, CSP, and Auth HTML/JSON responses.
 rewrite_issuer = true
-# 是否重写 Auth 登录页面（HTML/JSON/JS/CSS）中硬编码的上游域名
 rewrite_auth_body = true
-# 是否合并上游 `/.well-known/matrix/client` 的其他字段（如 `m.identity_server`、`rtc_foci`）
 merge_upstream_well_known = true
-# 上游发现元数据缓存 TTL（秒）
+
+# Optional timeouts & discovery cache TTL (seconds; `request_timeout_secs = 0` allows long `/sync` & uploads).
+connect_timeout_secs = 15
+request_timeout_secs = 0
 cache_ttl_secs = 60
 
 
 # =============================================================================
-# 示例 2（共享单端口 + 出站 PROXY Protocol v2 直连上游 8443）：极致性能与内核级真 IP 透传
-# 适用场景：上游 HAProxy 在 8443 端口开启 `accept-proxy`（PROXY Protocol v2），
-#          通过二进制 PPv2 头直接将真实客户端 IP 传给上游 HAProxy 与 Tuwunel/Synapse。
+# Example 2 (Shared Port + Outbound PROXY Protocol): Direct Upstream Reverse Proxy
+# Works with Nginx (`listen 8443 ssl proxy_protocol`), HAProxy (`accept-proxy`),
+# Envoy, Traefik, or any reverse proxy accepting standard PROXY Protocol v1/v2.
 # =============================================================================
 [[proxies]]
-name = "matrix-ppv2-direct"
-domains = ["proxy2.example.com"]
-public_url = "https://proxy2.example.com"
+name = "selfhosted-pp"
+domains = ["matrix2.example.com"]
+public_url = "https://matrix2.example.com"
 
-# 直连上游 accept-proxy TLS 端口（自动按客户端 IP 隔离复用 TLS 1.3 + HTTP/2 连接池）
-matrix_url = "https://hs-origin.example.org:8443"
-auth_url = "https://hs-origin.example.org:8443"
-# 可选：自定义发往上游的 Host 请求头（例如上游 ACL 校验 `Host: example.org` 而非带 `:8443`）
-matrix_host_header = "example.org"
-auth_host_header = "example.org"
-server_name = "example.org"
-rtc_url = "https://rtc.example.org"
+# Connect directly to an upstream port that expects PROXY Protocol (e.g. Nginx/HAProxy on 8443).
+matrix_url = "https://origin.example.net:8443"
+auth_url = "https://origin.example.net:8443"
 
-# 细粒度控制各上游是否发送出站 PROXY Protocol v2（也可用 `send_proxy_v2 = true` 统一开启）
-matrix_send_proxy_v2 = true
-auth_send_proxy_v2 = true
-rtc_send_proxy_v2 = false
+# Optional Host header overrides (only needed when upstream URL uses a custom port or internal IP).
+matrix_host_header = "origin.example.net"
+auth_host_header = "origin.example.net"
+server_name = "origin.example.net"
 
-# 额外需要重写为代理域名的上游公网源（当直连内网/8443 端口但上游 auth_metadata 声明了另一公网域名时非常有用）
-rewrite_origins = ["https://public-hs.example.org"]
+# Enable standard PROXY Protocol ("v2" binary recommended; use "v1" if upstream only supports v1).
+# Connections are pooled per `(upstream, protocol, client_ip)` for H2 multiplexing with zero IP leakage.
+matrix_proxy_protocol = "v2"
+auth_proxy_protocol = "v2"
+rtc_proxy_protocol = "off"
+
+# Extra upstream origins to rewrite (useful when upstream advertises another public domain in metadata/HTML).
+rewrite_origins = ["https://public-origin.example.net"]
 
 client_ip_mode = "replace"
 auth_mode = "root"
@@ -182,36 +180,35 @@ merge_upstream_well_known = true
 
 
 # =============================================================================
-# 示例 3（自定义独立监听端口 + 出站 SOCKS5 代理 + prefix 前缀模式）
-# 适用场景：HAProxy 按不同域名分别转发到不同后端端口（如 8080、8081），或需通过中转代理访问上游
+# Example 3 (Optional Dedicated Port + Outbound SOCKS5 Proxy + Prefix Auth Mode)
+# Uncomment below and expose the matching port in compose.yaml if desired.
 # =============================================================================
 # [[proxies]]
-# name = "matrix-dedicated-port"
-# # 自定义独立端口（Docker 部署时需同步映射此端口，例如 `127.0.0.1:8911:8081`）
+# name = "dedicated-socks5"
+#
+# # Bind a dedicated port (expose matching port in compose.yaml if using Docker).
 # listen = "0.0.0.0:8081"
-# public_url = "https://proxy3.example.com"
-# # 可选双域名模式：指定单独的 Auth 代理域名，按 Host 自动分流
-# # public_auth_url = "https://auth-proxy3.example.com"
-# # 独立端口默认放行所有 Host（方便本机/健康检查），如需强制校验 Host 可设为 true
+# domains = ["matrix3.example.com"]
+# public_url = "https://matrix3.example.com"
+#
+# # Reject requests with mismatched Host headers even on a dedicated single-profile port.
 # strict_host_match = false
-# # 共享端口模式下设为 true 可作为未知 Host 的兜底实例（同一端口最多允许 1 个）
-# default = false
 #
-# matrix_url = "https://matrix-c.example.org"
-# auth_url = "https://auth-c.example.org"
-# # 可选：通过出站 HTTP / HTTPS / SOCKS5 / SOCKS5h 代理连接上游
+# matrix_url = "https://homeserver.example.net"
+# auth_url = "https://auth.example.net"
+#
+# # Optional outbound HTTP / HTTPS / SOCKS5 / SOCKS5h proxy (credentials are redacted in logs and `/_proxy/info`).
 # outbound_proxy = "socks5h://127.0.0.1:1080"
-# connect_timeout_secs = 15
-# request_timeout_secs = 0             # 0 表示不设总超时，保证长轮询 /sync 与大文件流式传输不断流
-# danger_accept_invalid_certs = false  # 仅内网自签证书测试时可设为 true
 #
+# # Mount Auth under `/_auth` to avoid any path overlap with custom root routes on the homeserver.
 # auth_mode = "prefix"
 # auth_prefix = "/_auth"
-# # 可选：自定义额外强制走 matrix_url 或强制走 auth_url 的路径前缀
-# matrix_extra_prefixes = []
-# auth_matrix_prefixes = []            # 例如直连无 Nginx 前置的原生 Synapse+MAS 时填 ["/_matrix/client/v3/login", "/_matrix/client/v3/logout", "/_matrix/client/v3/refresh"]
 #
-# # 可选：强制在 `/.well-known/matrix/client` 中写入旧版 MSC2965 认证块
-# force_msc2965_well_known = false
-# # 可选：覆盖 `/.well-known/matrix/client` 中的 `m.identity_server.base_url`
-# identity_server_url = ""
+# # Set true only for self-signed test upstreams (NEVER enable in production).
+# danger_accept_invalid_certs = false
+#
+# proxy_protocol = "off"
+# client_ip_mode = "replace"
+# rewrite_issuer = true
+# rewrite_auth_body = true
+# merge_upstream_well_known = true
