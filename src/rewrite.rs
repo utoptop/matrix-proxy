@@ -43,12 +43,12 @@ impl PublicContext {
         has_rtc: bool,
     ) -> Self {
         let matrix_base = profile
-            .public_url
+            .matrix_proxy_public_url
             .clone()
             .unwrap_or_else(|| infer_public_url(client, headers));
 
         let (auth_base, auth_prefix, dual_domain) =
-            if let Some(explicit_auth) = &profile.public_auth_url {
+            if let Some(explicit_auth) = &profile.matrix_proxy_public_auth_url {
                 (explicit_auth.clone(), None, true)
             } else {
                 match profile.routing.auth_mode {
@@ -475,6 +475,11 @@ impl<'a> RewriteEngine<'a> {
             if is_http && lower == "secure" {
                 continue;
             }
+            if is_http && lower == "samesite=none" {
+                // Browsers drop `SameSite=None` cookies when `Secure` is absent (e.g. `http://ip:port` over Tailscale/LAN).
+                out.push("SameSite=Lax".to_string());
+                continue;
+            }
             if from_auth_upstream
                 && let (Some(prefix), Some(rest)) = (
                     &self.public.auth_prefix,
@@ -510,6 +515,17 @@ impl<'a> RewriteEngine<'a> {
         let matrix_origin = self.upstreams.matrix_origin.as_str();
         if matrix_origin != pub_matrix && result.contains(matrix_origin) {
             result = result.replace(matrix_origin, &pub_matrix);
+        }
+        if !self.public.public_is_https() {
+            // Avoid browsers upgrading `http://ip:port` assets/forms to non-existent HTTPS.
+            result = result
+                .split(';')
+                .map(str::trim)
+                .filter(|dir| {
+                    !dir.is_empty() && !dir.eq_ignore_ascii_case("upgrade-insecure-requests")
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
         }
         result
     }

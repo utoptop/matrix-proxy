@@ -1,7 +1,9 @@
 use crate::client_ip::{encode_proxy_protocol_local, encode_proxy_protocol_proxy};
-use crate::config::{ProxyProtocol, ServerConfig};
+use crate::config::{ProxyProtocol, ServerConfig, should_bypass_outbound_proxy};
 use crate::metrics::ProxyMetrics;
-use crate::ws::{build_client_tls_config, connect_via_proxy};
+use crate::ws::{
+    build_client_tls_config, connect_via_proxy, fallback_dst_addr, trim_ipv6_brackets,
+};
 use anyhow::{Context, Result, anyhow};
 use axum::body::Body;
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
@@ -56,6 +58,7 @@ enum SelectedConn {
 pub struct Ppv2Client {
     tls_config: Arc<rustls::ClientConfig>,
     outbound_proxy: Option<Url>,
+    outbound_no_proxy: Vec<String>,
     connect_timeout: Duration,
     idle_timeout: Duration,
     tcp_keepalive: Duration,
@@ -70,6 +73,7 @@ impl Ppv2Client {
     pub fn new(
         server: &ServerConfig,
         outbound_proxy: Option<&str>,
+        outbound_no_proxy: Vec<String>,
         connect_timeout_secs: u64,
         danger_accept_invalid_certs: bool,
         metrics: Option<Arc<ProxyMetrics>>,
@@ -85,6 +89,7 @@ impl Ppv2Client {
         Ok(Self {
             tls_config,
             outbound_proxy: proxy_url,
+            outbound_no_proxy,
             connect_timeout: Duration::from_secs(connect_timeout_secs.max(1)),
             idle_timeout: Duration::from_secs(server.pool_idle_timeout_secs.max(10)),
             tcp_keepalive: Duration::from_secs(server.tcp_keepalive_secs),
@@ -431,38 +436,52 @@ impl Ppv2Client {
         proto: ProxyProtocol,
         client_addr: Option<SocketAddr>,
     ) -> Result<(BoxedStream, bool)> {
-        let mut tcp = if let Some(proxy_url) = &self.outbound_proxy {
-            connect_via_proxy(proxy_url, host, port).await?
+        let clean_host = trim_ipv6_brackets(host);
+        let (mut stream, peer_addr): (BoxedStream, Option<SocketAddr>) = if let Some(proxy_url) =
+            &self.outbound_proxy
+            && !should_bypass_outbound_proxy(host, &self.outbound_no_proxy)
+        {
+            let proxied = connect_via_proxy(
+                proxy_url,
+                host,
+                port,
+                &self.tls_config,
+                self.tcp_nodelay,
+                self.tcp_keepalive,
+            )
+            .await?;
+            (proxied, None)
         } else {
-            TcpStream::connect((host, port))
+            let tcp = TcpStream::connect((clean_host, port))
                 .await
-                .with_context(|| format!("TCP connect to {host}:{port} failed"))?
+                .with_context(|| format!("TCP connect to {host}:{port} failed"))?;
+            configure_tcp_socket(&tcp, self.tcp_nodelay, self.tcp_keepalive);
+            let peer = tcp.peer_addr().ok();
+            (Box::new(tcp), peer)
         };
 
-        configure_tcp_socket(&tcp, self.tcp_nodelay, self.tcp_keepalive);
-
-        let dst_addr = tcp
-            .peer_addr()
-            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], port)));
-
         let pp_hdr = match client_addr {
-            Some(src) => encode_proxy_protocol_proxy(proto, src, dst_addr),
+            Some(src) => {
+                let dst_addr =
+                    peer_addr.unwrap_or_else(|| fallback_dst_addr(clean_host, port, src));
+                encode_proxy_protocol_proxy(proto, src, dst_addr)
+            }
             None => encode_proxy_protocol_local(proto),
         };
         if !pp_hdr.is_empty() {
-            tcp.write_all(&pp_hdr).await.with_context(|| {
+            stream.write_all(&pp_hdr).await.with_context(|| {
                 format!("failed to write PROXY Protocol {proto} header to upstream")
             })?;
         }
 
         if !use_tls {
-            return Ok((Box::new(tcp), false));
+            return Ok((stream, false));
         }
 
         let connector = TlsConnector::from(Arc::clone(&self.tls_config));
-        let sni = ServerName::try_from(host.to_string())
+        let sni = ServerName::try_from(clean_host.to_string())
             .map_err(|_| anyhow!("invalid TLS SNI host '{host}'"))?;
-        let tls_stream = connector.connect(sni, tcp).await.with_context(|| {
+        let tls_stream = connector.connect(sni, stream).await.with_context(|| {
             format!("TLS handshake to {host}:{port} failed after PROXY Protocol {proto} header")
         })?;
 

@@ -1,5 +1,5 @@
 use crate::client_ip::{ClientInfo, apply_upstream_client_ip_headers, encode_proxy_protocol_proxy};
-use crate::config::{ProxyProfile, ProxyProtocol, ServerConfig};
+use crate::config::{ProxyProfile, ProxyProtocol, ServerConfig, should_bypass_outbound_proxy};
 use crate::ppv2_client::{BoxedStream, configure_tcp_socket};
 use crate::rewrite::RewriteEngine;
 use anyhow::{Context, Result, anyhow, bail};
@@ -8,7 +8,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCo
 use http_body_util::Empty;
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -61,6 +61,7 @@ pub async fn proxy_websocket(
         connect_upstream_ws_stream(
             server_cfg,
             profile.upstream.outbound_proxy.as_deref(),
+            &profile.upstream.outbound_no_proxy,
             tls_config,
             &host,
             port,
@@ -202,6 +203,7 @@ fn is_dropped_upgrade_resp_header(name: &HeaderName) -> bool {
 async fn connect_upstream_ws_stream(
     server_cfg: &ServerConfig,
     outbound_proxy: Option<&str>,
+    outbound_no_proxy: &[String],
     tls_config: &Arc<rustls::ClientConfig>,
     target_host: &str,
     target_port: u16,
@@ -209,73 +211,127 @@ async fn connect_upstream_ws_stream(
     proxy_protocol: ProxyProtocol,
     pp_client_addr: Option<SocketAddr>,
 ) -> Result<BoxedStream> {
-    let mut tcp = if let Some(proxy_raw) = outbound_proxy {
-        let proxy_url = Url::parse(proxy_raw).context("invalid outbound_proxy URL")?;
-        connect_via_proxy(&proxy_url, target_host, target_port).await?
-    } else {
-        TcpStream::connect((target_host, target_port))
-            .await
-            .with_context(|| format!("TCP connect to {target_host}:{target_port} failed"))?
-    };
+    let keepalive = Duration::from_secs(server_cfg.tcp_keepalive_secs);
+    let clean_target = trim_ipv6_brackets(target_host);
 
-    configure_tcp_socket(
-        &tcp,
-        server_cfg.tcp_nodelay,
-        Duration::from_secs(server_cfg.tcp_keepalive_secs),
-    );
+    let (mut stream, peer_addr): (BoxedStream, Option<SocketAddr>) = if let Some(proxy_raw) =
+        outbound_proxy
+        && !should_bypass_outbound_proxy(target_host, outbound_no_proxy)
+    {
+        let proxy_url = Url::parse(proxy_raw).context("invalid outbound_proxy URL")?;
+        let proxied = connect_via_proxy(
+            &proxy_url,
+            target_host,
+            target_port,
+            tls_config,
+            server_cfg.tcp_nodelay,
+            keepalive,
+        )
+        .await?;
+        (proxied, None)
+    } else {
+        let tcp = TcpStream::connect((clean_target, target_port))
+            .await
+            .with_context(|| format!("TCP connect to {target_host}:{target_port} failed"))?;
+        configure_tcp_socket(&tcp, server_cfg.tcp_nodelay, keepalive);
+        let peer = tcp.peer_addr().ok();
+        (Box::new(tcp), peer)
+    };
 
     if proxy_protocol.is_enabled()
         && let Some(src_addr) = pp_client_addr
     {
-        let dst_addr = tcp
-            .peer_addr()
-            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], target_port)));
+        let dst_addr =
+            peer_addr.unwrap_or_else(|| fallback_dst_addr(clean_target, target_port, src_addr));
         let pp_hdr = encode_proxy_protocol_proxy(proxy_protocol, src_addr, dst_addr);
-        tcp.write_all(&pp_hdr).await.with_context(|| {
+        stream.write_all(&pp_hdr).await.with_context(|| {
             format!("failed to write PROXY Protocol {proxy_protocol} header for websocket")
         })?;
     }
 
     if !use_tls {
-        return Ok(Box::new(tcp));
+        return Ok(stream);
     }
 
     let connector = TlsConnector::from(Arc::clone(tls_config));
-    let server_name = ServerName::try_from(target_host.to_string())
+    let server_name = ServerName::try_from(clean_target.to_string())
         .map_err(|_| anyhow!("invalid TLS SNI server name '{target_host}'"))?;
     let tls_stream = connector
-        .connect(server_name, tcp)
+        .connect(server_name, stream)
         .await
         .with_context(|| format!("TLS handshake to {target_host}:{target_port} failed"))?;
     Ok(Box::new(tls_stream))
+}
+
+pub fn fallback_dst_addr(host: &str, port: u16, src_hint: SocketAddr) -> SocketAddr {
+    if let Ok(ip) = trim_ipv6_brackets(host).parse::<IpAddr>() {
+        return SocketAddr::new(ip, port);
+    }
+    match src_hint {
+        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port),
+    }
+}
+
+pub fn trim_ipv6_brackets(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host)
 }
 
 pub async fn connect_via_proxy(
     proxy_url: &Url,
     target_host: &str,
     target_port: u16,
-) -> Result<TcpStream> {
-    let proxy_host = proxy_url
+    tls_config: &Arc<rustls::ClientConfig>,
+    tcp_nodelay: bool,
+    tcp_keepalive: Duration,
+) -> Result<BoxedStream> {
+    let proxy_host_raw = proxy_url
         .host_str()
         .ok_or_else(|| anyhow!("outbound proxy missing host"))?;
+    let proxy_host = trim_ipv6_brackets(proxy_host_raw);
     let proxy_port = proxy_url.port_or_known_default().unwrap_or(1080);
 
-    let mut stream = TcpStream::connect((proxy_host, proxy_port))
+    let tcp = TcpStream::connect((proxy_host, proxy_port))
         .await
         .with_context(|| {
-            format!("failed to connect to outbound proxy {proxy_host}:{proxy_port}")
+            format!("failed to connect to outbound proxy {proxy_host_raw}:{proxy_port}")
         })?;
+    configure_tcp_socket(&tcp, tcp_nodelay, tcp_keepalive);
+
+    let mut stream: BoxedStream = if proxy_url.scheme().eq_ignore_ascii_case("https") {
+        let proxy_tls_cfg = build_client_tls_config(false, &[b"http/1.1".as_slice()])
+            .unwrap_or_else(|_| Arc::clone(tls_config));
+        let connector = TlsConnector::from(proxy_tls_cfg);
+        let sni = ServerName::try_from(proxy_host.to_string())
+            .map_err(|_| anyhow!("invalid HTTPS proxy SNI host '{proxy_host_raw}'"))?;
+        let tls = connector.connect(sni, tcp).await.with_context(|| {
+            format!("TLS handshake to HTTPS proxy {proxy_host_raw}:{proxy_port} failed")
+        })?;
+        Box::new(tls)
+    } else {
+        Box::new(tcp)
+    };
+
+    let decoded_user = percent_decode(proxy_url.username());
+    let decoded_pass = proxy_url.password().map(percent_decode);
+    let has_auth = !decoded_user.is_empty() || decoded_pass.is_some();
 
     match proxy_url.scheme() {
         "http" | "https" => {
-            let mut req = format!(
-                "CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n"
-            );
-            if !proxy_url.username().is_empty() || proxy_url.password().is_some() {
+            let connect_authority = if target_host.contains(':') && !target_host.starts_with('[') {
+                format!("[{target_host}]:{target_port}")
+            } else {
+                format!("{target_host}:{target_port}")
+            };
+            let mut req =
+                format!("CONNECT {connect_authority} HTTP/1.1\r\nHost: {connect_authority}\r\n");
+            if has_auth {
                 let creds = format!(
                     "{}:{}",
-                    proxy_url.username(),
-                    proxy_url.password().unwrap_or_default()
+                    decoded_user,
+                    decoded_pass.as_deref().unwrap_or_default()
                 );
                 let encoded = base64_encode(creds.as_bytes());
                 req.push_str(&format!("Proxy-Authorization: Basic {encoded}\r\n"));
@@ -293,13 +349,12 @@ pub async fn connect_via_proxy(
             }
             let header_str = String::from_utf8_lossy(&buf);
             let status_line = header_str.lines().next().unwrap_or_default();
-            if !status_line.contains(" 200 ") {
+            if status_line.split_whitespace().nth(1) != Some("200") {
                 bail!("outbound HTTP proxy rejected CONNECT: {status_line}");
             }
             Ok(stream)
         }
         "socks5" | "socks5h" => {
-            let has_auth = !proxy_url.username().is_empty() || proxy_url.password().is_some();
             if has_auth {
                 stream.write_all(&[0x05, 0x02, 0x00, 0x02]).await?;
             } else {
@@ -311,8 +366,8 @@ pub async fn connect_via_proxy(
                 bail!("invalid SOCKS5 greeting version");
             }
             if method_resp[1] == 0x02 {
-                let user = proxy_url.username().as_bytes();
-                let pass = proxy_url.password().unwrap_or_default().as_bytes();
+                let user = decoded_user.as_bytes();
+                let pass = decoded_pass.as_deref().unwrap_or_default().as_bytes();
                 if user.len() > 255 || pass.len() > 255 {
                     bail!("SOCKS5 credentials exceed 255 bytes");
                 }
@@ -335,13 +390,29 @@ pub async fn connect_via_proxy(
                 );
             }
 
-            let host_bytes = target_host.as_bytes();
-            if host_bytes.len() > 255 {
-                bail!("target host exceeds SOCKS5 domain limit");
+            let clean_host = trim_ipv6_brackets(target_host);
+            let mut connect_req = Vec::with_capacity(32);
+            connect_req.extend_from_slice(&[0x05, 0x01, 0x00]);
+            if let Ok(ip) = clean_host.parse::<IpAddr>() {
+                match ip {
+                    IpAddr::V4(v4) => {
+                        connect_req.push(0x01);
+                        connect_req.extend_from_slice(&v4.octets());
+                    }
+                    IpAddr::V6(v6) => {
+                        connect_req.push(0x04);
+                        connect_req.extend_from_slice(&v6.octets());
+                    }
+                }
+            } else {
+                let host_bytes = clean_host.as_bytes();
+                if host_bytes.len() > 255 {
+                    bail!("target host exceeds SOCKS5 domain limit");
+                }
+                connect_req.push(0x03);
+                connect_req.push(host_bytes.len() as u8);
+                connect_req.extend_from_slice(host_bytes);
             }
-            let mut connect_req = Vec::with_capacity(7 + host_bytes.len());
-            connect_req.extend_from_slice(&[0x05, 0x01, 0x00, 0x03, host_bytes.len() as u8]);
-            connect_req.extend_from_slice(host_bytes);
             connect_req.extend_from_slice(&target_port.to_be_bytes());
             stream.write_all(&connect_req).await?;
 
@@ -370,6 +441,34 @@ pub async fn connect_via_proxy(
             Ok(stream)
         }
         other => bail!("unsupported outbound proxy scheme '{other}'"),
+    }
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 

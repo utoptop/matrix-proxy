@@ -298,11 +298,11 @@ async fn single_domain_root_mode_full_matrix_and_auth_flow() {
     let cluster = spawn_mock_cluster("a").await;
 
     let mut cfg = Config::default();
-    cfg.server.public_url = Some("https://proxy.example.com".to_string());
+    cfg.server.matrix_proxy_public_url = Some("https://proxy.example.com".to_string());
     cfg.server.expose_info = ExposeInfoMode::Always;
-    cfg.upstream.matrix_url = Some(cluster.matrix_url.clone());
-    cfg.upstream.auth_url = Some(cluster.auth_url.clone());
-    cfg.upstream.rtc_url = Some(cluster.rtc_url.clone());
+    cfg.upstream.upstream_matrix_server_url = Some(cluster.matrix_url.clone());
+    cfg.upstream.upstream_matrix_auth_url = Some(cluster.auth_url.clone());
+    cfg.upstream.upstream_matrix_rtc_url = Some(cluster.rtc_url.clone());
 
     let app = build_single_listener_app(cfg).await;
 
@@ -538,9 +538,9 @@ async fn single_domain_prefix_mode_and_rfc8414_discovery() {
     let cluster = spawn_mock_cluster("pref").await;
 
     let mut cfg = Config::default();
-    cfg.server.public_url = Some("https://proxy.example.com".to_string());
-    cfg.upstream.matrix_url = Some(cluster.matrix_url.clone());
-    cfg.upstream.auth_url = Some(cluster.auth_url.clone());
+    cfg.server.matrix_proxy_public_url = Some("https://proxy.example.com".to_string());
+    cfg.upstream.upstream_matrix_server_url = Some(cluster.matrix_url.clone());
+    cfg.upstream.upstream_matrix_auth_url = Some(cluster.auth_url.clone());
     cfg.routing.auth_mode = AuthRouteMode::Prefix;
     cfg.routing.auth_prefix = "/_auth".to_string();
 
@@ -607,7 +607,7 @@ async fn auto_discovers_separate_auth_upstream_without_explicit_auth_url() {
     let cluster = spawn_mock_cluster("auto").await;
 
     let mut cfg = Config::default();
-    cfg.upstream.matrix_url = Some(cluster.matrix_url.clone());
+    cfg.upstream.upstream_matrix_server_url = Some(cluster.matrix_url.clone());
 
     let app = build_single_listener_app(cfg).await;
 
@@ -651,9 +651,9 @@ async fn preserve_issuer_mode_rewrites_endpoints_only() {
     let cluster = spawn_mock_cluster("pres").await;
 
     let mut cfg = Config::default();
-    cfg.server.public_url = Some("https://proxy.example.com".to_string());
-    cfg.upstream.matrix_url = Some(cluster.matrix_url.clone());
-    cfg.upstream.auth_url = Some(cluster.auth_url.clone());
+    cfg.server.matrix_proxy_public_url = Some("https://proxy.example.com".to_string());
+    cfg.upstream.upstream_matrix_server_url = Some(cluster.matrix_url.clone());
+    cfg.upstream.upstream_matrix_auth_url = Some(cluster.auth_url.clone());
     cfg.discovery.rewrite_issuer = false;
 
     let app = build_single_listener_app(cfg).await;
@@ -681,10 +681,10 @@ async fn dual_domain_host_routing_mode() {
     let cluster = spawn_mock_cluster("dual").await;
 
     let mut cfg = Config::default();
-    cfg.server.public_url = Some("https://matrix-proxy.example.com".to_string());
-    cfg.server.public_auth_url = Some("https://auth-proxy.example.com".to_string());
-    cfg.upstream.matrix_url = Some(cluster.matrix_url.clone());
-    cfg.upstream.auth_url = Some(cluster.auth_url.clone());
+    cfg.server.matrix_proxy_public_url = Some("https://matrix-proxy.example.com".to_string());
+    cfg.server.matrix_proxy_public_auth_url = Some("https://auth-proxy.example.com".to_string());
+    cfg.upstream.upstream_matrix_server_url = Some(cluster.matrix_url.clone());
+    cfg.upstream.upstream_matrix_auth_url = Some(cluster.auth_url.clone());
 
     let app = build_single_listener_app(cfg).await;
 
@@ -734,17 +734,15 @@ async fn shared_port_vhost_routes_multiple_upstreams_by_domain() {
 
         [[proxies]]
         name = "alpha"
-        domains = ["a.proxy.test"]
-        public_url = "https://a.proxy.test"
-        matrix_url = "{}"
-        auth_url = "{}"
+        matrix_proxy_public_url = "https://a.proxy.test"
+        upstream_matrix_server_url = "{}"
+        upstream_matrix_auth_url = "{}"
 
         [[proxies]]
         name = "beta"
-        domains = ["b.proxy.test", "*.b.proxy.test"]
-        public_url = "https://b.proxy.test"
-        matrix_url = "{}"
-        auth_url = "{}"
+        matrix_proxy_public_url = "https://b.proxy.test"
+        upstream_matrix_server_url = "{}"
+        upstream_matrix_auth_url = "{}"
         "#,
         cluster_a.matrix_url, cluster_a.auth_url, cluster_b.matrix_url, cluster_b.auth_url
     );
@@ -767,13 +765,13 @@ async fn shared_port_vhost_routes_multiple_upstreams_by_domain() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_json(resp).await["cluster"], "alpha");
 
-    // 2. Domain B (and wildcard subdomain) -> Cluster B
+    // 2. Domain B -> Cluster B (routed automatically from matrix_proxy_public_url without a `domains` field)
     let resp = app
         .clone()
         .oneshot(
             Request::builder()
                 .uri("/_matrix/client/versions")
-                .header(header::HOST, "edge.b.proxy.test")
+                .header(header::HOST, "b.proxy.test:443")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -832,9 +830,9 @@ async fn client_ip_forwarding_anti_spoofing_and_expose_info_acl() {
     let cluster = spawn_mock_cluster("ip").await;
 
     let mut cfg = Config::default();
-    cfg.server.public_url = Some("https://proxy.example.com".to_string());
+    cfg.server.matrix_proxy_public_url = Some("https://proxy.example.com".to_string());
     cfg.server.expose_info = ExposeInfoMode::Trusted;
-    cfg.upstream.matrix_url = Some(cluster.matrix_url.clone());
+    cfg.upstream.upstream_matrix_server_url = Some(cluster.matrix_url.clone());
 
     let app = build_single_listener_app(cfg).await;
 
@@ -952,13 +950,13 @@ async fn outbound_proxy_protocol_v2_passes_real_client_ip_and_isolates_clients()
 
         [[proxies]]
         name = "ppv2-matrix"
-        public_url = "https://proxy.example.com"
-        matrix_url = "http://{ppv2_addr}"
-        auth_url = "http://{ppv2_addr}"
-        matrix_host_header = "matrix.example.org"
-        auth_host_header = "matrix.example.org"
-        proxy_protocol = "v2"
-        rewrite_origins = ["https://auth.example.org"]
+        matrix_proxy_public_url = "https://proxy.example.com"
+        upstream_matrix_server_url = "http://{ppv2_addr}"
+        upstream_matrix_auth_url = "http://{ppv2_addr}"
+        upstream_matrix_host_header = "matrix.example.org"
+        upstream_auth_host_header = "matrix.example.org"
+        upstream_proxy_protocol = "v2"
+        upstream_rewrite_origins = ["https://auth.example.org"]
         "#
     );
 
@@ -1020,10 +1018,10 @@ async fn rate_limit_enforced_per_client_ip() {
     let cluster = spawn_mock_cluster("rl").await;
 
     let mut cfg = Config::default();
-    cfg.server.public_url = Some("https://proxy.example.com".to_string());
+    cfg.server.matrix_proxy_public_url = Some("https://proxy.example.com".to_string());
     cfg.server.rate_limit_rps = 1;
     cfg.server.rate_limit_burst = 2;
-    cfg.upstream.matrix_url = Some(cluster.matrix_url.clone());
+    cfg.upstream.upstream_matrix_server_url = Some(cluster.matrix_url.clone());
 
     let app = build_single_listener_app(cfg).await;
 
@@ -1109,9 +1107,9 @@ async fn well_known_discovery_follows_301_redirect() {
     });
 
     let mut cfg = Config::default();
-    cfg.server.public_url = Some("https://proxy.example.com".to_string());
-    cfg.upstream.server_name = Some(format!("http://{redir_addr}"));
-    cfg.upstream.rtc_url = Some("https://rtc.example.org".to_string());
+    cfg.server.matrix_proxy_public_url = Some("https://proxy.example.com".to_string());
+    cfg.upstream.upstream_matrix_server_name = Some(format!("http://{redir_addr}"));
+    cfg.upstream.upstream_matrix_rtc_url = Some("https://rtc.example.org".to_string());
 
     let app = build_single_listener_app(cfg).await;
 
@@ -1136,4 +1134,430 @@ async fn well_known_discovery_follows_301_redirect() {
         wk["org.matrix.msc4143.rtc_foci"][0]["livekit_service_url"],
         "https://proxy.example.com/_rtc"
     );
+}
+
+#[tokio::test]
+async fn http_ip_port_tailscale_mode_without_domain_rewrites_cookies_csp_and_urls() {
+    // Mock auth server returning Secure + SameSite=None cookie, upgrade-insecure-requests CSP, and HSTS
+    let auth_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let auth_addr = auth_listener.local_addr().unwrap();
+    let auth_url = format!("http://{auth_addr}");
+    let auth_base_arc = Arc::new(auth_url.clone());
+
+    let auth_app = Router::new()
+        .route(
+            "/authorize",
+            get(|State(_b): State<Arc<String>>| async move {
+                Response::builder()
+                    .status(StatusCode::FOUND)
+                    .header(header::LOCATION, "/login")
+                    .header(
+                        header::SET_COOKIE,
+                        "oidc_sess=abc; Domain=auth.internal; Path=/; Secure; SameSite=None; HttpOnly",
+                    )
+                    .header("strict-transport-security", "max-age=31536000")
+                    .body(Body::empty())
+                    .unwrap()
+            }),
+        )
+        .route(
+            "/login",
+            get(|State(b): State<Arc<String>>| async move {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/html")
+                    .header(
+                        "content-security-policy",
+                        format!("default-src 'self'; form-action {b}; upgrade-insecure-requests"),
+                    )
+                    .body(Body::from(format!(r#"<form action="{b}/login"></form>"#)))
+                    .unwrap()
+            }),
+        )
+        .with_state(auth_base_arc);
+    tokio::spawn(async move {
+        let _ = axum::serve(auth_listener, auth_app).await;
+    });
+
+    // Mock Matrix homeserver whose auth_metadata advertises the separate auth server
+    let hs_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hs_addr = hs_listener.local_addr().unwrap();
+    let hs_url = format!("http://{hs_addr}");
+    let auth_for_hs = auth_url.clone();
+    let hs_app = Router::new()
+        .route(
+            "/_matrix/client/v1/auth_metadata",
+            get(move || {
+                let a = auth_for_hs.clone();
+                async move {
+                    let doc = json!({
+                        "issuer": format!("{a}/"),
+                        "authorization_endpoint": format!("{a}/authorize"),
+                        "token_endpoint": format!("{a}/oauth2/token"),
+                    });
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(doc.to_string()))
+                        .unwrap()
+                }
+            }),
+        )
+        .route(
+            "/_matrix/client/versions",
+            get(|| async { r#"{"versions":["v1.15"]}"# }),
+        );
+    tokio::spawn(async move {
+        let _ = axum::serve(hs_listener, hs_app).await;
+    });
+
+    let toml_cfg = format!(
+        r#"
+        [[proxies]]
+        name = "tailscale-node"
+        listen = "0.0.0.0:8081"
+        matrix_proxy_public_url = "http://100.64.0.10:8081"
+        upstream_matrix_server_url = "{hs_url}"
+        upstream_matrix_auth_url = "{auth_url}"
+        upstream_matrix_rtc_url = "https://rtc.example.org"
+        "#
+    );
+
+    let cfg = Config::from_toml_str(&toml_cfg).unwrap();
+    let app = build_single_listener_app(cfg).await;
+
+    // 1. /.well-known/matrix/client exposes http://100.64.0.10:8081
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/matrix/client")
+                .header(header::HOST, "100.64.0.10:8081")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let wk = body_json(resp).await;
+    assert_eq!(wk["m.homeserver"]["base_url"], "http://100.64.0.10:8081");
+    assert_eq!(
+        wk["org.matrix.msc4143.rtc_foci"][0]["livekit_service_url"],
+        "http://100.64.0.10:8081/_rtc"
+    );
+
+    // 2. auth_metadata rewrites issuer & endpoints to http://100.64.0.10:8081
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_matrix/client/v1/auth_metadata")
+                .header(header::HOST, "100.64.0.10:8081")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let meta = body_json(resp).await;
+    assert_eq!(meta["issuer"], "http://100.64.0.10:8081/");
+    assert_eq!(
+        meta["authorization_endpoint"],
+        "http://100.64.0.10:8081/authorize"
+    );
+
+    // 3. Plain HTTP cookie strips Secure & Domain, downgrades SameSite=None -> SameSite=Lax, strips HSTS
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/authorize")
+                .header(header::HOST, "100.64.0.10:8081")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    assert!(resp.headers().get("strict-transport-security").is_none());
+    let cookie = resp
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(!cookie.to_ascii_lowercase().contains("secure"));
+    assert!(!cookie.to_ascii_lowercase().contains("domain="));
+    assert!(cookie.contains("SameSite=Lax"));
+
+    // 4. Plain HTTP CSP removes upgrade-insecure-requests and rewrites form-action to http://100.64.0.10:8081
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/login")
+                .header(header::HOST, "100.64.0.10:8081")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let csp = resp
+        .headers()
+        .get("content-security-policy")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        !csp.to_ascii_lowercase()
+            .contains("upgrade-insecure-requests")
+    );
+    assert!(csp.contains("form-action http://100.64.0.10:8081"));
+    let html = body_text(resp).await;
+    assert!(html.contains(r#"action="http://100.64.0.10:8081/login""#));
+}
+
+#[tokio::test]
+async fn global_http_and_socks5_outbound_proxies_with_direct_override() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    // Target mock Matrix homeserver
+    let hs_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hs_addr = hs_listener.local_addr().unwrap();
+    let hs_app = Router::new().route(
+        "/_matrix/client/versions",
+        get(|| async {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"versions":["v1.15"],"via":"ok"}"#))
+                .unwrap()
+        }),
+    );
+    tokio::spawn(async move {
+        let _ = axum::serve(hs_listener, hs_app).await;
+    });
+
+    // 1. Minimal mock HTTP forward proxy (handles absolute-URI HTTP proxy requests)
+    let http_proxy_hits = Arc::new(AtomicUsize::new(0));
+    let http_proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_proxy_addr = http_proxy_listener.local_addr().unwrap();
+    let hits_clone = Arc::clone(&http_proxy_hits);
+    tokio::spawn(async move {
+        while let Ok((mut client, _)) = http_proxy_listener.accept().await {
+            let hits = Arc::clone(&hits_clone);
+            tokio::spawn(async move {
+                let mut req_buf = Vec::new();
+                let mut byte = [0u8; 1];
+                while !req_buf.ends_with(b"\r\n\r\n") && req_buf.len() < 8192 {
+                    if client.read_exact(&mut byte).await.is_err() {
+                        return;
+                    }
+                    req_buf.push(byte[0]);
+                }
+                let head = String::from_utf8_lossy(&req_buf);
+                let first_line = head.lines().next().unwrap_or_default();
+                let mut parts = first_line.split_whitespace();
+                let method = parts.next().unwrap_or_default();
+                let target = parts.next().unwrap_or_default();
+                hits.fetch_add(1, Ordering::SeqCst);
+
+                if method == "CONNECT" {
+                    if let Ok(mut upstream) = TcpStream::connect(target).await {
+                        let _ = client
+                            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                            .await;
+                        let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                    }
+                } else if let Ok(url) = url::Url::parse(target)
+                    && let (Some(h), Some(p)) = (url.host_str(), url.port_or_known_default())
+                    && let Ok(mut upstream) = TcpStream::connect((h, p)).await
+                {
+                    let pq = match url.query() {
+                        Some(q) => format!("{}?{q}", url.path()),
+                        None => url.path().to_string(),
+                    };
+                    let forwarded = format!(
+                        "{method} {pq} HTTP/1.1\r\nHost: {h}:{p}\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = upstream.write_all(forwarded.as_bytes()).await;
+                    let _ = tokio::io::copy(&mut upstream, &mut client).await;
+                }
+            });
+        }
+    });
+
+    // 2. Minimal mock SOCKS5 proxy with RFC 1929 username/password auth (alice:s3cr3t)
+    let socks_hits = Arc::new(AtomicUsize::new(0));
+    let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_addr = socks_listener.local_addr().unwrap();
+    let socks_hits_clone = Arc::clone(&socks_hits);
+    tokio::spawn(async move {
+        while let Ok((mut client, _)) = socks_listener.accept().await {
+            let hits = Arc::clone(&socks_hits_clone);
+            tokio::spawn(async move {
+                let mut hdr = [0u8; 2];
+                if client.read_exact(&mut hdr).await.is_err() || hdr[0] != 0x05 {
+                    return;
+                }
+                let mut methods = vec![0u8; hdr[1] as usize];
+                if client.read_exact(&mut methods).await.is_err() {
+                    return;
+                }
+                // Select username/password auth (0x02)
+                if !methods.contains(&0x02) {
+                    let _ = client.write_all(&[0x05, 0xFF]).await;
+                    return;
+                }
+                let _ = client.write_all(&[0x05, 0x02]).await;
+
+                // Read RFC 1929 auth
+                let mut ver_ulen = [0u8; 2];
+                if client.read_exact(&mut ver_ulen).await.is_err() {
+                    return;
+                }
+                let mut user = vec![0u8; ver_ulen[1] as usize];
+                if client.read_exact(&mut user).await.is_err() {
+                    return;
+                }
+                let mut plen = [0u8; 1];
+                if client.read_exact(&mut plen).await.is_err() {
+                    return;
+                }
+                let mut pass = vec![0u8; plen[0] as usize];
+                if client.read_exact(&mut pass).await.is_err() {
+                    return;
+                }
+                if user != b"alice" || pass != b"s3cr3t" {
+                    let _ = client.write_all(&[0x01, 0x01]).await;
+                    return;
+                }
+                let _ = client.write_all(&[0x01, 0x00]).await;
+
+                // Read CONNECT request
+                let mut req = [0u8; 4];
+                if client.read_exact(&mut req).await.is_err() || req[1] != 0x01 {
+                    return;
+                }
+                let target_host = match req[3] {
+                    0x01 => {
+                        let mut ip = [0u8; 4];
+                        if client.read_exact(&mut ip).await.is_err() {
+                            return;
+                        }
+                        std::net::Ipv4Addr::from(ip).to_string()
+                    }
+                    0x03 => {
+                        let mut len = [0u8; 1];
+                        if client.read_exact(&mut len).await.is_err() {
+                            return;
+                        }
+                        let mut dom = vec![0u8; len[0] as usize];
+                        if client.read_exact(&mut dom).await.is_err() {
+                            return;
+                        }
+                        String::from_utf8_lossy(&dom).into_owned()
+                    }
+                    _ => return,
+                };
+                let mut port_b = [0u8; 2];
+                if client.read_exact(&mut port_b).await.is_err() {
+                    return;
+                }
+                let port = u16::from_be_bytes(port_b);
+                hits.fetch_add(1, Ordering::SeqCst);
+
+                if let Ok(mut upstream) = TcpStream::connect((target_host.as_str(), port)).await {
+                    let _ = client
+                        .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+                        .await;
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                }
+            });
+        }
+    });
+
+    // Global HTTP outbound proxy + per-profile SOCKS5 override + per-profile direct bypass
+    let toml_cfg = format!(
+        r#"
+        [server]
+        listen = "0.0.0.0:8080"
+        outbound_proxy = "http://{http_proxy_addr}"
+
+        [[proxies]]
+        name = "via-global-http"
+        matrix_proxy_public_url = "https://http-proxy.test"
+        upstream_matrix_server_url = "http://{hs_addr}"
+        merge_upstream_well_known = false
+
+        [[proxies]]
+        name = "via-socks5"
+        matrix_proxy_public_url = "https://socks5.test"
+        upstream_matrix_server_url = "http://{hs_addr}"
+        outbound_proxy = "socks5h://alice:s3cr3t@{socks_addr}"
+        merge_upstream_well_known = false
+
+        [[proxies]]
+        name = "direct-bypass"
+        matrix_proxy_public_url = "https://direct.test"
+        upstream_matrix_server_url = "http://{hs_addr}"
+        outbound_proxy = "direct"
+        merge_upstream_well_known = false
+        "#
+    );
+
+    let cfg = Config::from_toml_str(&toml_cfg).unwrap();
+    let app = build_single_listener_app(cfg).await;
+
+    let http_before = http_proxy_hits.load(Ordering::SeqCst);
+    let resp_http = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_matrix/client/versions")
+                .header(header::HOST, "http-proxy.test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp_http.status(), StatusCode::OK);
+    assert_eq!(body_json(resp_http).await["via"], "ok");
+    assert!(http_proxy_hits.load(Ordering::SeqCst) > http_before);
+
+    let socks_before = socks_hits.load(Ordering::SeqCst);
+    let resp_socks = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_matrix/client/versions")
+                .header(header::HOST, "socks5.test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp_socks.status(), StatusCode::OK);
+    assert_eq!(body_json(resp_socks).await["via"], "ok");
+    assert!(socks_hits.load(Ordering::SeqCst) > socks_before);
+
+    let http_before_direct = http_proxy_hits.load(Ordering::SeqCst);
+    let socks_before_direct = socks_hits.load(Ordering::SeqCst);
+    let resp_direct = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_matrix/client/versions")
+                .header(header::HOST, "direct.test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp_direct.status(), StatusCode::OK);
+    assert_eq!(body_json(resp_direct).await["via"], "ok");
+    assert_eq!(http_proxy_hits.load(Ordering::SeqCst), http_before_direct);
+    assert_eq!(socks_hits.load(Ordering::SeqCst), socks_before_direct);
 }

@@ -1,13 +1,18 @@
 # =============================================================================
-# matrix-proxy v1.2 — Full Configuration Reference
+# matrix-proxy v1.3 — Full Configuration Reference
 # =============================================================================
-# Deployment modes (both can be combined in a single process):
-#   1. Shared single port + host-based routing (Virtual Host):
+# Deployment architectures (all can be combined freely in a single process):
+#   1. Shared single port + host-based routing:
 #      Multiple `[[proxies]]` blocks omit `listen` and share `[server].listen`.
-#      Your edge proxy (Nginx / HAProxy / Caddy / Envoy) forwards multiple proxy
-#      domains to one port and matrix-proxy routes by `X-Forwarded-Host` / `Host`.
-#   2. Dedicated port per upstream:
-#      Each `[[proxies]]` block specifies its own `listen = "0.0.0.0:8081"`, etc.
+#      Routing hosts are automatically derived from `matrix_proxy_public_url`
+#      (no separate `domains` list needed).
+#   2. Domainless `http://ip:port` mode (Tailscale / WireGuard / Private LAN):
+#      Set `matrix_proxy_public_url = "http://<tailscale-ip>:<port>"` with a
+#      dedicated `listen` port per upstream — zero domain or TLS cert required.
+#   3. Global HTTP / HTTPS / SOCKS5 outbound proxy:
+#      Set `[server].outbound_proxy` to route all upstream Matrix/Auth/RTC/WS
+#      connections through an outbound proxy, with optional `outbound_no_proxy`
+#      bypass rules or per-profile `outbound_proxy = "direct"` overrides.
 #
 # Quick start:
 #   cp config.example.toml config.toml
@@ -18,17 +23,34 @@
 # Default listen address shared by all `[[proxies]]` blocks that omit `listen`.
 listen = "0.0.0.0:8080"
 
-# Optional native TLS termination (leave empty when terminating TLS at Nginx / HAProxy / Caddy).
+# Optional native TLS termination (leave empty when terminating TLS at Nginx / HAProxy / Caddy,
+# or when exposing plain `http://ip:port` directly inside Tailscale / WireGuard).
 tls_cert_path = ""
 tls_key_path = ""
 
 # Inbound PROXY Protocol framing on accepted TCP connections:
-#   - "off" (default, recommended behind local L7 HTTP proxies such as Nginx / HAProxy HTTP mode)
+#   - "off" (default, recommended behind local L7 HTTP proxies or direct Tailscale access)
 #   - "v1"  (standard ASCII PROXY Protocol v1 header)
 #   - "v2"  (standard binary PROXY Protocol v2 header, e.g. L4 TCP passthrough / AWS NLB)
 # Note: Only physical peers matching `trusted_proxies` are allowed to send PROXY Protocol frames.
 #       Built-in `--health-check` automatically speaks v1/v2 when enabled.
 inbound_proxy_protocol = "off"
+
+# ---------------------- Global Outbound Proxy (HTTP / SOCKS5) ----------------------
+# Optional global outbound proxy for ALL upstream Matrix, Auth, RTC, Discovery, and WebSocket traffic.
+# Useful when the proxy host itself has restricted network access to upstream Matrix servers.
+# Supported schemes:
+#   - "http://[user:pass@]host:port"
+#   - "https://[user:pass@]host:port"
+#   - "socks5://[user:pass@]host:port"
+#   - "socks5h://[user:pass@]host:port"  (recommended: resolves DNS remotely via the proxy)
+#   - "direct"                          (force direct connections, ignoring OS HTTP_PROXY/ALL_PROXY env vars)
+# Leave empty to connect directly by default. Individual `[[proxies]]` can override or set `"direct"`.
+outbound_proxy = ""
+
+# Optional host / domain suffix / IP / CIDR bypass rules when `outbound_proxy` is enabled.
+# Examples: ["127.0.0.1", "localhost", "100.64.0.0/10", "192.168.0.0/16", ".internal"]
+outbound_no_proxy = []
 
 # ---------------------- Security & Real Client IP Trust ----------------------
 # Trust `X-Forwarded-For`, `X-Real-IP`, `Forwarded`, `X-Forwarded-Host`, and `X-Forwarded-Proto`
@@ -36,6 +58,8 @@ inbound_proxy_protocol = "off"
 trust_forwarded_headers = true
 
 # Trusted reverse-proxy IP / CIDR allowlist (loopback, Docker bridges, private LANs).
+# Add "100.64.0.0/10" if you want Tailscale peers to access `/_proxy/info` & `/_proxy/metrics`
+# or if another reverse proxy forwards headers over Tailscale.
 trusted_proxies = [
   "127.0.0.1/32",
   "::1/128",
@@ -94,29 +118,26 @@ shutdown_grace_secs = 15
 
 
 # =============================================================================
-# Example 1 (Shared Port + Virtual Host): Matrix Homeserver + Separate Auth/MAS
+# Example 1 (Shared Port): Public Matrix Homeserver + Separate Auth/MAS
 # =============================================================================
 [[proxies]]
 name = "matrix-primary"
 
 # Omit `listen` to share `[server].listen` (`0.0.0.0:8080`).
-# Domains routed to this upstream (exact match or wildcard `*.example.com`).
-domains = ["matrix1.example.com"]
-
-# External single proxy URL entered in Matrix clients (https:// prefix is optional).
-public_url = "https://matrix1.example.com"
+# Proxy entry URL entered in Matrix clients — routing host (`matrix1.example.com`) is extracted automatically.
+matrix_proxy_public_url = "https://matrix1.example.com"
 
 # Upstream Matrix Client-Server URL.
-matrix_url = "https://matrix-client.example.org"
+upstream_matrix_server_url = "https://matrix-client.example.org"
 
 # Upstream Matrix Auth / MAS / OIDC URL (omit to auto-discover from `auth_metadata`).
-auth_url = "https://account.example.org"
+upstream_matrix_auth_url = "https://account.example.org"
 
-# Optional Matrix server_name for `.well-known/matrix/client` merging (follows up to 3 redirects).
-server_name = "example.org"
+# Optional upstream Matrix server_name for `.well-known/matrix/client` merging (follows up to 3 redirects).
+upstream_matrix_server_name = "example.org"
 
-# Optional LiveKit JWT / Element Call RTC endpoint (automatically proxied via `/_rtc`).
-rtc_url = "https://livekit-jwt.example.org"
+# Optional upstream LiveKit JWT / Element Call RTC endpoint (automatically proxied via `/_rtc`).
+upstream_matrix_rtc_url = "https://livekit-jwt.example.org"
 
 # Standard HTTP client IP headers forwarded upstream:
 #   - "replace" (recommended): overwrite X-Forwarded-For, X-Real-IP, and RFC 7239 Forwarded with real client IP
@@ -126,9 +147,9 @@ client_ip_mode = "replace"
 
 # Outbound PROXY Protocol framing toward upstream reverse proxies ("off" | "v1" | "v2").
 # MUST be "off" for public third-party HTTPS servers that do not expect PROXY Protocol.
-matrix_proxy_protocol = "off"
-auth_proxy_protocol = "off"
-rtc_proxy_protocol = "off"
+upstream_matrix_proxy_protocol = "off"
+upstream_auth_proxy_protocol = "off"
+upstream_rtc_proxy_protocol = "off"
 
 # Single-domain routing mode: "root" (recommended for MAS/OIDC) or "prefix" (mounts auth under `/_auth`).
 auth_mode = "root"
@@ -145,32 +166,34 @@ cache_ttl_secs = 60
 
 
 # =============================================================================
-# Example 2 (Shared Port + Outbound PROXY Protocol): Direct Upstream Reverse Proxy
+# Example 2 (Shared Port + Outbound PROXY Protocol v2): Self-Hosted Upstream
 # Works with Nginx (`listen 8443 ssl proxy_protocol`), HAProxy (`accept-proxy`),
 # Envoy, Traefik, or any reverse proxy accepting standard PROXY Protocol v1/v2.
 # =============================================================================
 [[proxies]]
 name = "selfhosted-pp"
-domains = ["matrix2.example.com"]
-public_url = "https://matrix2.example.com"
+matrix_proxy_public_url = "https://matrix2.example.com"
 
 # Connect directly to an upstream port that expects PROXY Protocol (e.g. Nginx/HAProxy on 8443).
-matrix_url = "https://origin.example.net:8443"
-auth_url = "https://origin.example.net:8443"
+upstream_matrix_server_url = "https://origin.example.net:8443"
+upstream_matrix_auth_url = "https://origin.example.net:8443"
 
 # Optional Host header overrides (only needed when upstream URL uses a custom port or internal IP).
-matrix_host_header = "origin.example.net"
-auth_host_header = "origin.example.net"
-server_name = "origin.example.net"
+upstream_matrix_host_header = "origin.example.net"
+upstream_auth_host_header = "origin.example.net"
+upstream_matrix_server_name = "origin.example.net"
 
 # Enable standard PROXY Protocol ("v2" binary recommended; use "v1" if upstream only supports v1).
 # Connections are pooled per `(upstream, protocol, client_ip)` for H2 multiplexing with zero IP leakage.
-matrix_proxy_protocol = "v2"
-auth_proxy_protocol = "v2"
-rtc_proxy_protocol = "off"
+upstream_matrix_proxy_protocol = "v2"
+upstream_auth_proxy_protocol = "v2"
+upstream_rtc_proxy_protocol = "off"
+
+# Optional: bypass global `[server].outbound_proxy` for direct peer-to-peer / LAN upstreams.
+# outbound_proxy = "direct"
 
 # Extra upstream origins to rewrite (useful when upstream advertises another public domain in metadata/HTML).
-rewrite_origins = ["https://public-origin.example.net"]
+upstream_rewrite_origins = ["https://public-origin.example.net"]
 
 client_ip_mode = "replace"
 auth_mode = "root"
@@ -180,35 +203,32 @@ merge_upstream_well_known = true
 
 
 # =============================================================================
-# Example 3 (Optional Dedicated Port + Outbound SOCKS5 Proxy + Prefix Auth Mode)
-# Uncomment below and expose the matching port in compose.yaml if desired.
+# Example 3 (Domainless Tailscale / LAN `http://ip:port` Mode + SOCKS5 Outbound)
+# Uncomment below (and map port 8081 in compose.yaml) to access a Matrix server
+# directly via a Tailscale IP without purchasing a domain or configuring TLS.
 # =============================================================================
 # [[proxies]]
-# name = "dedicated-socks5"
+# name = "tailscale-matrix"
 #
-# # Bind a dedicated port (expose matching port in compose.yaml if using Docker).
+# # Bind a dedicated port per upstream when using plain `http://ip:port`.
 # listen = "0.0.0.0:8081"
-# domains = ["matrix3.example.com"]
-# public_url = "https://matrix3.example.com"
 #
-# # Reject requests with mismatched Host headers even on a dedicated single-profile port.
-# strict_host_match = false
+# # Enter `http://100.64.0.10:8081` directly in your Matrix client (Tailscale encrypts transport).
+# # Cookies automatically drop `Secure` / downgrade `SameSite=None` -> `SameSite=Lax`, and CSP strips
+# # `upgrade-insecure-requests` so web OIDC/MAS login works cleanly over plain HTTP.
+# matrix_proxy_public_url = "http://100.64.0.10:8081"
 #
-# matrix_url = "https://homeserver.example.net"
-# auth_url = "https://auth.example.net"
+# upstream_matrix_server_url = "https://matrix-client.matrix.org"
+# upstream_matrix_auth_url = "https://account.matrix.org"
+# upstream_matrix_server_name = "matrix.org"
+# upstream_matrix_rtc_url = "https://livekit-jwt.call.matrix.org"
 #
-# # Optional outbound HTTP / HTTPS / SOCKS5 / SOCKS5h proxy (credentials are redacted in logs and `/_proxy/info`).
+# # Optional per-profile outbound proxy override (inherits `[server].outbound_proxy` if omitted).
 # outbound_proxy = "socks5h://127.0.0.1:1080"
 #
-# # Mount Auth under `/_auth` to avoid any path overlap with custom root routes on the homeserver.
-# auth_mode = "prefix"
-# auth_prefix = "/_auth"
-#
-# # Set true only for self-signed test upstreams (NEVER enable in production).
-# danger_accept_invalid_certs = false
-#
-# proxy_protocol = "off"
+# upstream_proxy_protocol = "off"
 # client_ip_mode = "replace"
+# auth_mode = "root"
 # rewrite_issuer = true
 # rewrite_auth_body = true
 # merge_upstream_well_known = true

@@ -106,8 +106,12 @@ pub struct Config {
 #[serde(default)]
 pub struct ServerConfig {
     pub listen: String,
-    pub public_url: Option<String>,
-    pub public_auth_url: Option<String>,
+    /// External/Tailscale proxy address exposed to Matrix clients (e.g. `https://proxy.example.com` or `http://100.64.0.10:8080`).
+    #[serde(alias = "public_url")]
+    pub matrix_proxy_public_url: Option<String>,
+    /// Optional separate external Auth/OIDC proxy address (dual-URL mode).
+    #[serde(alias = "public_auth_url")]
+    pub matrix_proxy_public_auth_url: Option<String>,
     pub tls_cert_path: Option<String>,
     pub tls_key_path: Option<String>,
     /// Inbound PROXY Protocol framing on accepted TCP connections (`"off"` | `"v1"` | `"v2"`).
@@ -115,6 +119,10 @@ pub struct ServerConfig {
     /// Deprecated v1.1 alias for `inbound_proxy_protocol = "v2"`.
     #[serde(skip_serializing)]
     pub accept_proxy_v2: Option<bool>,
+    /// Global outbound HTTP / HTTPS / SOCKS5 / SOCKS5h proxy for all upstream requests (e.g. `socks5h://127.0.0.1:1080` or `http://127.0.0.1:7890`; set `"direct"` to ignore env proxies).
+    pub outbound_proxy: Option<String>,
+    /// Global bypass list for `outbound_proxy` (hosts, `.suffix` domains, IPs, CIDRs such as `100.64.0.0/10` or `127.0.0.1`).
+    pub outbound_no_proxy: Vec<String>,
     pub trust_forwarded_headers: bool,
     pub trusted_proxies: Vec<String>,
     pub expose_info: ExposeInfoMode,
@@ -154,12 +162,14 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             listen: "0.0.0.0:8080".to_string(),
-            public_url: None,
-            public_auth_url: None,
+            matrix_proxy_public_url: None,
+            matrix_proxy_public_auth_url: None,
             tls_cert_path: None,
             tls_key_path: None,
             inbound_proxy_protocol: ProxyProtocol::Off,
             accept_proxy_v2: None,
+            outbound_proxy: None,
+            outbound_no_proxy: Vec::new(),
             trust_forwarded_headers: true,
             trusted_proxies: default_trusted_proxies(),
             expose_info: ExposeInfoMode::Trusted,
@@ -184,25 +194,41 @@ impl Default for ServerConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct UpstreamConfig {
-    pub matrix_url: Option<String>,
-    pub auth_url: Option<String>,
-    pub server_name: Option<String>,
-    pub rtc_url: Option<String>,
-    pub matrix_host_header: Option<String>,
-    pub auth_host_header: Option<String>,
-    pub rtc_host_header: Option<String>,
-    pub rewrite_origins: Vec<String>,
+    #[serde(alias = "matrix_url")]
+    pub upstream_matrix_server_url: Option<String>,
+    #[serde(alias = "auth_url")]
+    pub upstream_matrix_auth_url: Option<String>,
+    #[serde(alias = "server_name")]
+    pub upstream_matrix_server_name: Option<String>,
+    #[serde(alias = "rtc_url")]
+    pub upstream_matrix_rtc_url: Option<String>,
+    #[serde(alias = "matrix_host_header")]
+    pub upstream_matrix_host_header: Option<String>,
+    #[serde(alias = "auth_host_header")]
+    pub upstream_auth_host_header: Option<String>,
+    #[serde(alias = "rtc_host_header")]
+    pub upstream_rtc_host_header: Option<String>,
+    #[serde(alias = "rewrite_origins")]
+    pub upstream_rewrite_origins: Vec<String>,
     pub outbound_proxy: Option<String>,
+    pub outbound_no_proxy: Vec<String>,
+    /// Internal marker set when `outbound_proxy` explicitly specifies `"direct"` / `"none"` / `"off"`.
+    #[serde(skip)]
+    pub outbound_proxy_direct: bool,
     pub client_ip_mode: ClientIpMode,
     /// Outbound PROXY Protocol default for this upstream (`"off"` | `"v1"` | `"v2"`).
-    pub proxy_protocol: ProxyProtocol,
+    #[serde(alias = "proxy_protocol")]
+    pub upstream_proxy_protocol: ProxyProtocol,
     /// Optional per-service outbound PROXY Protocol override for the Matrix homeserver.
-    pub matrix_proxy_protocol: Option<ProxyProtocol>,
+    #[serde(alias = "matrix_proxy_protocol")]
+    pub upstream_matrix_proxy_protocol: Option<ProxyProtocol>,
     /// Optional per-service outbound PROXY Protocol override for the Matrix auth server (MAS/OIDC).
-    pub auth_proxy_protocol: Option<ProxyProtocol>,
+    #[serde(alias = "auth_proxy_protocol")]
+    pub upstream_auth_proxy_protocol: Option<ProxyProtocol>,
     /// Optional per-service outbound PROXY Protocol override for the LiveKit RTC JWT service.
-    pub rtc_proxy_protocol: Option<ProxyProtocol>,
-    /// Deprecated v1.1 aliases for `*_proxy_protocol = "v2"`.
+    #[serde(alias = "rtc_proxy_protocol")]
+    pub upstream_rtc_proxy_protocol: Option<ProxyProtocol>,
+    /// Deprecated v1.1 aliases for `upstream_*_proxy_protocol = "v2"`.
     #[serde(skip_serializing)]
     pub send_proxy_v2: Option<bool>,
     #[serde(skip_serializing)]
@@ -219,20 +245,22 @@ pub struct UpstreamConfig {
 impl Default for UpstreamConfig {
     fn default() -> Self {
         Self {
-            matrix_url: None,
-            auth_url: None,
-            server_name: None,
-            rtc_url: None,
-            matrix_host_header: None,
-            auth_host_header: None,
-            rtc_host_header: None,
-            rewrite_origins: Vec::new(),
+            upstream_matrix_server_url: None,
+            upstream_matrix_auth_url: None,
+            upstream_matrix_server_name: None,
+            upstream_matrix_rtc_url: None,
+            upstream_matrix_host_header: None,
+            upstream_auth_host_header: None,
+            upstream_rtc_host_header: None,
+            upstream_rewrite_origins: Vec::new(),
             outbound_proxy: None,
+            outbound_no_proxy: Vec::new(),
+            outbound_proxy_direct: false,
             client_ip_mode: ClientIpMode::Replace,
-            proxy_protocol: ProxyProtocol::Off,
-            matrix_proxy_protocol: None,
-            auth_proxy_protocol: None,
-            rtc_proxy_protocol: None,
+            upstream_proxy_protocol: ProxyProtocol::Off,
+            upstream_matrix_proxy_protocol: None,
+            upstream_auth_proxy_protocol: None,
+            upstream_rtc_proxy_protocol: None,
             send_proxy_v2: None,
             matrix_send_proxy_v2: None,
             auth_send_proxy_v2: None,
@@ -299,35 +327,53 @@ pub struct ProxyProfileInput {
     pub name: Option<String>,
     /// Optional dedicated listen address (e.g. `"0.0.0.0:8081"`). Omit to share `server.listen`.
     pub listen: Option<String>,
-    /// Domains routed to this profile when sharing a port (auto-inferred from `public_url` & `public_auth_url` if empty).
-    pub domains: Vec<String>,
     /// If true on a shared listener, handles unmatched `Host` headers as fallback.
     pub default: bool,
-    /// If true on a single-profile dedicated listener, rejects requests whose Host does not match `domains`.
+    /// If true on a single-profile dedicated listener, rejects requests whose Host does not match `matrix_proxy_public_url`.
     pub strict_host_match: bool,
 
-    pub public_url: Option<String>,
-    pub public_auth_url: Option<String>,
+    /// Proxy entry URL exposed to Matrix clients (supports `https://domain` or `http://ip:port`, e.g. Tailscale IP).
+    /// On a shared port, the host in this URL automatically drives virtual-host routing.
+    #[serde(alias = "public_url")]
+    pub matrix_proxy_public_url: Option<String>,
+    /// Optional separate proxy URL for Auth/OIDC in dual-URL deployments.
+    #[serde(alias = "public_auth_url")]
+    pub matrix_proxy_public_auth_url: Option<String>,
     pub tls_cert_path: Option<String>,
     pub tls_key_path: Option<String>,
     pub inbound_proxy_protocol: Option<ProxyProtocol>,
     #[serde(skip_serializing)]
     pub accept_proxy_v2: Option<bool>,
 
-    pub matrix_url: Option<String>,
-    pub auth_url: Option<String>,
-    pub server_name: Option<String>,
-    pub rtc_url: Option<String>,
-    pub matrix_host_header: Option<String>,
-    pub auth_host_header: Option<String>,
-    pub rtc_host_header: Option<String>,
-    pub rewrite_origins: Vec<String>,
+    #[serde(alias = "matrix_url")]
+    pub upstream_matrix_server_url: Option<String>,
+    #[serde(alias = "auth_url")]
+    pub upstream_matrix_auth_url: Option<String>,
+    #[serde(alias = "server_name")]
+    pub upstream_matrix_server_name: Option<String>,
+    #[serde(alias = "rtc_url")]
+    pub upstream_matrix_rtc_url: Option<String>,
+    #[serde(alias = "matrix_host_header")]
+    pub upstream_matrix_host_header: Option<String>,
+    #[serde(alias = "auth_host_header")]
+    pub upstream_auth_host_header: Option<String>,
+    #[serde(alias = "rtc_host_header")]
+    pub upstream_rtc_host_header: Option<String>,
+    #[serde(alias = "rewrite_origins")]
+    pub upstream_rewrite_origins: Vec<String>,
+    /// Optional per-profile outbound proxy override (`http://`, `https://`, `socks5://`, `socks5h://`, or `"direct"` to bypass global `[server].outbound_proxy`).
     pub outbound_proxy: Option<String>,
+    /// Optional per-profile `outbound_no_proxy` override (inherits `[server].outbound_no_proxy` when omitted).
+    pub outbound_no_proxy: Option<Vec<String>>,
     pub client_ip_mode: Option<ClientIpMode>,
-    pub proxy_protocol: Option<ProxyProtocol>,
-    pub matrix_proxy_protocol: Option<ProxyProtocol>,
-    pub auth_proxy_protocol: Option<ProxyProtocol>,
-    pub rtc_proxy_protocol: Option<ProxyProtocol>,
+    #[serde(alias = "proxy_protocol")]
+    pub upstream_proxy_protocol: Option<ProxyProtocol>,
+    #[serde(alias = "matrix_proxy_protocol")]
+    pub upstream_matrix_proxy_protocol: Option<ProxyProtocol>,
+    #[serde(alias = "auth_proxy_protocol")]
+    pub upstream_auth_proxy_protocol: Option<ProxyProtocol>,
+    #[serde(alias = "rtc_proxy_protocol")]
+    pub upstream_rtc_proxy_protocol: Option<ProxyProtocol>,
     #[serde(skip_serializing)]
     pub send_proxy_v2: Option<bool>,
     #[serde(skip_serializing)]
@@ -360,15 +406,16 @@ pub struct ProxyProfileInput {
 pub struct ProxyProfile {
     pub name: String,
     pub listen: SocketAddr,
-    pub domains: Vec<String>,
+    /// Routing hosts automatically derived from `matrix_proxy_public_url` and `matrix_proxy_public_auth_url`.
+    pub route_hosts: Vec<String>,
     pub is_default: bool,
     pub strict_host_match: bool,
     pub tls_cert_path: Option<String>,
     pub tls_key_path: Option<String>,
     pub inbound_proxy_protocol: ProxyProtocol,
 
-    pub public_url: Option<Url>,
-    pub public_auth_url: Option<Url>,
+    pub matrix_proxy_public_url: Option<Url>,
+    pub matrix_proxy_public_auth_url: Option<Url>,
 
     pub upstream: UpstreamConfig,
     pub routing: RoutingConfig,
@@ -389,20 +436,20 @@ impl ProxyProfile {
 
     pub fn matrix_proxy_protocol(&self) -> ProxyProtocol {
         self.upstream
-            .matrix_proxy_protocol
-            .unwrap_or(self.upstream.proxy_protocol)
+            .upstream_matrix_proxy_protocol
+            .unwrap_or(self.upstream.upstream_proxy_protocol)
     }
 
     pub fn auth_proxy_protocol(&self) -> ProxyProtocol {
         self.upstream
-            .auth_proxy_protocol
-            .unwrap_or(self.upstream.proxy_protocol)
+            .upstream_auth_proxy_protocol
+            .unwrap_or(self.upstream.upstream_proxy_protocol)
     }
 
     pub fn rtc_proxy_protocol(&self) -> ProxyProtocol {
         self.upstream
-            .rtc_proxy_protocol
-            .unwrap_or(self.upstream.proxy_protocol)
+            .upstream_rtc_proxy_protocol
+            .unwrap_or(self.upstream.upstream_proxy_protocol)
     }
 
     pub fn uses_outbound_proxy_protocol(&self) -> bool {
@@ -509,11 +556,15 @@ impl Config {
         {
             self.server.listen = v;
         }
-        if let Some(v) = env_non_empty("PUBLIC_URL") {
-            self.server.public_url = Some(v);
+        if let Some(v) =
+            env_non_empty("MATRIX_PROXY_PUBLIC_URL").or_else(|| env_non_empty("PUBLIC_URL"))
+        {
+            self.server.matrix_proxy_public_url = Some(v);
         }
-        if let Some(v) = env_non_empty("PUBLIC_AUTH_URL") {
-            self.server.public_auth_url = Some(v);
+        if let Some(v) = env_non_empty("MATRIX_PROXY_PUBLIC_AUTH_URL")
+            .or_else(|| env_non_empty("PUBLIC_AUTH_URL"))
+        {
+            self.server.matrix_proxy_public_auth_url = Some(v);
         }
         if let Some(v) = env_non_empty("TLS_CERT_PATH") {
             self.server.tls_cert_path = Some(v);
@@ -529,6 +580,12 @@ impl Config {
             } else {
                 ProxyProtocol::Off
             };
+        }
+        if let Some(v) = env_non_empty("OUTBOUND_PROXY") {
+            self.server.outbound_proxy = Some(v);
+        }
+        if let Some(v) = env_non_empty("OUTBOUND_NO_PROXY") {
+            self.server.outbound_no_proxy = split_csv(&v);
         }
         if let Some(v) = env_bool("TRUST_FORWARDED_HEADERS")? {
             self.server.trust_forwarded_headers = v;
@@ -585,29 +642,45 @@ impl Config {
             self.server.shutdown_grace_secs = v;
         }
 
-        if let Some(v) = env_non_empty("MATRIX_UPSTREAM") {
-            self.upstream.matrix_url = Some(v);
+        if let Some(v) =
+            env_non_empty("UPSTREAM_MATRIX_SERVER_URL").or_else(|| env_non_empty("MATRIX_UPSTREAM"))
+        {
+            self.upstream.upstream_matrix_server_url = Some(v);
         }
-        if let Some(v) = env_non_empty("AUTH_UPSTREAM") {
-            self.upstream.auth_url = Some(v);
+        if let Some(v) =
+            env_non_empty("UPSTREAM_MATRIX_AUTH_URL").or_else(|| env_non_empty("AUTH_UPSTREAM"))
+        {
+            self.upstream.upstream_matrix_auth_url = Some(v);
         }
-        if let Some(v) = env_non_empty("MATRIX_SERVER_NAME") {
-            self.upstream.server_name = Some(v);
+        if let Some(v) = env_non_empty("UPSTREAM_MATRIX_SERVER_NAME")
+            .or_else(|| env_non_empty("MATRIX_SERVER_NAME"))
+        {
+            self.upstream.upstream_matrix_server_name = Some(v);
         }
-        if let Some(v) = env_non_empty("RTC_UPSTREAM") {
-            self.upstream.rtc_url = Some(v);
+        if let Some(v) =
+            env_non_empty("UPSTREAM_MATRIX_RTC_URL").or_else(|| env_non_empty("RTC_UPSTREAM"))
+        {
+            self.upstream.upstream_matrix_rtc_url = Some(v);
         }
-        if let Some(v) = env_non_empty("MATRIX_HOST_HEADER") {
-            self.upstream.matrix_host_header = Some(v);
+        if let Some(v) = env_non_empty("UPSTREAM_MATRIX_HOST_HEADER")
+            .or_else(|| env_non_empty("MATRIX_HOST_HEADER"))
+        {
+            self.upstream.upstream_matrix_host_header = Some(v);
         }
-        if let Some(v) = env_non_empty("AUTH_HOST_HEADER") {
-            self.upstream.auth_host_header = Some(v);
+        if let Some(v) =
+            env_non_empty("UPSTREAM_AUTH_HOST_HEADER").or_else(|| env_non_empty("AUTH_HOST_HEADER"))
+        {
+            self.upstream.upstream_auth_host_header = Some(v);
         }
-        if let Some(v) = env_non_empty("RTC_HOST_HEADER") {
-            self.upstream.rtc_host_header = Some(v);
+        if let Some(v) =
+            env_non_empty("UPSTREAM_RTC_HOST_HEADER").or_else(|| env_non_empty("RTC_HOST_HEADER"))
+        {
+            self.upstream.upstream_rtc_host_header = Some(v);
         }
-        if let Some(v) = env_non_empty("REWRITE_ORIGINS") {
-            self.upstream.rewrite_origins = split_csv(&v);
+        if let Some(v) =
+            env_non_empty("UPSTREAM_REWRITE_ORIGINS").or_else(|| env_non_empty("REWRITE_ORIGINS"))
+        {
+            self.upstream.upstream_rewrite_origins = split_csv(&v);
         }
         if let Some(v) = env_non_empty("UPSTREAM_PROXY") {
             self.upstream.outbound_proxy = Some(v);
@@ -615,25 +688,33 @@ impl Config {
         if let Some(v) = env_non_empty("CLIENT_IP_MODE") {
             self.upstream.client_ip_mode = parse_client_ip_mode(&v)?;
         }
-        if let Some(v) = env_non_empty("PROXY_PROTOCOL") {
-            self.upstream.proxy_protocol = parse_proxy_protocol(&v)?;
+        if let Some(v) =
+            env_non_empty("UPSTREAM_PROXY_PROTOCOL").or_else(|| env_non_empty("PROXY_PROTOCOL"))
+        {
+            self.upstream.upstream_proxy_protocol = parse_proxy_protocol(&v)?;
         } else if let Some(v) = env_bool("SEND_PROXY_V2")? {
-            self.upstream.proxy_protocol = bool_to_ppv2(v);
+            self.upstream.upstream_proxy_protocol = bool_to_ppv2(v);
         }
-        if let Some(v) = env_non_empty("MATRIX_PROXY_PROTOCOL") {
-            self.upstream.matrix_proxy_protocol = Some(parse_proxy_protocol(&v)?);
+        if let Some(v) = env_non_empty("UPSTREAM_MATRIX_PROXY_PROTOCOL")
+            .or_else(|| env_non_empty("MATRIX_PROXY_PROTOCOL"))
+        {
+            self.upstream.upstream_matrix_proxy_protocol = Some(parse_proxy_protocol(&v)?);
         } else if let Some(v) = env_bool("MATRIX_SEND_PROXY_V2")? {
-            self.upstream.matrix_proxy_protocol = Some(bool_to_ppv2(v));
+            self.upstream.upstream_matrix_proxy_protocol = Some(bool_to_ppv2(v));
         }
-        if let Some(v) = env_non_empty("AUTH_PROXY_PROTOCOL") {
-            self.upstream.auth_proxy_protocol = Some(parse_proxy_protocol(&v)?);
+        if let Some(v) = env_non_empty("UPSTREAM_AUTH_PROXY_PROTOCOL")
+            .or_else(|| env_non_empty("AUTH_PROXY_PROTOCOL"))
+        {
+            self.upstream.upstream_auth_proxy_protocol = Some(parse_proxy_protocol(&v)?);
         } else if let Some(v) = env_bool("AUTH_SEND_PROXY_V2")? {
-            self.upstream.auth_proxy_protocol = Some(bool_to_ppv2(v));
+            self.upstream.upstream_auth_proxy_protocol = Some(bool_to_ppv2(v));
         }
-        if let Some(v) = env_non_empty("RTC_PROXY_PROTOCOL") {
-            self.upstream.rtc_proxy_protocol = Some(parse_proxy_protocol(&v)?);
+        if let Some(v) = env_non_empty("UPSTREAM_RTC_PROXY_PROTOCOL")
+            .or_else(|| env_non_empty("RTC_PROXY_PROTOCOL"))
+        {
+            self.upstream.upstream_rtc_proxy_protocol = Some(parse_proxy_protocol(&v)?);
         } else if let Some(v) = env_bool("RTC_SEND_PROXY_V2")? {
-            self.upstream.rtc_proxy_protocol = Some(bool_to_ppv2(v));
+            self.upstream.upstream_rtc_proxy_protocol = Some(bool_to_ppv2(v));
         }
         if let Some(v) = env_parse::<u64>("CONNECT_TIMEOUT_SECS")? {
             self.upstream.connect_timeout_secs = v;
@@ -691,18 +772,25 @@ impl Config {
     }
 
     pub fn normalize_and_validate(&mut self) -> Result<()> {
-        normalize_http_url_opt(&mut self.server.public_url);
-        normalize_http_url_opt(&mut self.server.public_auth_url);
+        normalize_http_url_opt(&mut self.server.matrix_proxy_public_url);
+        normalize_http_url_opt(&mut self.server.matrix_proxy_public_auth_url);
         normalize_opt_string(&mut self.server.tls_cert_path);
         normalize_opt_string(&mut self.server.tls_key_path);
-        normalize_http_url_opt(&mut self.upstream.matrix_url);
-        normalize_http_url_opt(&mut self.upstream.auth_url);
-        normalize_opt_string(&mut self.upstream.server_name);
-        normalize_http_url_opt(&mut self.upstream.rtc_url);
-        normalize_opt_string(&mut self.upstream.matrix_host_header);
-        normalize_opt_string(&mut self.upstream.auth_host_header);
-        normalize_opt_string(&mut self.upstream.rtc_host_header);
+        normalize_opt_string(&mut self.server.outbound_proxy);
+        self.server.outbound_no_proxy = normalize_no_proxy_list(&self.server.outbound_no_proxy);
+        if let Some(proxy) = &self.server.outbound_proxy {
+            validate_outbound_proxy_value("server.outbound_proxy", proxy)?;
+        }
+
+        normalize_http_url_opt(&mut self.upstream.upstream_matrix_server_url);
+        normalize_http_url_opt(&mut self.upstream.upstream_matrix_auth_url);
+        normalize_opt_string(&mut self.upstream.upstream_matrix_server_name);
+        normalize_http_url_opt(&mut self.upstream.upstream_matrix_rtc_url);
+        normalize_opt_string(&mut self.upstream.upstream_matrix_host_header);
+        normalize_opt_string(&mut self.upstream.upstream_auth_host_header);
+        normalize_opt_string(&mut self.upstream.upstream_rtc_host_header);
         normalize_opt_string(&mut self.upstream.outbound_proxy);
+        self.upstream.outbound_no_proxy = normalize_no_proxy_list(&self.upstream.outbound_no_proxy);
         normalize_http_url_opt(&mut self.discovery.identity_server_url);
 
         if self.server.tls_cert_path.is_some() ^ self.server.tls_key_path.is_some() {
@@ -784,61 +872,73 @@ impl Config {
                 .or_else(|| raw.accept_proxy_v2.map(bool_to_ppv2))
                 .unwrap_or_else(|| self.server.effective_inbound_proxy_protocol());
 
-            let mut public_url_str = raw.public_url.clone();
+            let mut public_url_str = raw.matrix_proxy_public_url.clone();
             normalize_http_url_opt(&mut public_url_str);
-            let public_url =
-                parse_http_url_opt(&format!("proxies[{name}].public_url"), &public_url_str)?;
+            let matrix_proxy_public_url = parse_http_url_opt(
+                &format!("proxies[{name}].matrix_proxy_public_url"),
+                &public_url_str,
+            )?;
 
-            let mut public_auth_url_str = raw.public_auth_url.clone();
+            let mut public_auth_url_str = raw.matrix_proxy_public_auth_url.clone();
             normalize_http_url_opt(&mut public_auth_url_str);
-            let public_auth_url = parse_http_url_opt(
-                &format!("proxies[{name}].public_auth_url"),
+            let matrix_proxy_public_auth_url = parse_http_url_opt(
+                &format!("proxies[{name}].matrix_proxy_public_auth_url"),
                 &public_auth_url_str,
             )?;
 
             let default_outbound_pp = resolve_outbound_pp(
-                raw.proxy_protocol,
+                raw.upstream_proxy_protocol,
                 raw.send_proxy_v2,
                 resolve_outbound_pp(
-                    Some(self.upstream.proxy_protocol).filter(|p| p.is_enabled()),
+                    Some(self.upstream.upstream_proxy_protocol).filter(|p| p.is_enabled()),
                     self.upstream.send_proxy_v2,
                     ProxyProtocol::Off,
                 ),
             );
-            let matrix_proxy_protocol = raw
-                .matrix_proxy_protocol
+            let upstream_matrix_proxy_protocol = raw
+                .upstream_matrix_proxy_protocol
                 .or_else(|| raw.matrix_send_proxy_v2.map(bool_to_ppv2))
-                .or(self.upstream.matrix_proxy_protocol)
+                .or(self.upstream.upstream_matrix_proxy_protocol)
                 .or_else(|| self.upstream.matrix_send_proxy_v2.map(bool_to_ppv2));
-            let auth_proxy_protocol = raw
-                .auth_proxy_protocol
+            let upstream_auth_proxy_protocol = raw
+                .upstream_auth_proxy_protocol
                 .or_else(|| raw.auth_send_proxy_v2.map(bool_to_ppv2))
-                .or(self.upstream.auth_proxy_protocol)
+                .or(self.upstream.upstream_auth_proxy_protocol)
                 .or_else(|| self.upstream.auth_send_proxy_v2.map(bool_to_ppv2));
-            let rtc_proxy_protocol = raw
-                .rtc_proxy_protocol
+            let upstream_rtc_proxy_protocol = raw
+                .upstream_rtc_proxy_protocol
                 .or_else(|| raw.rtc_send_proxy_v2.map(bool_to_ppv2))
-                .or(self.upstream.rtc_proxy_protocol)
+                .or(self.upstream.upstream_rtc_proxy_protocol)
                 .or_else(|| self.upstream.rtc_send_proxy_v2.map(bool_to_ppv2));
 
+            let effective_outbound_proxy = opt_trim(raw.outbound_proxy.as_deref())
+                .or_else(|| opt_trim(self.upstream.outbound_proxy.as_deref()))
+                .or_else(|| opt_trim(self.server.outbound_proxy.as_deref()));
+            let effective_outbound_no_proxy = if let Some(list) = &raw.outbound_no_proxy {
+                normalize_no_proxy_list(list)
+            } else if !self.upstream.outbound_no_proxy.is_empty() {
+                normalize_no_proxy_list(&self.upstream.outbound_no_proxy)
+            } else {
+                normalize_no_proxy_list(&self.server.outbound_no_proxy)
+            };
+
             let mut upstream = UpstreamConfig {
-                matrix_url: raw.matrix_url.clone(),
-                auth_url: raw.auth_url.clone(),
-                server_name: raw.server_name.clone(),
-                rtc_url: raw.rtc_url.clone(),
-                matrix_host_header: raw.matrix_host_header.clone(),
-                auth_host_header: raw.auth_host_header.clone(),
-                rtc_host_header: raw.rtc_host_header.clone(),
-                rewrite_origins: raw.rewrite_origins.clone(),
-                outbound_proxy: raw
-                    .outbound_proxy
-                    .clone()
-                    .or_else(|| self.upstream.outbound_proxy.clone()),
+                upstream_matrix_server_url: raw.upstream_matrix_server_url.clone(),
+                upstream_matrix_auth_url: raw.upstream_matrix_auth_url.clone(),
+                upstream_matrix_server_name: raw.upstream_matrix_server_name.clone(),
+                upstream_matrix_rtc_url: raw.upstream_matrix_rtc_url.clone(),
+                upstream_matrix_host_header: raw.upstream_matrix_host_header.clone(),
+                upstream_auth_host_header: raw.upstream_auth_host_header.clone(),
+                upstream_rtc_host_header: raw.upstream_rtc_host_header.clone(),
+                upstream_rewrite_origins: raw.upstream_rewrite_origins.clone(),
+                outbound_proxy: effective_outbound_proxy,
+                outbound_no_proxy: effective_outbound_no_proxy,
+                outbound_proxy_direct: false,
                 client_ip_mode: raw.client_ip_mode.unwrap_or(self.upstream.client_ip_mode),
-                proxy_protocol: default_outbound_pp,
-                matrix_proxy_protocol,
-                auth_proxy_protocol,
-                rtc_proxy_protocol,
+                upstream_proxy_protocol: default_outbound_pp,
+                upstream_matrix_proxy_protocol,
+                upstream_auth_proxy_protocol,
+                upstream_rtc_proxy_protocol,
                 send_proxy_v2: None,
                 matrix_send_proxy_v2: None,
                 auth_send_proxy_v2: None,
@@ -914,23 +1014,22 @@ impl Config {
                 cache_ttl_secs: raw.cache_ttl_secs.unwrap_or(self.discovery.cache_ttl_secs),
             };
 
-            let domains = collect_profile_domains(
-                &raw.domains,
-                public_url.as_ref(),
-                public_auth_url.as_ref(),
+            let route_hosts = collect_profile_route_hosts(
+                matrix_proxy_public_url.as_ref(),
+                matrix_proxy_public_auth_url.as_ref(),
             );
 
             out.push(ProxyProfile {
                 name,
                 listen,
-                domains,
+                route_hosts,
                 is_default: raw.default,
                 strict_host_match: raw.strict_host_match,
                 tls_cert_path,
                 tls_key_path,
                 inbound_proxy_protocol,
-                public_url,
-                public_auth_url,
+                matrix_proxy_public_url,
+                matrix_proxy_public_auth_url,
                 upstream,
                 routing,
                 discovery,
@@ -947,24 +1046,35 @@ impl Config {
                 format!("invalid server.listen address '{}'", self.server.listen)
             })?;
 
-        let public_url = parse_http_url_opt("server.public_url", &self.server.public_url)?;
-        let public_auth_url =
-            parse_http_url_opt("server.public_auth_url", &self.server.public_auth_url)?;
+        let matrix_proxy_public_url = parse_http_url_opt(
+            "server.matrix_proxy_public_url",
+            &self.server.matrix_proxy_public_url,
+        )?;
+        let matrix_proxy_public_auth_url = parse_http_url_opt(
+            "server.matrix_proxy_public_auth_url",
+            &self.server.matrix_proxy_public_auth_url,
+        )?;
 
         let mut upstream = self.upstream.clone();
-        upstream.proxy_protocol = resolve_outbound_pp(
-            Some(upstream.proxy_protocol).filter(|p| p.is_enabled()),
+        if upstream.outbound_proxy.is_none() {
+            upstream.outbound_proxy = self.server.outbound_proxy.clone();
+        }
+        if upstream.outbound_no_proxy.is_empty() {
+            upstream.outbound_no_proxy = self.server.outbound_no_proxy.clone();
+        }
+        upstream.upstream_proxy_protocol = resolve_outbound_pp(
+            Some(upstream.upstream_proxy_protocol).filter(|p| p.is_enabled()),
             upstream.send_proxy_v2,
             ProxyProtocol::Off,
         );
-        upstream.matrix_proxy_protocol = upstream
-            .matrix_proxy_protocol
+        upstream.upstream_matrix_proxy_protocol = upstream
+            .upstream_matrix_proxy_protocol
             .or_else(|| upstream.matrix_send_proxy_v2.map(bool_to_ppv2));
-        upstream.auth_proxy_protocol = upstream
-            .auth_proxy_protocol
+        upstream.upstream_auth_proxy_protocol = upstream
+            .upstream_auth_proxy_protocol
             .or_else(|| upstream.auth_send_proxy_v2.map(bool_to_ppv2));
-        upstream.rtc_proxy_protocol = upstream
-            .rtc_proxy_protocol
+        upstream.upstream_rtc_proxy_protocol = upstream
+            .upstream_rtc_proxy_protocol
             .or_else(|| upstream.rtc_send_proxy_v2.map(bool_to_ppv2));
         let parsed_rewrite_origins = validate_upstream("upstream", &mut upstream)?;
         let _ = parse_http_url_opt(
@@ -972,19 +1082,22 @@ impl Config {
             &self.discovery.identity_server_url,
         )?;
 
-        let domains = collect_profile_domains(&[], public_url.as_ref(), public_auth_url.as_ref());
+        let route_hosts = collect_profile_route_hosts(
+            matrix_proxy_public_url.as_ref(),
+            matrix_proxy_public_auth_url.as_ref(),
+        );
 
         Ok(ProxyProfile {
             name: "default".to_string(),
             listen,
-            domains,
+            route_hosts,
             is_default: true,
             strict_host_match: false,
             tls_cert_path: self.server.tls_cert_path.clone(),
             tls_key_path: self.server.tls_key_path.clone(),
             inbound_proxy_protocol: self.server.effective_inbound_proxy_protocol(),
-            public_url,
-            public_auth_url,
+            matrix_proxy_public_url,
+            matrix_proxy_public_auth_url,
             upstream,
             routing: self.routing.clone(),
             discovery: self.discovery.clone(),
@@ -994,14 +1107,14 @@ impl Config {
 
     pub fn parsed_public_url(&self) -> Option<Url> {
         self.server
-            .public_url
+            .matrix_proxy_public_url
             .as_deref()
             .and_then(|s| Url::parse(s).ok())
     }
 
     pub fn parsed_public_auth_url(&self) -> Option<Url> {
         self.server
-            .public_auth_url
+            .matrix_proxy_public_auth_url
             .as_deref()
             .and_then(|s| Url::parse(s).ok())
     }
@@ -1033,7 +1146,7 @@ fn group_into_listeners(profiles: Vec<ProxyProfile>) -> Result<Vec<ListenerPlan>
         let first_proxy_prefix = group[0].routing.proxy_prefix.clone();
 
         let is_shared = group.len() > 1;
-        let mut seen_domains = HashSet::new();
+        let mut seen_hosts = HashSet::new();
         let mut default_count = 0usize;
 
         for p in &group {
@@ -1053,16 +1166,16 @@ fn group_into_listeners(profiles: Vec<ProxyProfile>) -> Result<Vec<ListenerPlan>
                 default_count += 1;
             }
             if is_shared {
-                if p.domains.is_empty() && !p.is_default {
+                if p.route_hosts.is_empty() && !p.is_default {
                     bail!(
-                        "listener {listen}: profile '{}' shares a port with other profiles and must set `domains` or `public_url` (or `default = true`)",
+                        "listener {listen}: profile '{}' shares a port with other profiles and must set `matrix_proxy_public_url` (or `default = true`)",
                         p.name
                     );
                 }
-                for d in &p.domains {
-                    if !seen_domains.insert(d.clone()) {
+                for h in &p.route_hosts {
+                    if !seen_hosts.insert(h.clone()) {
                         bail!(
-                            "listener {listen}: duplicate domain '{d}' claimed by multiple profiles"
+                            "listener {listen}: duplicate routing host '{h}' claimed by multiple profiles (use distinct `matrix_proxy_public_url` hosts or separate `listen` ports)"
                         );
                     }
                 }
@@ -1087,41 +1200,50 @@ fn group_into_listeners(profiles: Vec<ProxyProfile>) -> Result<Vec<ListenerPlan>
 }
 
 fn validate_upstream(prefix: &str, upstream: &mut UpstreamConfig) -> Result<Vec<String>> {
-    normalize_http_url_opt(&mut upstream.matrix_url);
-    normalize_http_url_opt(&mut upstream.auth_url);
-    normalize_opt_string(&mut upstream.server_name);
-    normalize_http_url_opt(&mut upstream.rtc_url);
-    normalize_opt_string(&mut upstream.matrix_host_header);
-    normalize_opt_string(&mut upstream.auth_host_header);
-    normalize_opt_string(&mut upstream.rtc_host_header);
+    normalize_http_url_opt(&mut upstream.upstream_matrix_server_url);
+    normalize_http_url_opt(&mut upstream.upstream_matrix_auth_url);
+    normalize_opt_string(&mut upstream.upstream_matrix_server_name);
+    normalize_http_url_opt(&mut upstream.upstream_matrix_rtc_url);
+    normalize_opt_string(&mut upstream.upstream_matrix_host_header);
+    normalize_opt_string(&mut upstream.upstream_auth_host_header);
+    normalize_opt_string(&mut upstream.upstream_rtc_host_header);
     normalize_opt_string(&mut upstream.outbound_proxy);
+    upstream.outbound_no_proxy = normalize_no_proxy_list(&upstream.outbound_no_proxy);
 
-    if upstream.matrix_url.is_none() && upstream.server_name.is_none() {
+    if upstream.upstream_matrix_server_url.is_none()
+        && upstream.upstream_matrix_server_name.is_none()
+    {
         bail!(
-            "{prefix}: configuration requires at least one of matrix_url (MATRIX_UPSTREAM) or server_name (MATRIX_SERVER_NAME)"
+            "{prefix}: configuration requires at least one of upstream_matrix_server_url (UPSTREAM_MATRIX_SERVER_URL) or upstream_matrix_server_name (UPSTREAM_MATRIX_SERVER_NAME)"
         );
     }
 
-    let _ = parse_http_url_opt(&format!("{prefix}.matrix_url"), &upstream.matrix_url)?;
-    let _ = parse_http_url_opt(&format!("{prefix}.auth_url"), &upstream.auth_url)?;
-    let _ = parse_http_url_opt(&format!("{prefix}.rtc_url"), &upstream.rtc_url)?;
+    let _ = parse_http_url_opt(
+        &format!("{prefix}.upstream_matrix_server_url"),
+        &upstream.upstream_matrix_server_url,
+    )?;
+    let _ = parse_http_url_opt(
+        &format!("{prefix}.upstream_matrix_auth_url"),
+        &upstream.upstream_matrix_auth_url,
+    )?;
+    let _ = parse_http_url_opt(
+        &format!("{prefix}.upstream_matrix_rtc_url"),
+        &upstream.upstream_matrix_rtc_url,
+    )?;
 
-    if let Some(proxy) = &upstream.outbound_proxy {
-        let parsed = Url::parse(proxy)
-            .with_context(|| format!("invalid {prefix}.outbound_proxy URL: {proxy}"))?;
-        match parsed.scheme() {
-            "http" | "https" | "socks5" | "socks5h" => {}
-            s => bail!(
-                "unsupported {prefix}.outbound_proxy scheme '{s}': expected http, https, socks5, or socks5h"
-            ),
+    if let Some(proxy) = upstream.outbound_proxy.clone() {
+        validate_outbound_proxy_value(&format!("{prefix}.outbound_proxy"), &proxy)?;
+        if is_direct_proxy_keyword(&proxy) {
+            upstream.outbound_proxy = None;
+            upstream.outbound_proxy_direct = true;
         }
     }
 
     let mut rewrite_origins = Vec::new();
-    for raw in &upstream.rewrite_origins {
+    for raw in &upstream.upstream_rewrite_origins {
         let mut s = Some(raw.clone());
         normalize_http_url_opt(&mut s);
-        if let Some(url) = parse_http_url_opt(&format!("{prefix}.rewrite_origins"), &s)? {
+        if let Some(url) = parse_http_url_opt(&format!("{prefix}.upstream_rewrite_origins"), &s)? {
             let origin = origin_string(&url);
             if !rewrite_origins.contains(&origin) {
                 rewrite_origins.push(origin);
@@ -1132,20 +1254,103 @@ fn validate_upstream(prefix: &str, upstream: &mut UpstreamConfig) -> Result<Vec<
     Ok(rewrite_origins)
 }
 
-fn collect_profile_domains(
-    explicit: &[String],
+pub fn is_direct_proxy_keyword(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "direct" | "none" | "off"
+    )
+}
+
+fn validate_outbound_proxy_value(label: &str, proxy: &str) -> Result<()> {
+    if is_direct_proxy_keyword(proxy) {
+        return Ok(());
+    }
+    let parsed = Url::parse(proxy).with_context(|| format!("invalid {label} URL: {proxy}"))?;
+    match parsed.scheme() {
+        "http" | "https" | "socks5" | "socks5h" => {}
+        s => bail!(
+            "unsupported {label} scheme '{s}': expected http, https, socks5, socks5h, or direct"
+        ),
+    }
+    if parsed.host_str().is_none() {
+        bail!("invalid {label}: missing proxy host in '{proxy}'");
+    }
+    Ok(())
+}
+
+fn normalize_no_proxy_list(raw: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for entry in raw {
+        for part in entry.split(',') {
+            let trimmed = part.trim().to_ascii_lowercase();
+            if !trimmed.is_empty() && !out.contains(&trimmed) {
+                out.push(trimmed);
+            }
+        }
+    }
+    out
+}
+
+/// Checks whether a target host should bypass `outbound_proxy` according to `outbound_no_proxy` rules
+/// (supports `*`, exact hostnames, `.domain.suffix` / `domain.suffix`, IP literals, and IPv4/IPv6 CIDRs).
+pub fn should_bypass_outbound_proxy(target_host: &str, no_proxy: &[String]) -> bool {
+    if no_proxy.is_empty() {
+        return false;
+    }
+    let clean_target = target_host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    if clean_target.is_empty() {
+        return false;
+    }
+    let target_ip = clean_target.parse::<IpAddr>().ok().map(canonical_ip);
+
+    for raw_rule in no_proxy {
+        let rule = raw_rule.trim().to_ascii_lowercase();
+        if rule.is_empty() {
+            continue;
+        }
+        if rule == "*" {
+            return true;
+        }
+        if let Ok(net) = rule.parse::<IpNet>() {
+            if let Some(ip) = target_ip
+                && net.contains(&ip)
+            {
+                return true;
+            }
+            continue;
+        }
+        let stripped_rule = rule.trim_start_matches('[').trim_end_matches(']');
+        if let Ok(rule_ip) = stripped_rule.parse::<IpAddr>() {
+            if target_ip == Some(canonical_ip(rule_ip)) {
+                return true;
+            }
+            continue;
+        }
+        let host_part = strip_host_port(&rule);
+        let suffix = host_part.trim_start_matches('.');
+        if !suffix.is_empty()
+            && (clean_target == suffix
+                || (clean_target.len() > suffix.len()
+                    && clean_target.ends_with(suffix)
+                    && clean_target.as_bytes()[clean_target.len() - suffix.len() - 1] == b'.'))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn collect_profile_route_hosts(
     public_url: Option<&Url>,
     public_auth_url: Option<&Url>,
 ) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
 
-    for raw in explicit {
-        let cleaned = normalize_domain_entry(raw);
-        if !cleaned.is_empty() && seen.insert(cleaned.clone()) {
-            out.push(cleaned);
-        }
-    }
     for url_opt in [public_url, public_auth_url] {
         if let Some(u) = url_opt
             && let Some(host) = u.host_str()
@@ -1157,20 +1362,6 @@ fn collect_profile_domains(
         }
     }
     out
-}
-
-fn normalize_domain_entry(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    if trimmed.contains("://")
-        && let Ok(u) = Url::parse(trimmed)
-        && let Some(h) = u.host_str()
-    {
-        return h.to_ascii_lowercase();
-    }
-    strip_host_port(trimmed).to_ascii_lowercase()
 }
 
 fn parse_trusted_proxies(raw_list: &[String]) -> Result<Vec<IpNet>> {
@@ -1400,35 +1591,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bare_hostnames_default_to_https() {
+    fn bare_hostnames_default_to_https_and_ip_port_keeps_http() {
         let cfg = Config::from_toml_str(
             r#"
             [server]
-            public_url = "proxy.example.com"
+            matrix_proxy_public_url = "proxy.example.com"
 
             [upstream]
-            matrix_url = "matrix.example.org"
-            auth_url = "https://auth.example.org"
-            rtc_url = "rtc.example.org"
+            upstream_matrix_server_url = "matrix.example.org"
+            upstream_matrix_auth_url = "https://auth.example.org"
+            upstream_matrix_rtc_url = "rtc.example.org"
             "#,
         )
         .unwrap();
 
         assert_eq!(
-            cfg.server.public_url.as_deref(),
+            cfg.server.matrix_proxy_public_url.as_deref(),
             Some("https://proxy.example.com")
         );
         assert_eq!(
-            cfg.upstream.matrix_url.as_deref(),
+            cfg.upstream.upstream_matrix_server_url.as_deref(),
             Some("https://matrix.example.org")
         );
         assert_eq!(
-            cfg.upstream.auth_url.as_deref(),
+            cfg.upstream.upstream_matrix_auth_url.as_deref(),
             Some("https://auth.example.org")
         );
         assert_eq!(
-            cfg.upstream.rtc_url.as_deref(),
+            cfg.upstream.upstream_matrix_rtc_url.as_deref(),
             Some("https://rtc.example.org")
+        );
+
+        let ts_cfg = Config::from_toml_str(
+            r#"
+            [[proxies]]
+            name = "tailscale"
+            listen = "0.0.0.0:8081"
+            matrix_proxy_public_url = "http://100.64.0.10:8081"
+            upstream_matrix_server_url = "https://matrix-client.matrix.org"
+            "#,
+        )
+        .unwrap()
+        .into_runtime()
+        .unwrap();
+        assert_eq!(
+            ts_cfg.listeners[0].profiles[0]
+                .matrix_proxy_public_url
+                .as_ref()
+                .map(normalized_base_url)
+                .as_deref(),
+            Some("http://100.64.0.10:8081")
+        );
+        assert_eq!(
+            ts_cfg.listeners[0].profiles[0].route_hosts,
+            vec!["100.64.0.10"]
         );
     }
 
@@ -1437,44 +1653,47 @@ mod tests {
         let err = Config::from_toml_str(
             r#"
             [upstream]
-            matrix_url = "ftp://matrix.example.org"
+            upstream_matrix_server_url = "ftp://matrix.example.org"
             "#,
         )
         .unwrap_err();
         assert!(
             err.to_string()
-                .contains("invalid upstream.matrix_url scheme")
+                .contains("invalid upstream.upstream_matrix_server_url scheme")
         );
     }
 
     #[test]
-    fn multi_proxy_supports_shared_port_and_custom_ports_simultaneously() {
+    fn multi_proxy_supports_shared_port_custom_ports_and_global_outbound_proxy() {
         let cfg = Config::from_toml_str(
             r#"
             [server]
             listen = "0.0.0.0:8080"
+            outbound_proxy = "socks5h://127.0.0.1:1080"
+            outbound_no_proxy = ["127.0.0.1", "100.64.0.0/10", ".internal"]
 
             [[proxies]]
             name = "site-a"
-            public_url = "https://a.example.com"
-            matrix_url = "https://hs-a.internal:8443"
-            proxy_protocol = "v2"
-            rewrite_origins = ["https://hs-public.example.org"]
+            matrix_proxy_public_url = "https://a.example.com"
+            upstream_matrix_server_url = "https://hs-a.internal:8443"
+            upstream_proxy_protocol = "v2"
+            upstream_rewrite_origins = ["https://hs-public.example.org"]
 
             [[proxies]]
-            name = "site-b"
-            domains = ["b.example.com", "*.b.example.com"]
-            public_url = "https://b.example.com"
-            matrix_url = "https://hs-b.internal"
-            auth_url = "https://auth-b.internal"
-            matrix_proxy_protocol = "v1"
-            auth_proxy_protocol = "off"
+            name = "site-b-direct"
+            matrix_proxy_public_url = "https://b.example.com"
+            upstream_matrix_server_url = "https://hs-b.internal"
+            upstream_matrix_auth_url = "https://auth-b.internal"
+            upstream_matrix_proxy_protocol = "v1"
+            upstream_auth_proxy_protocol = "off"
+            outbound_proxy = "direct"
 
             [[proxies]]
-            name = "site-c-dedicated"
+            name = "site-c-tailscale"
             listen = "0.0.0.0:8081"
-            public_url = "https://c.example.com"
-            matrix_url = "https://hs-c.internal"
+            matrix_proxy_public_url = "http://100.64.0.10:8081"
+            upstream_matrix_server_url = "https://hs-c.example.org"
+            outbound_proxy = "http://127.0.0.1:7890"
             "#,
         )
         .unwrap();
@@ -1484,12 +1703,44 @@ mod tests {
         assert_eq!(runtime.listeners[0].listen.port(), 8080);
         assert_eq!(runtime.listeners[0].profiles.len(), 2);
         assert_eq!(
-            runtime.listeners[0].profiles[0].domains,
+            runtime.listeners[0].profiles[0].route_hosts,
             vec!["a.example.com"]
+        );
+        // Inherits global [server].outbound_proxy & outbound_no_proxy
+        assert_eq!(
+            runtime.listeners[0].profiles[0]
+                .upstream
+                .outbound_proxy
+                .as_deref(),
+            Some("socks5h://127.0.0.1:1080")
+        );
+        assert_eq!(
+            runtime.listeners[0].profiles[0].upstream.outbound_no_proxy,
+            vec!["127.0.0.1", "100.64.0.0/10", ".internal"]
+        );
+        assert!(
+            !runtime.listeners[0].profiles[0]
+                .upstream
+                .outbound_proxy_direct
         );
         assert_eq!(
             runtime.listeners[0].profiles[0].matrix_proxy_protocol(),
             ProxyProtocol::V2
+        );
+        assert_eq!(
+            runtime.listeners[0].profiles[0].parsed_rewrite_origins,
+            vec!["https://hs-public.example.org"]
+        );
+
+        // Profile B explicitly overrides global outbound_proxy with "direct"
+        assert_eq!(
+            runtime.listeners[0].profiles[1].upstream.outbound_proxy,
+            None
+        );
+        assert!(
+            runtime.listeners[0].profiles[1]
+                .upstream
+                .outbound_proxy_direct
         );
         assert_eq!(
             runtime.listeners[0].profiles[1].matrix_proxy_protocol(),
@@ -1499,18 +1750,41 @@ mod tests {
             runtime.listeners[0].profiles[1].auth_proxy_protocol(),
             ProxyProtocol::Off
         );
-        assert_eq!(
-            runtime.listeners[0].profiles[0].parsed_rewrite_origins,
-            vec!["https://hs-public.example.org"]
-        );
 
+        // Dedicated Tailscale port with per-profile HTTP proxy override
         assert_eq!(runtime.listeners[1].listen.port(), 8081);
         assert_eq!(runtime.listeners[1].profiles.len(), 1);
-        assert_eq!(runtime.listeners[1].profiles[0].name, "site-c-dedicated");
+        assert_eq!(runtime.listeners[1].profiles[0].name, "site-c-tailscale");
+        assert_eq!(
+            runtime.listeners[1].profiles[0]
+                .upstream
+                .outbound_proxy
+                .as_deref(),
+            Some("http://127.0.0.1:7890")
+        );
     }
 
     #[test]
-    fn legacy_ppv2_booleans_remain_backward_compatible() {
+    fn no_proxy_matching_handles_domains_ips_and_cidrs() {
+        let rules = normalize_no_proxy_list(&[
+            "localhost, 127.0.0.1".to_string(),
+            "100.64.0.0/10".to_string(),
+            ".internal.example".to_string(),
+            "direct.org".to_string(),
+        ]);
+        assert!(should_bypass_outbound_proxy("localhost", &rules));
+        assert!(should_bypass_outbound_proxy("127.0.0.1", &rules));
+        assert!(should_bypass_outbound_proxy("100.64.12.34", &rules));
+        assert!(should_bypass_outbound_proxy("hs.internal.example", &rules));
+        assert!(should_bypass_outbound_proxy("internal.example", &rules));
+        assert!(should_bypass_outbound_proxy("direct.org", &rules));
+        assert!(should_bypass_outbound_proxy("sub.direct.org", &rules));
+        assert!(!should_bypass_outbound_proxy("notdirect.org", &rules));
+        assert!(!should_bypass_outbound_proxy("matrix.org", &rules));
+    }
+
+    #[test]
+    fn legacy_field_names_and_ppv2_booleans_remain_backward_compatible() {
         let cfg = Config::from_toml_str(
             r#"
             [server]
@@ -1520,8 +1794,11 @@ mod tests {
 
             [[proxies]]
             name = "legacy"
-            domains = ["legacy.example.com"]
+            public_url = "https://legacy.example.com"
             matrix_url = "https://hs.example.org:8443"
+            auth_url = "https://auth.example.org:8443"
+            rtc_url = "https://rtc.example.org"
+            server_name = "example.org"
             matrix_send_proxy_v2 = true
             auth_send_proxy_v2 = false
             "#,
@@ -1533,33 +1810,45 @@ mod tests {
             runtime.listeners[0].inbound_proxy_protocol,
             ProxyProtocol::V2
         );
+        let p = &runtime.listeners[0].profiles[0];
+        assert_eq!(p.route_hosts, vec!["legacy.example.com"]);
         assert_eq!(
-            runtime.listeners[0].profiles[0].matrix_proxy_protocol(),
-            ProxyProtocol::V2
+            p.upstream.upstream_matrix_server_url.as_deref(),
+            Some("https://hs.example.org:8443")
         );
         assert_eq!(
-            runtime.listeners[0].profiles[0].auth_proxy_protocol(),
-            ProxyProtocol::Off
+            p.upstream.upstream_matrix_auth_url.as_deref(),
+            Some("https://auth.example.org:8443")
         );
+        assert_eq!(
+            p.upstream.upstream_matrix_rtc_url.as_deref(),
+            Some("https://rtc.example.org")
+        );
+        assert_eq!(
+            p.upstream.upstream_matrix_server_name.as_deref(),
+            Some("example.org")
+        );
+        assert_eq!(p.matrix_proxy_protocol(), ProxyProtocol::V2);
+        assert_eq!(p.auth_proxy_protocol(), ProxyProtocol::Off);
     }
 
     #[test]
-    fn duplicate_domain_on_shared_port_is_rejected() {
+    fn duplicate_routing_host_on_shared_port_is_rejected() {
         let err = Config::from_toml_str(
             r#"
             [[proxies]]
             name = "p1"
-            public_url = "https://dup.example.com"
-            matrix_url = "https://hs1.example.com"
+            matrix_proxy_public_url = "https://dup.example.com"
+            upstream_matrix_server_url = "https://hs1.example.com"
 
             [[proxies]]
             name = "p2"
-            public_url = "https://dup.example.com"
-            matrix_url = "https://hs2.example.com"
+            matrix_proxy_public_url = "https://dup.example.com"
+            upstream_matrix_server_url = "https://hs2.example.com"
             "#,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("duplicate domain"));
+        assert!(err.to_string().contains("duplicate routing host"));
     }
 
     #[test]

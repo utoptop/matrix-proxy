@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build linux/amd64 image natively on the utop x86_64 node and push to Docker Hub.
-IMAGE="${IMAGE:-utoptop/matrix-proxy:1.0}"
+# Build linux/amd64 image natively on the utop x86_64 node and push to Docker Hub
+# (plus GitHub Container Registry `ghcr.io` when GHCR_PUSH=1 or GHCR_TOKEN/existing login is configured).
+APP_VERSION="${APP_VERSION:-1.3.0}"
+DOCKERHUB_REPO="${DOCKERHUB_REPO:-utoptop/matrix-proxy}"
+IMAGE="${IMAGE:-${DOCKERHUB_REPO}:1.0}"
+EXTRA_TAGS="${EXTRA_TAGS:-${DOCKERHUB_REPO}:latest ${DOCKERHUB_REPO}:${APP_VERSION}}"
+GHCR_REPO="${GHCR_REPO:-ghcr.io/utoptop/matrix-proxy}"
+GHCR_USER="${GHCR_USER:-utoptop}"
+GHCR_TOKEN="${GHCR_TOKEN:-}"
 REMOTE_HOST="${REMOTE_HOST:-utop}"
 REMOTE_DIR="${REMOTE_DIR:-/tmp/matrix-proxy-build}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,17 +39,38 @@ if [[ -n \"\${PROXY_URL}\" ]]; then
   BUILD_PROXY_ARGS=(--network=host --build-arg \"HTTP_PROXY=\${PROXY_URL}\" --build-arg \"HTTPS_PROXY=\${PROXY_URL}\" --build-arg \"NO_PROXY=\${NO_PROXY}\")
 fi
 DOCKER_BUILDKIT=1 docker build --platform linux/amd64 \"\${BUILD_PROXY_ARGS[@]}\" -t \"${IMAGE}\" .
+for tag in ${EXTRA_TAGS}; do
+  docker tag \"${IMAGE}\" \"\${tag}\"
+done
 '"
 
-echo "==> Pushing ${IMAGE}"
+echo "==> Pushing Docker Hub tags (${IMAGE} ${EXTRA_TAGS})"
 ssh "${REMOTE_HOST}" "bash -euo pipefail -c '
 if ss -tln | grep -q \"127.0.0.1:10809\"; then
   export HTTP_PROXY=http://127.0.0.1:10809 HTTPS_PROXY=http://127.0.0.1:10809
 fi
-docker push \"${IMAGE}\"
-echo \"==> Verifying pushed manifest\"
+for tag in ${IMAGE} ${EXTRA_TAGS}; do
+  docker push \"\${tag}\"
+done
+echo \"==> Verifying pushed Docker Hub manifest\"
 docker buildx imagetools inspect \"${IMAGE}\"
 '"
+
+if [[ -n "${GHCR_TOKEN}" ]]; then
+  echo "==> Pushing GHCR tags (${GHCR_REPO}:1.0, :latest, :${APP_VERSION})"
+  printf '%s' "${GHCR_TOKEN}" | ssh "${REMOTE_HOST}" "bash -euo pipefail -c '
+    if ss -tln | grep -q \"127.0.0.1:10809\"; then
+      export HTTP_PROXY=http://127.0.0.1:10809 HTTPS_PROXY=http://127.0.0.1:10809
+    fi
+    docker login ghcr.io -u \"${GHCR_USER}\" --password-stdin
+    trap \"docker logout ghcr.io >/dev/null 2>&1 || true\" EXIT
+    for suffix in 1.0 latest ${APP_VERSION}; do
+      docker tag \"${IMAGE}\" \"${GHCR_REPO}:\${suffix}\"
+      docker push \"${GHCR_REPO}:\${suffix}\"
+    done
+    docker buildx imagetools inspect \"${GHCR_REPO}:latest\"
+  '"
+fi
 
 echo "==> Cleaning up remote build directory ${REMOTE_DIR}"
 ssh "${REMOTE_HOST}" "rm -rf '${REMOTE_DIR}'"

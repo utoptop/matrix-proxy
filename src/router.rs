@@ -290,9 +290,9 @@ fn is_request_for_auth_host(
         return false;
     };
     let matrix_host = public.matrix_base.host_str().unwrap_or_default();
-    if auth_host.eq_ignore_ascii_case(matrix_host)
-        && public.auth_base.port_or_known_default() == public.matrix_base.port_or_known_default()
-    {
+    let auth_port = public.auth_base.port_or_known_default();
+    let matrix_port = public.matrix_base.port_or_known_default();
+    if auth_host.eq_ignore_ascii_case(matrix_host) && auth_port == matrix_port {
         return false;
     }
 
@@ -300,7 +300,33 @@ fn is_request_for_auth_host(
         return false;
     };
 
-    strip_host_port(&req_host).eq_ignore_ascii_case(auth_host)
+    if !strip_host_port(&req_host).eq_ignore_ascii_case(auth_host) {
+        return false;
+    }
+
+    // If Matrix & Auth share the same host/IP on different ports (e.g. `http://100.64.0.10:8081` vs `:8082`),
+    // match the explicit port too so Matrix traffic isn't misrouted to Auth.
+    if auth_host.eq_ignore_ascii_case(matrix_host) {
+        let req_port = extract_host_port(&req_host).or_else(|| {
+            Some(if client.client_proto == "https" {
+                443
+            } else {
+                80
+            })
+        });
+        return req_port == auth_port;
+    }
+
+    true
+}
+
+fn extract_host_port(host: &str) -> Option<u16> {
+    if host.starts_with('[') {
+        let after_bracket = host.split_once(']')?.1;
+        after_bracket.strip_prefix(':')?.parse::<u16>().ok()
+    } else {
+        host.rsplit_once(':')?.1.parse::<u16>().ok()
+    }
 }
 
 fn join_pq(path: &str, query: Option<&str>) -> String {

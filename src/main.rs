@@ -490,6 +490,7 @@ async fn main() -> Result<()> {
     info!(
         version = env!("CARGO_PKG_VERSION"),
         listeners = runtime.listeners.len(),
+        global_outbound_proxy = ?runtime.server.outbound_proxy.as_deref().map(redact_proxy_url),
         max_concurrent_requests = runtime.server.max_concurrent_requests,
         rate_limit_rps = runtime.server.rate_limit_rps,
         tcp_nodelay = runtime.server.tcp_nodelay,
@@ -1102,8 +1103,8 @@ mod tests {
 
                 [[proxies]]
                 name = "test"
-                domains = ["proxy.example.com"]
-                matrix_url = "https://matrix.example.org"
+                matrix_proxy_public_url = "https://proxy.example.com"
+                upstream_matrix_server_url = "https://matrix.example.org"
                 "#
             ))
             .unwrap();
@@ -1171,10 +1172,9 @@ mod tests {
 
             [[proxies]]
             name = "site-a"
-            domains = ["a.example.com"]
             strict_host_match = true
-            public_url = "https://a.example.com"
-            matrix_url = "http://{addr_a}"
+            matrix_proxy_public_url = "https://a.example.com"
+            upstream_matrix_server_url = "http://{addr_a}"
             "#
         );
         std::fs::write(&tmp_path, cfg_v1).unwrap();
@@ -1219,16 +1219,14 @@ mod tests {
 
             [[proxies]]
             name = "site-a"
-            domains = ["a.example.com"]
             strict_host_match = true
-            public_url = "https://a.example.com"
-            matrix_url = "http://{addr_a}"
+            matrix_proxy_public_url = "https://a.example.com"
+            upstream_matrix_server_url = "http://{addr_a}"
 
             [[proxies]]
             name = "site-b"
-            domains = ["b.example.com"]
-            public_url = "https://b.example.com"
-            matrix_url = "http://{addr_b}"
+            matrix_proxy_public_url = "https://b.example.com"
+            upstream_matrix_server_url = "http://{addr_b}"
             "#
         );
         std::fs::write(&tmp_path, cfg_v2).unwrap();

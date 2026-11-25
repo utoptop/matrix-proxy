@@ -1,11 +1,14 @@
 # =============================================================================
-# matrix-proxy — Hardened Docker Compose Example
+# matrix-proxy v1.3 — Hardened Docker Compose Example
 # Quick start:
 #   cp config.example.toml config.toml
 #   docker compose up -d
 # =============================================================================
 services:
   matrix-proxy:
+    # Available from both Docker Hub and GitHub Container Registry (GHCR):
+    #   - utoptop/matrix-proxy:1.0  (or :latest)
+    #   - ghcr.io/utoptop/matrix-proxy:latest
     image: utoptop/matrix-proxy:1.0
     container_name: matrix-proxy
     restart: unless-stopped
@@ -15,21 +18,22 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    # Bind to localhost only and terminate TLS via Nginx, HAProxy, Caddy, or Envoy.
-    # Add extra port mappings if any [[proxies]] block uses a dedicated `listen` port (e.g. 8081).
+    # Bind to localhost behind Nginx/HAProxy/Caddy, or bind to your Tailscale IP (e.g. 100.64.0.10:8081:8081)
+    # for direct domainless `http://ip:port` access without TLS certificates.
     ports:
       - "127.0.0.1:8910:8080"
-      # - "127.0.0.1:8911:8081"
+      # - "100.64.0.10:8081:8081"
     environment:
       RUST_LOG: "${RUST_LOG:-matrix_proxy=info}"
       # For zero-TOML single-upstream deployments, uncomment below and remove `volumes`:
-      # PUBLIC_URL: "${PUBLIC_URL:-https://proxy.example.com}"
-      # MATRIX_UPSTREAM: "${MATRIX_UPSTREAM:-https://matrix.example.org}"
-      # AUTH_UPSTREAM: "${AUTH_UPSTREAM:-https://auth.example.org}"
-      # RTC_UPSTREAM: "${RTC_UPSTREAM:-}"
-      # UPSTREAM_PROXY: "${UPSTREAM_PROXY:-}"
+      # MATRIX_PROXY_PUBLIC_URL: "${MATRIX_PROXY_PUBLIC_URL:-https://proxy.example.com}"
+      # UPSTREAM_MATRIX_SERVER_URL: "${UPSTREAM_MATRIX_SERVER_URL:-https://matrix.example.org}"
+      # UPSTREAM_MATRIX_AUTH_URL: "${UPSTREAM_MATRIX_AUTH_URL:-https://auth.example.org}"
+      # UPSTREAM_MATRIX_RTC_URL: "${UPSTREAM_MATRIX_RTC_URL:-}"
+      # OUTBOUND_PROXY: "${OUTBOUND_PROXY:-}"
+      # OUTBOUND_NO_PROXY: "${OUTBOUND_NO_PROXY:-}"
       # CLIENT_IP_MODE: "${CLIENT_IP_MODE:-replace}"
-      # PROXY_PROTOCOL: "${PROXY_PROTOCOL:-off}"
+      # UPSTREAM_PROXY_PROTOCOL: "${UPSTREAM_PROXY_PROTOCOL:-off}"
       # EXPOSE_INFO: "${EXPOSE_INFO:-trusted}"
     volumes:
       # Mounting the directory to `/app/conf:ro` (auto-loads `/app/conf/config.toml`) ensures

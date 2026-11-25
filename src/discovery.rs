@@ -230,8 +230,9 @@ impl DiscoveryManager {
             snapshot_changed = true;
         }
 
-        if self.profile.upstream.auth_url.is_none()
+        if self.profile.upstream.upstream_matrix_auth_url.is_none()
             && let Some(url) = learned_url
+            && !self.is_self_public_origin(&url)
         {
             let changed = guard
                 .dynamic_auth_url
@@ -250,12 +251,13 @@ impl DiscoveryManager {
         }
 
         if snapshot_changed && let Some(prev) = &guard.resolved {
-            let new_auth_url =
-                if self.profile.upstream.auth_url.is_none() && guard.dynamic_auth_url.is_some() {
-                    guard.dynamic_auth_url.clone()
-                } else {
-                    prev.auth_url.clone()
-                };
+            let new_auth_url = if self.profile.upstream.upstream_matrix_auth_url.is_none()
+                && guard.dynamic_auth_url.is_some()
+            {
+                guard.dynamic_auth_url.clone()
+            } else {
+                prev.auth_url.clone()
+            };
             let new_issuer = guard
                 .dynamic_issuer
                 .clone()
@@ -272,12 +274,29 @@ impl DiscoveryManager {
         }
     }
 
+    /// Prevents proxy self-loops when an upstream homeserver (e.g. Tuwunel built-in OIDC)
+    /// already advertises this proxy's own `matrix_proxy_public_url` as its OIDC issuer.
+    fn is_self_public_origin(&self, candidate: &Url) -> bool {
+        let cand_orig = origin_string(candidate);
+        let matches_main = self
+            .profile
+            .matrix_proxy_public_url
+            .as_ref()
+            .is_some_and(|u| origin_string(u) == cand_orig);
+        let matches_auth = self
+            .profile
+            .matrix_proxy_public_auth_url
+            .as_ref()
+            .is_some_and(|u| origin_string(u) == cand_orig);
+        matches_main || matches_auth
+    }
+
     async fn refresh_internal(&self, is_startup: bool) -> Result<Arc<ResolvedUpstreams>> {
         let mut upstream_well_known: Option<Value> = None;
 
         // 1. Try server_name well-known if configured (follows up to 3 HTTP/HTTPS redirects,
         //    e.g. `mozilla.org/.well-known/matrix/client` -> `www.mozilla.org/.well-known/matrix/client`).
-        if let Some(server_name) = &self.profile.upstream.server_name {
+        if let Some(server_name) = &self.profile.upstream.upstream_matrix_server_name {
             let wk_url = build_server_name_well_known_url(server_name)?;
             match self
                 .fetch_json(&wk_url, ProxyProtocol::Off, None, true)
@@ -288,10 +307,10 @@ impl DiscoveryManager {
                     upstream_well_known = Some(json);
                 }
                 Err(err) => {
-                    if self.profile.upstream.matrix_url.is_none() {
+                    if self.profile.upstream.upstream_matrix_server_url.is_none() {
                         return Err(err).with_context(|| {
                             format!(
-                                "failed to discover matrix_url from server_name '{server_name}' ({wk_url})"
+                                "failed to discover upstream_matrix_server_url from upstream_matrix_server_name '{server_name}' ({wk_url})"
                             )
                         });
                     }
@@ -300,9 +319,9 @@ impl DiscoveryManager {
             }
         }
 
-        // 2. Resolve matrix_url
-        let matrix_url = if let Some(explicit) = &self.profile.upstream.matrix_url {
-            Url::parse(explicit).context("invalid upstream.matrix_url")?
+        // 2. Resolve upstream_matrix_server_url
+        let matrix_url = if let Some(explicit) = &self.profile.upstream.upstream_matrix_server_url {
+            Url::parse(explicit).context("invalid upstream_matrix_server_url")?
         } else if let Some(wk) = &upstream_well_known {
             let discovered = wk
                 .pointer("/m.homeserver/base_url")
@@ -315,12 +334,12 @@ impl DiscoveryManager {
             })?
         } else {
             return Err(anyhow!(
-                "unable to resolve upstream matrix_url: neither matrix_url nor valid server_name well-known available"
+                "unable to resolve upstream_matrix_server_url: neither upstream_matrix_server_url nor valid upstream_matrix_server_name well-known available"
             ));
         };
 
         let matrix_pp = self.profile.matrix_proxy_protocol();
-        let matrix_host_ov = self.profile.upstream.matrix_host_header.as_deref();
+        let matrix_host_ov = self.profile.upstream.upstream_matrix_host_header.as_deref();
 
         // 3. Fallback well-known fetch from matrix_url if needed.
         if upstream_well_known.is_none()
@@ -360,8 +379,8 @@ impl DiscoveryManager {
             discovered_issuer = prev_dyn_issuer;
         }
 
-        let explicit_auth_url = match &self.profile.upstream.auth_url {
-            Some(raw) => Some(Url::parse(raw).context("invalid upstream.auth_url")?),
+        let explicit_auth_url = match &self.profile.upstream.upstream_matrix_auth_url {
+            Some(raw) => Some(Url::parse(raw).context("invalid upstream_matrix_auth_url")?),
             None => None,
         };
 
@@ -373,12 +392,15 @@ impl DiscoveryManager {
             && matches!(u.scheme(), "http" | "https")
             && u.host_str().is_some()
         {
-            auth_url = Some(origin_only_url(&u));
+            let cand = origin_only_url(&u);
+            if !self.is_self_public_origin(&cand) {
+                auth_url = Some(cand);
+            }
         }
 
         // Probe upstream auth_metadata on startup or when auth_url / issuer still unknown.
         if (auth_url.is_none() || discovered_issuer.is_none() || observed_origins.is_empty())
-            && (is_startup || self.profile.upstream.auth_url.is_none())
+            && (is_startup || self.profile.upstream.upstream_matrix_auth_url.is_none())
             && let Some(meta) = self
                 .probe_auth_metadata(&matrix_url, matrix_pp, matrix_host_ov)
                 .await
@@ -411,14 +433,23 @@ impl DiscoveryManager {
                         observed_origins.push(orig);
                     }
                     if auth_url.is_none() {
-                        auth_url = Some(origin_only_url(&u));
+                        let cand = origin_only_url(&u);
+                        if !self.is_self_public_origin(&cand) {
+                            auth_url = Some(cand);
+                        } else {
+                            debug!(
+                                profile = %self.profile.name,
+                                origin = %cand,
+                                "discovered auth origin matches matrix_proxy_public_url; routing auth to upstream_matrix_server_url to avoid self-loop"
+                            );
+                        }
                     }
                 }
             }
         }
 
-        let rtc_url = match &self.profile.upstream.rtc_url {
-            Some(raw) => Some(Url::parse(raw).context("invalid upstream.rtc_url")?),
+        let rtc_url = match &self.profile.upstream.upstream_matrix_rtc_url {
+            Some(raw) => Some(Url::parse(raw).context("invalid upstream_matrix_rtc_url")?),
             None => None,
         };
 

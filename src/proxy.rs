@@ -118,6 +118,7 @@ impl ProxyInstance {
             Some(Arc::new(Ppv2Client::new(
                 server,
                 profile.upstream.outbound_proxy.as_deref(),
+                profile.upstream.outbound_no_proxy.clone(),
                 profile.upstream.connect_timeout_secs,
                 profile.upstream.danger_accept_invalid_certs,
                 metrics,
@@ -152,14 +153,14 @@ impl ProxyInstance {
 fn warn_if_pp_on_standard_https_port(profile: &ProxyProfile) {
     for (label, proto, raw_url) in [
         (
-            "matrix_url",
+            "upstream_matrix_server_url",
             profile.matrix_proxy_protocol(),
-            profile.upstream.matrix_url.as_deref(),
+            profile.upstream.upstream_matrix_server_url.as_deref(),
         ),
         (
-            "auth_url",
+            "upstream_matrix_auth_url",
             profile.auth_proxy_protocol(),
-            profile.upstream.auth_url.as_deref(),
+            profile.upstream.upstream_matrix_auth_url.as_deref(),
         ),
     ] {
         if proto.is_enabled()
@@ -212,7 +213,7 @@ impl ListenerState {
             let inst =
                 ProxyInstance::build(&runtime.server, profile.clone(), Some(Arc::clone(&metrics)))?;
             entries.push((
-                profile.domains.clone(),
+                profile.route_hosts.clone(),
                 profile.is_default,
                 profile.strict_host_match,
                 inst,
@@ -272,7 +273,7 @@ impl ListenerState {
             match res {
                 Ok(Ok(_)) => Ok(()),
                 Ok(Err(err)) => {
-                    if inst.profile.upstream.matrix_url.is_none() {
+                    if inst.profile.upstream.upstream_matrix_server_url.is_none() {
                         Err(err).with_context(|| {
                             format!(
                                 "startup upstream auto-discovery failed for profile '{}'",
@@ -289,7 +290,7 @@ impl ListenerState {
                     }
                 }
                 Err(_) => {
-                    if inst.profile.upstream.matrix_url.is_none() {
+                    if inst.profile.upstream.upstream_matrix_server_url.is_none() {
                         anyhow::bail!(
                             "startup upstream auto-discovery timed out for profile '{}'",
                             inst.profile.name
@@ -355,14 +356,21 @@ fn build_http_client(
         builder = builder.no_gzip().no_brotli().no_deflate();
     }
     if let Some(proxy_url) = &profile.upstream.outbound_proxy {
-        let proxy = reqwest::Proxy::all(proxy_url).with_context(|| {
+        let mut proxy = reqwest::Proxy::all(proxy_url).with_context(|| {
             format!(
                 "invalid outbound proxy '{}' in profile '{}'",
                 redact_proxy_url(proxy_url),
                 profile.name
             )
         })?;
-        builder = builder.proxy(proxy);
+        if !profile.upstream.outbound_no_proxy.is_empty() {
+            let csv = profile.upstream.outbound_no_proxy.join(",");
+            proxy = proxy.no_proxy(reqwest::NoProxy::from_string(&csv));
+        }
+        // Explicitly replace ambient env proxies with the configured proxy + no_proxy rules.
+        builder = builder.no_proxy().proxy(proxy);
+    } else if profile.upstream.outbound_proxy_direct {
+        builder = builder.no_proxy();
     }
 
     builder
@@ -785,12 +793,13 @@ fn handle_listener_summary_info(
         .map(|inst| {
             json!({
                 "name": inst.profile.name,
-                "domains": inst.profile.domains,
+                "route_hosts": inst.profile.route_hosts,
                 "default": inst.profile.is_default,
-                "public_url": inst.profile.public_url.as_ref().map(normalized_base_url),
-                "matrix_proxy_protocol": inst.profile.matrix_proxy_protocol(),
-                "auth_proxy_protocol": inst.profile.auth_proxy_protocol(),
-                "rtc_proxy_protocol": inst.profile.rtc_proxy_protocol(),
+                "matrix_proxy_public_url": inst.profile.matrix_proxy_public_url.as_ref().map(normalized_base_url),
+                "outbound_proxy": inst.profile.upstream.outbound_proxy.as_deref().map(redact_proxy_url),
+                "upstream_matrix_proxy_protocol": inst.profile.matrix_proxy_protocol(),
+                "upstream_auth_proxy_protocol": inst.profile.auth_proxy_protocol(),
+                "upstream_rtc_proxy_protocol": inst.profile.rtc_proxy_protocol(),
                 "client_ip_mode": inst.profile.upstream.client_ip_mode,
             })
         })
@@ -803,6 +812,7 @@ fn handle_listener_summary_info(
             "version": env!("CARGO_PKG_VERSION"),
             "listener": state.plan.listen.to_string(),
             "inbound_proxy_protocol": state.plan.inbound_proxy_protocol,
+            "global_outbound_proxy": state.runtime.server.outbound_proxy.as_deref().map(redact_proxy_url),
             "shared_port": state.vhost.is_shared_port(),
             "seen_client_ip": client.client_ip.to_string(),
             "runtime": runtime_metrics_json(state, metrics),
@@ -824,28 +834,29 @@ fn handle_profile_info(
         "service": "matrix-proxy",
         "version": env!("CARGO_PKG_VERSION"),
         "profile": inst.profile.name,
-        "domains": inst.profile.domains,
+        "route_hosts": inst.profile.route_hosts,
         "inbound_proxy_protocol": state.plan.inbound_proxy_protocol,
         "seen_client_ip": client.client_ip.to_string(),
         "runtime": runtime_metrics_json(state, metrics),
         "public": {
-            "matrix_url": normalized_base_url(&public.matrix_base),
-            "auth_url": normalized_base_url(&public.auth_base),
+            "matrix_proxy_public_url": normalized_base_url(&public.matrix_base),
+            "matrix_proxy_public_auth_url": normalized_base_url(&public.auth_base),
             "rtc_url": public.rtc_base.as_ref().map(normalized_base_url),
             "dual_domain": public.dual_domain,
             "auth_mode": inst.profile.routing.auth_mode,
             "auth_prefix": public.auth_prefix,
         },
         "upstream": {
-            "matrix_url": normalized_base_url(&upstreams.matrix_url),
-            "auth_url": normalized_base_url(upstreams.effective_auth_url()),
+            "upstream_matrix_server_url": normalized_base_url(&upstreams.matrix_url),
+            "upstream_matrix_auth_url": normalized_base_url(upstreams.effective_auth_url()),
             "auth_is_separate": upstreams.auth_is_separate(),
-            "rtc_url": upstreams.rtc_url.as_ref().map(normalized_base_url),
+            "upstream_matrix_rtc_url": upstreams.rtc_url.as_ref().map(normalized_base_url),
             "outbound_proxy": inst.profile.upstream.outbound_proxy.as_deref().map(redact_proxy_url),
+            "outbound_no_proxy": inst.profile.upstream.outbound_no_proxy,
             "client_ip_mode": inst.profile.upstream.client_ip_mode,
-            "matrix_proxy_protocol": inst.profile.matrix_proxy_protocol(),
-            "auth_proxy_protocol": inst.profile.auth_proxy_protocol(),
-            "rtc_proxy_protocol": inst.profile.rtc_proxy_protocol(),
+            "upstream_matrix_proxy_protocol": inst.profile.matrix_proxy_protocol(),
+            "upstream_auth_proxy_protocol": inst.profile.auth_proxy_protocol(),
+            "upstream_rtc_proxy_protocol": inst.profile.rtc_proxy_protocol(),
         },
         "discovery": {
             "rewrite_issuer": inst.profile.discovery.rewrite_issuer,
@@ -871,9 +882,9 @@ async fn handle_auth_metadata(
     };
 
     let matrix_pp = inst.profile.matrix_proxy_protocol();
-    let matrix_host_ov = inst.profile.upstream.matrix_host_header.as_deref();
+    let matrix_host_ov = inst.profile.upstream.upstream_matrix_host_header.as_deref();
     let auth_pp = inst.profile.auth_proxy_protocol();
-    let auth_host_ov = inst.profile.upstream.auth_host_header.as_deref();
+    let auth_host_ov = inst.profile.upstream.upstream_auth_host_header.as_deref();
 
     let mut candidates: Vec<(Url, ProxyProtocol, Option<&str>)> = vec![
         (
@@ -971,7 +982,7 @@ async fn handle_oidc_discovery(
     let auth_base = upstreams.effective_auth_url();
     let target_url = build_upstream_target_url(auth_base, upstream_path);
     let auth_pp = inst.profile.auth_proxy_protocol();
-    let host_ov = inst.profile.upstream.auth_host_header.as_deref();
+    let host_ov = inst.profile.upstream.upstream_auth_host_header.as_deref();
 
     match fetch_metadata_json(inst, client, &target_url, auth_pp, host_ov, req_headers).await {
         Ok((status, body_bytes, content_type)) if status.is_success() => {
@@ -1101,15 +1112,15 @@ async fn forward_request(
     let (outbound_pp, host_override) = match kind {
         ForwardKind::Matrix => (
             inst.profile.matrix_proxy_protocol(),
-            inst.profile.upstream.matrix_host_header.as_deref(),
+            inst.profile.upstream.upstream_matrix_host_header.as_deref(),
         ),
         ForwardKind::Auth => (
             inst.profile.auth_proxy_protocol(),
-            inst.profile.upstream.auth_host_header.as_deref(),
+            inst.profile.upstream.upstream_auth_host_header.as_deref(),
         ),
         ForwardKind::Rtc => (
             inst.profile.rtc_proxy_protocol(),
-            inst.profile.upstream.rtc_host_header.as_deref(),
+            inst.profile.upstream.upstream_rtc_host_header.as_deref(),
         ),
     };
 
@@ -1475,6 +1486,13 @@ fn build_rewritten_response_headers(
 
     for (name, value) in resp_headers {
         if is_hop_by_hop_header(name) || dynamic_resp_hop.contains(name.as_str()) {
+            continue;
+        }
+        if !public.public_is_https()
+            && name
+                .as_str()
+                .eq_ignore_ascii_case("strict-transport-security")
+        {
             continue;
         }
         if do_body_rewrite
