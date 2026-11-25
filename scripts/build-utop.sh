@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Build linux/amd64 image natively on the utop x86_64 node and push to Docker Hub
 # (plus GitHub Container Registry `ghcr.io` when GHCR_PUSH=1 or GHCR_TOKEN/existing login is configured).
-APP_VERSION="${APP_VERSION:-1.4.3}"
+APP_VERSION="${APP_VERSION:-1.5.0}"
 DOCKERHUB_REPO="${DOCKERHUB_REPO:-utoptop/matrix-proxy}"
 IMAGE="${IMAGE:-${DOCKERHUB_REPO}:1.0}"
 EXTRA_TAGS="${EXTRA_TAGS:-${DOCKERHUB_REPO}:latest ${DOCKERHUB_REPO}:${APP_VERSION}}"

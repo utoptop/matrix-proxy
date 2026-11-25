@@ -17,32 +17,10 @@ use tower::ServiceExt;
 struct MockCluster {
     matrix_url: String,
     auth_url: String,
-    rtc_url: String,
 }
 
 async fn spawn_mock_cluster(tag: &'static str) -> MockCluster {
-    // 1. Mock RTC server
-    let rtc_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let rtc_addr = rtc_listener.local_addr().unwrap();
-    let rtc_url = format!("http://{rtc_addr}");
-    let rtc_app = Router::new().route(
-        "/sfu/get",
-        post(move || async move {
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    json!({"url": "wss://livekit.internal", "jwt": format!("token-{tag}")})
-                        .to_string(),
-                ))
-                .unwrap()
-        }),
-    );
-    tokio::spawn(async move {
-        axum::serve(rtc_listener, rtc_app).await.unwrap();
-    });
-
-    // 2. Mock Auth / MAS server
+    // 1. Mock Auth / MAS server
     let auth_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let auth_addr = auth_listener.local_addr().unwrap();
     let auth_url = format!("http://{auth_addr}");
@@ -142,18 +120,18 @@ async fn spawn_mock_cluster(tag: &'static str) -> MockCluster {
         axum::serve(auth_listener, auth_app).await.unwrap();
     });
 
-    // 3. Mock Matrix Homeserver
+    // 2. Mock Matrix Homeserver
     let matrix_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let matrix_addr = matrix_listener.local_addr().unwrap();
     let matrix_url = format!("http://{matrix_addr}");
-    let hs_state = Arc::new((matrix_url.clone(), auth_url.clone(), rtc_url.clone(), tag));
+    let hs_state = Arc::new((matrix_url.clone(), auth_url.clone(), tag));
 
     let matrix_app = Router::new()
         .route(
             "/.well-known/matrix/client",
             get(
-                |State(st): State<Arc<(String, String, String, &'static str)>>| async move {
-                    let (m, a, r, _) = st.as_ref();
+                |State(st): State<Arc<(String, String, &'static str)>>| async move {
+                    let (m, a, _) = st.as_ref();
                     let doc = json!({
                         "m.homeserver": { "base_url": m },
                         "m.identity_server": { "base_url": "https://vector.im" },
@@ -162,7 +140,7 @@ async fn spawn_mock_cluster(tag: &'static str) -> MockCluster {
                             "account": format!("{a}/account")
                         },
                         "org.matrix.msc4143.rtc_foci": [
-                            { "type": "livekit", "livekit_service_url": r }
+                            { "type": "livekit", "livekit_service_url": "https://upstream-rtc.example.org" }
                         ]
                     });
                     Response::builder()
@@ -176,8 +154,8 @@ async fn spawn_mock_cluster(tag: &'static str) -> MockCluster {
         .route(
             "/_matrix/client/versions",
             get(
-                |State(st): State<Arc<(String, String, String, &'static str)>>| async move {
-                    let doc = json!({"versions": ["v1.15"], "cluster": st.3});
+                |State(st): State<Arc<(String, String, &'static str)>>| async move {
+                    let doc = json!({"versions": ["v1.15"], "cluster": st.2});
                     Response::builder()
                         .status(StatusCode::OK)
                         .header(header::CONTENT_TYPE, "application/json")
@@ -189,7 +167,7 @@ async fn spawn_mock_cluster(tag: &'static str) -> MockCluster {
         .route(
             "/_matrix/client/v1/auth_metadata",
             get(
-                |State(st): State<Arc<(String, String, String, &'static str)>>| async move {
+                |State(st): State<Arc<(String, String, &'static str)>>| async move {
                     let a = &st.1;
                     let doc = json!({
                         "issuer": format!("{a}/"),
@@ -213,8 +191,7 @@ async fn spawn_mock_cluster(tag: &'static str) -> MockCluster {
         .route(
             "/_matrix/client/v3/sync",
             get(
-                |State(st): State<Arc<(String, String, String, &'static str)>>,
-                 headers: HeaderMap| async move {
+                |State(st): State<Arc<(String, String, &'static str)>>, headers: HeaderMap| async move {
                     let hdr = |k: &str| {
                         headers
                             .get(k)
@@ -223,7 +200,7 @@ async fn spawn_mock_cluster(tag: &'static str) -> MockCluster {
                             .to_string()
                     };
                     let doc = json!({
-                        "next_batch": format!("s_{}", st.3),
+                        "next_batch": format!("s_{}", st.2),
                         "seen_auth": hdr("authorization"),
                         "seen_xff": hdr("x-forwarded-for"),
                         "seen_x_real_ip": hdr("x-real-ip"),
@@ -240,7 +217,7 @@ async fn spawn_mock_cluster(tag: &'static str) -> MockCluster {
         .route(
             "/_matrix/client/v3/login/sso/redirect",
             get(
-                |State(st): State<Arc<(String, String, String, &'static str)>>| async move {
+                |State(st): State<Arc<(String, String, &'static str)>>| async move {
                     let a = &st.1;
                     Response::builder()
                         .status(StatusCode::FOUND)
@@ -253,8 +230,7 @@ async fn spawn_mock_cluster(tag: &'static str) -> MockCluster {
         .route(
             "/_matrix/client/v3/keys/device_signing/upload",
             post(
-                |State(st): State<Arc<(String, String, String, &'static str)>>,
-                 headers: HeaderMap| async move {
+                |State(st): State<Arc<(String, String, &'static str)>>, headers: HeaderMap| async move {
                     let a = &st.1;
                     let doc = json!({
                         "session": "uia_sess_reset_1",
@@ -317,7 +293,6 @@ async fn spawn_mock_cluster(tag: &'static str) -> MockCluster {
     MockCluster {
         matrix_url,
         auth_url,
-        rtc_url,
     }
 }
 
@@ -349,7 +324,7 @@ async fn single_domain_root_mode_full_matrix_and_auth_flow() {
     cfg.server.expose_info = ExposeInfoMode::Always;
     cfg.upstream.upstream_matrix_server_url = Some(cluster.matrix_url.clone());
     cfg.upstream.upstream_matrix_auth_url = Some(cluster.auth_url.clone());
-    cfg.upstream.upstream_matrix_rtc_url = Some(cluster.rtc_url.clone());
+    cfg.discovery.matrix_rtc_url = Some("https://mrtc.example.org".to_string());
 
     let app = build_single_listener_app(cfg).await;
 
@@ -383,7 +358,7 @@ async fn single_domain_root_mode_full_matrix_and_auth_flow() {
     );
     assert_eq!(
         wk["org.matrix.msc4143.rtc_foci"][0]["livekit_service_url"],
-        "https://proxy.example.com/_rtc"
+        "https://mrtc.example.org"
     );
 
     // 2. auth_metadata v1 & unstable fallback
@@ -541,7 +516,7 @@ async fn single_domain_root_mode_full_matrix_and_auth_flow() {
         .unwrap();
     assert_eq!(body_json(resp).await["size"], 65536);
 
-    // 9. SSO redirect & RTC
+    // 9. SSO redirect
     let resp = app
         .clone()
         .oneshot(
@@ -557,19 +532,6 @@ async fn single_domain_root_mode_full_matrix_and_auth_flow() {
         "https://proxy.example.com/authorize?compat=1"
     );
 
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/_rtc/sfu/get")
-                .body(Body::from("{}"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(body_json(resp).await["jwt"], "token-a");
-
     // 10. Health & info
     let resp = app
         .clone()
@@ -581,7 +543,12 @@ async fn single_domain_root_mode_full_matrix_and_auth_flow() {
         )
         .await
         .unwrap();
-    assert_eq!(body_json(resp).await["upstream"]["auth_is_separate"], true);
+    let info = body_json(resp).await;
+    assert_eq!(info["upstream"]["auth_is_separate"], true);
+    assert_eq!(
+        info["discovery"]["matrix_rtc"],
+        json!(["https://mrtc.example.org"])
+    );
 }
 
 #[tokio::test]
@@ -1160,7 +1127,7 @@ async fn well_known_discovery_follows_301_redirect() {
     let mut cfg = Config::default();
     cfg.server.matrix_proxy_public_url = Some("https://proxy.example.com".to_string());
     cfg.upstream.upstream_matrix_server_name = Some(format!("http://{redir_addr}"));
-    cfg.upstream.upstream_matrix_rtc_url = Some("https://rtc.example.org".to_string());
+    cfg.discovery.matrix_rtc_url = Some("https://mrtc.example.org".to_string());
 
     let app = build_single_listener_app(cfg).await;
 
@@ -1183,7 +1150,7 @@ async fn well_known_discovery_follows_301_redirect() {
     );
     assert_eq!(
         wk["org.matrix.msc4143.rtc_foci"][0]["livekit_service_url"],
-        "https://proxy.example.com/_rtc"
+        "https://mrtc.example.org"
     );
 }
 
@@ -1270,14 +1237,14 @@ async fn http_ip_port_tailscale_mode_without_domain_rewrites_cookies_csp_and_url
         matrix_proxy_public_url = "http://100.64.0.10:8081"
         upstream_matrix_server_url = "{hs_url}"
         upstream_matrix_auth_url = "{auth_url}"
-        upstream_matrix_rtc_url = "https://rtc.example.org"
+        matrix_rtc_url = "https://mrtc.example.org"
         "#
     );
 
     let cfg = Config::from_toml_str(&toml_cfg).unwrap();
     let app = build_single_listener_app(cfg).await;
 
-    // 1. /.well-known/matrix/client exposes http://100.64.0.10:8081
+    // 1. /.well-known/matrix/client exposes http://100.64.0.10:8081 and delegates directly to mrtc (never leaking private Tailscale IP!)
     let resp = app
         .clone()
         .oneshot(
@@ -1294,7 +1261,7 @@ async fn http_ip_port_tailscale_mode_without_domain_rewrites_cookies_csp_and_url
     assert_eq!(wk["m.homeserver"]["base_url"], "http://100.64.0.10:8081");
     assert_eq!(
         wk["org.matrix.msc4143.rtc_foci"][0]["livekit_service_url"],
-        "http://100.64.0.10:8081/_rtc"
+        "https://mrtc.example.org"
     );
 
     // 2. auth_metadata rewrites issuer & endpoints to http://100.64.0.10:8081
@@ -1699,7 +1666,7 @@ async fn auth_proxy_mode_token_only_and_direct_preserve_interactive_login() {
         matrix_proxy_public_url = "https://token-only.example.com"
         upstream_matrix_server_url = "{}"
         upstream_matrix_auth_url = "{}"
-        upstream_matrix_rtc_url = "{}"
+        matrix_rtc_url = "https://mrtc.example.org"
         auth_proxy_mode = "token_only"
 
         [[proxies]]
@@ -1707,21 +1674,16 @@ async fn auth_proxy_mode_token_only_and_direct_preserve_interactive_login() {
         matrix_proxy_public_url = "https://direct-auth.example.com"
         upstream_matrix_server_url = "{}"
         upstream_matrix_auth_url = "{}"
-        upstream_matrix_rtc_url = "{}"
+        matrix_rtc_url = "upstream"
         auth_proxy_mode = "direct"
         "#,
-        cluster.matrix_url,
-        cluster.auth_url,
-        cluster.rtc_url,
-        cluster.matrix_url,
-        cluster.auth_url,
-        cluster.rtc_url,
+        cluster.matrix_url, cluster.auth_url, cluster.matrix_url, cluster.auth_url,
     );
 
     let app = build_single_listener_app(Config::from_toml_str(&toml_cfg).unwrap()).await;
 
     // --- 1. `token_only` mode ---
-    // 1a. /.well-known/matrix/client rewrites homeserver & RTC, preserves official MSC2965 auth
+    // 1a. /.well-known/matrix/client rewrites homeserver, delegates mrtc directly, preserves official MSC2965 auth
     let resp = app
         .clone()
         .oneshot(
@@ -1741,7 +1703,7 @@ async fn auth_proxy_mode_token_only_and_direct_preserve_interactive_login() {
     );
     assert_eq!(
         wk["org.matrix.msc4143.rtc_foci"][0]["livekit_service_url"],
-        "https://token-only.example.com/_rtc"
+        "https://mrtc.example.org"
     );
     assert_eq!(
         wk["org.matrix.msc2965.authentication"]["issuer"],
@@ -2049,5 +2011,126 @@ async fn matrix_401_uia_cross_signing_reset_rewrites_oauth_approval_url() {
             "{}/account/?action=org.matrix.cross_signing_reset",
             cluster.auth_url
         )
+    );
+}
+
+#[tokio::test]
+async fn matrix_rtc_delegation_supports_defaults_upstream_off_and_multi_foci() {
+    let cluster = spawn_mock_cluster("mrtc").await;
+
+    let toml_cfg = format!(
+        r#"
+        [defaults]
+        matrix_rtc_url = "https://global-mrtc.example.org"
+
+        [[proxies]]
+        name = "inherits-default"
+        matrix_proxy_public_url = "https://a-mrtc.example.com"
+        upstream_matrix_server_url = "{}"
+        upstream_matrix_auth_url = "{}"
+
+        [[proxies]]
+        name = "keeps-upstream"
+        matrix_proxy_public_url = "https://b-mrtc.example.com"
+        upstream_matrix_server_url = "{}"
+        upstream_matrix_auth_url = "{}"
+        matrix_rtc_url = "upstream"
+
+        [[proxies]]
+        name = "disables-rtc"
+        matrix_proxy_public_url = "https://c-mrtc.example.com"
+        upstream_matrix_server_url = "{}"
+        upstream_matrix_auth_url = "{}"
+        matrix_rtc_url = "off"
+
+        [[proxies]]
+        name = "multi-foci"
+        matrix_proxy_public_url = "https://d-mrtc.example.com"
+        upstream_matrix_server_url = "{}"
+        upstream_matrix_auth_url = "{}"
+        matrix_rtc_urls = ["https://mrtc-us.example.org", "https://mrtc-eu.example.org/"]
+        "#,
+        cluster.matrix_url,
+        cluster.auth_url,
+        cluster.matrix_url,
+        cluster.auth_url,
+        cluster.matrix_url,
+        cluster.auth_url,
+        cluster.matrix_url,
+        cluster.auth_url,
+    );
+
+    let app = build_single_listener_app(Config::from_toml_str(&toml_cfg).unwrap()).await;
+
+    // 1. Inherits [defaults].matrix_rtc_url directly
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/matrix/client")
+                .header(header::HOST, "a-mrtc.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let wk_a = body_json(resp).await;
+    assert_eq!(
+        wk_a["org.matrix.msc4143.rtc_foci"],
+        json!([{ "type": "livekit", "livekit_service_url": "https://global-mrtc.example.org" }])
+    );
+
+    // 2. Overrides with "upstream" -> preserves upstream's original rtc_foci verbatim
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/matrix/client")
+                .header(header::HOST, "b-mrtc.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let wk_b = body_json(resp).await;
+    assert_eq!(
+        wk_b["org.matrix.msc4143.rtc_foci"],
+        json!([{ "type": "livekit", "livekit_service_url": "https://upstream-rtc.example.org" }])
+    );
+
+    // 3. Overrides with "off" -> removes org.matrix.msc4143.rtc_foci
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/matrix/client")
+                .header(header::HOST, "c-mrtc.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let wk_c = body_json(resp).await;
+    assert!(wk_c.get("org.matrix.msc4143.rtc_foci").is_none());
+
+    // 4. Overrides with multi-foci list
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/matrix/client")
+                .header(header::HOST, "d-mrtc.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let wk_d = body_json(resp).await;
+    assert_eq!(
+        wk_d["org.matrix.msc4143.rtc_foci"],
+        json!([
+            { "type": "livekit", "livekit_service_url": "https://mrtc-us.example.org" },
+            { "type": "livekit", "livekit_service_url": "https://mrtc-eu.example.org" },
+        ])
     );
 }

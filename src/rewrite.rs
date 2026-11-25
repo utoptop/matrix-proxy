@@ -1,6 +1,7 @@
 use crate::client_ip::ClientInfo;
 use crate::config::{
-    AuthProxyMode, AuthRouteMode, ProxyProfile, normalized_base_url, origin_string,
+    AuthProxyMode, AuthRouteMode, MatrixRtcDelegation, ProxyProfile, normalized_base_url,
+    origin_string,
 };
 use crate::discovery::ResolvedUpstreams;
 use http::HeaderMap;
@@ -41,19 +42,13 @@ const AUTH_METADATA_INTERACTIVE_KEYS: &[&str] = &[
 pub struct PublicContext {
     pub matrix_base: Url,
     pub auth_base: Url,
-    pub rtc_base: Option<Url>,
     /// Present only in single-domain `prefix` mode (e.g. `"/_auth"`).
     pub auth_prefix: Option<String>,
     pub dual_domain: bool,
 }
 
 impl PublicContext {
-    pub fn from_request(
-        profile: &ProxyProfile,
-        client: &ClientInfo,
-        headers: &HeaderMap,
-        has_rtc: bool,
-    ) -> Self {
+    pub fn from_request(profile: &ProxyProfile, client: &ClientInfo, headers: &HeaderMap) -> Self {
         let matrix_base = profile
             .matrix_proxy_public_url
             .clone()
@@ -77,21 +72,9 @@ impl PublicContext {
                 }
             };
 
-        let rtc_base = if has_rtc {
-            let base = format!(
-                "{}{}",
-                normalized_base_url(&matrix_base),
-                profile.routing.rtc_prefix
-            );
-            Url::parse(&base).ok()
-        } else {
-            None
-        };
-
         Self {
             matrix_base,
             auth_base,
-            rtc_base,
             auth_prefix,
             dual_domain,
         }
@@ -194,7 +177,6 @@ impl<'a> RewriteEngine<'a> {
         let raw_origin = origin_string(&parsed);
         let matrix_origin = self.upstreams.matrix_origin.as_str();
         let auth_origin = self.upstreams.auth_origin.as_str();
-        let rtc_origin = self.upstreams.rtc_origin.as_deref();
         let wk_hs_origin = self.upstreams.wk_hs_origin.as_deref();
 
         let matches_extra_auth = self
@@ -208,30 +190,20 @@ impl<'a> RewriteEngine<'a> {
             .iter()
             .any(|o| o == &raw_origin);
 
-        let target_base = if let (Some(ro), Some(rtc_base)) = (rtc_origin, &self.public.rtc_base) {
-            if raw_origin == ro {
-                Some(normalized_base_url(rtc_base))
-            } else {
-                None
-            }
+        let target_base = if (raw_origin == auth_origin
+            && (raw_origin != matrix_origin || prefer_auth))
+            || (prefer_auth && (matches_extra_auth || matches_configured_rewrite))
+        {
+            Some(normalized_base_url(&self.public.auth_base))
+        } else if raw_origin == matrix_origin
+            || wk_hs_origin == Some(raw_origin.as_str())
+            || matches_configured_rewrite
+            || matches_extra_auth
+        {
+            Some(normalized_base_url(&self.public.matrix_base))
         } else {
             None
-        }
-        .or_else(|| {
-            if (raw_origin == auth_origin && (raw_origin != matrix_origin || prefer_auth))
-                || (prefer_auth && (matches_extra_auth || matches_configured_rewrite))
-            {
-                Some(normalized_base_url(&self.public.auth_base))
-            } else if raw_origin == matrix_origin
-                || wk_hs_origin == Some(raw_origin.as_str())
-                || matches_configured_rewrite
-                || matches_extra_auth
-            {
-                Some(normalized_base_url(&self.public.matrix_base))
-            } else {
-                None
-            }
-        });
+        };
 
         let Some(base) = target_base else {
             return raw.to_string();
@@ -416,33 +388,26 @@ impl<'a> RewriteEngine<'a> {
             );
         }
 
-        if let Some(rtc_base) = &self.public.rtc_base {
-            let proxy_rtc_url = normalized_base_url(rtc_base);
-            if let Some(Value::Array(mut foci)) = root.remove("org.matrix.msc4143.rtc_foci") {
-                for focus in &mut foci {
-                    if let Some(obj) = focus.as_object_mut()
-                        && let Some(Value::String(url)) = obj.get("livekit_service_url")
-                    {
-                        let rewritten = self.rewrite_url_str(url, false);
-                        let final_url = if rewritten == *url {
-                            proxy_rtc_url.clone()
-                        } else {
-                            rewritten
-                        };
-                        obj.insert("livekit_service_url".to_string(), Value::String(final_url));
-                    }
-                }
+        match &self.profile.matrix_rtc {
+            MatrixRtcDelegation::Upstream => {
+                // Keep upstream `.well-known/matrix/client` `org.matrix.msc4143.rtc_foci` verbatim.
+            }
+            MatrixRtcDelegation::Disabled => {
+                root.remove("org.matrix.msc4143.rtc_foci");
+            }
+            MatrixRtcDelegation::Delegate(urls) => {
+                let foci: Vec<Value> = urls
+                    .iter()
+                    .map(|url| {
+                        json!({
+                            "type": "livekit",
+                            "livekit_service_url": url
+                        })
+                    })
+                    .collect();
                 root.insert(
                     "org.matrix.msc4143.rtc_foci".to_string(),
                     Value::Array(foci),
-                );
-            } else {
-                root.insert(
-                    "org.matrix.msc4143.rtc_foci".to_string(),
-                    json!([{
-                        "type": "livekit",
-                        "livekit_service_url": proxy_rtc_url
-                    }]),
                 );
             }
         }

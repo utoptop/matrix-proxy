@@ -34,7 +34,7 @@ pub enum AuthRouteMode {
 ///   on the official upstream Auth server so multi-hop third-party IdPs (Mozilla Accounts, Google, Apple, Passkey) work with zero `redirect_uri`/anti-phishing
 ///   issues during initial login, while STILL proxying background machine-to-machine endpoints (`token_endpoint`, `revocation_endpoint`, `registration_endpoint`,
 ///   `jwks_uri`) for 24/7 uninterrupted token refresh via `matrix-proxy`.
-/// - `direct`: proxy only Matrix Client-Server & RTC; return all Auth metadata and `.well-known` auth fields untouched.
+/// - `direct`: proxy only Matrix Client-Server; return all Auth metadata and `.well-known` auth fields untouched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthProxyMode {
@@ -44,6 +44,40 @@ pub enum AuthProxyMode {
     TokenOnly,
     #[serde(alias = "passthrough", alias = "off")]
     Direct,
+}
+
+/// Direct MatrixRTC (MSC4143 / LiveKit JWT `mrtc`) delegation policy for `/.well-known/matrix/client`.
+/// MatrixRTC is delegated directly to reachable `lk-jwt-service` URLs rather than HTTP-proxied,
+/// because WebRTC SFU WebSocket/UDP media cannot be proxied through an HTTP reverse proxy and
+/// advertising a proxy path would leak into federated room `m.call.member` state events.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[serde(untagged)]
+pub enum MatrixRtcDelegation {
+    /// Preserve the upstream homeserver's `.well-known/matrix/client` `org.matrix.msc4143.rtc_foci` verbatim.
+    #[default]
+    Upstream,
+    /// Delegate directly to one or more MatrixRTC / LiveKit JWT service URLs.
+    Delegate(Vec<String>),
+    /// Omit `org.matrix.msc4143.rtc_foci` from `/.well-known/matrix/client`.
+    Disabled,
+}
+
+impl MatrixRtcDelegation {
+    pub fn summary(&self) -> String {
+        match self {
+            Self::Upstream => "upstream".to_string(),
+            Self::Disabled => "off".to_string(),
+            Self::Delegate(urls) => urls.join(","),
+        }
+    }
+
+    pub fn info_json(&self) -> serde_json::Value {
+        match self {
+            Self::Upstream => serde_json::json!("upstream"),
+            Self::Disabled => serde_json::json!("off"),
+            Self::Delegate(urls) => serde_json::json!(urls),
+        }
+    }
 }
 
 impl AuthProxyMode {
@@ -184,8 +218,6 @@ pub struct ProxyDefaultsConfig {
     pub upstream_matrix_proxy_protocol: Option<ProxyProtocol>,
     #[serde(alias = "auth_proxy_protocol")]
     pub upstream_auth_proxy_protocol: Option<ProxyProtocol>,
-    #[serde(alias = "rtc_proxy_protocol")]
-    pub upstream_rtc_proxy_protocol: Option<ProxyProtocol>,
     #[serde(alias = "rewrite_origins")]
     pub upstream_rewrite_origins: Option<Vec<String>>,
     pub connect_timeout_secs: Option<u64>,
@@ -194,12 +226,24 @@ pub struct ProxyDefaultsConfig {
 
     pub auth_mode: Option<AuthRouteMode>,
     pub auth_prefix: Option<String>,
-    pub rtc_prefix: Option<String>,
     pub proxy_prefix: Option<String>,
     pub matrix_extra_prefixes: Option<Vec<String>>,
     pub auth_matrix_prefixes: Option<Vec<String>>,
 
     pub auth_proxy_mode: Option<AuthProxyMode>,
+    /// Delegated MatrixRTC (`mrtc` / LiveKit JWT) service URL written directly to `/.well-known/matrix/client`
+    /// (`"https://..."` | `"upstream"` / `""` | `"off"`).
+    #[serde(
+        alias = "mrtc_url",
+        alias = "rtc_foci_url",
+        alias = "livekit_service_url",
+        alias = "upstream_matrix_rtc_url",
+        alias = "rtc_url"
+    )]
+    pub matrix_rtc_url: Option<String>,
+    /// Optional list of delegated MatrixRTC (`mrtc` / LiveKit JWT) service URLs (takes precedence over `matrix_rtc_url`).
+    #[serde(alias = "mrtc_urls", alias = "rtc_foci_urls")]
+    pub matrix_rtc_urls: Option<Vec<String>>,
     pub rewrite_issuer: Option<bool>,
     pub force_msc2965_well_known: Option<bool>,
     pub rewrite_auth_body: Option<bool>,
@@ -314,14 +358,18 @@ pub struct UpstreamConfig {
     pub upstream_matrix_auth_url: Option<String>,
     #[serde(alias = "server_name")]
     pub upstream_matrix_server_name: Option<String>,
-    #[serde(alias = "rtc_url")]
+    /// Deprecated v1.0-v1.4 location; folded into `discovery.matrix_rtc_url` as direct MatrixRTC delegation.
+    #[serde(
+        alias = "rtc_url",
+        alias = "matrix_rtc_url",
+        alias = "mrtc_url",
+        skip_serializing
+    )]
     pub upstream_matrix_rtc_url: Option<String>,
     #[serde(alias = "matrix_host_header")]
     pub upstream_matrix_host_header: Option<String>,
     #[serde(alias = "auth_host_header")]
     pub upstream_auth_host_header: Option<String>,
-    #[serde(alias = "rtc_host_header")]
-    pub upstream_rtc_host_header: Option<String>,
     #[serde(alias = "rewrite_origins")]
     pub upstream_rewrite_origins: Vec<String>,
     pub outbound_proxy: Option<String>,
@@ -339,9 +387,6 @@ pub struct UpstreamConfig {
     /// Optional per-service outbound PROXY Protocol override for the Matrix auth server (MAS/OIDC).
     #[serde(alias = "auth_proxy_protocol")]
     pub upstream_auth_proxy_protocol: Option<ProxyProtocol>,
-    /// Optional per-service outbound PROXY Protocol override for the LiveKit RTC JWT service.
-    #[serde(alias = "rtc_proxy_protocol")]
-    pub upstream_rtc_proxy_protocol: Option<ProxyProtocol>,
     /// Deprecated v1.1 aliases for `upstream_*_proxy_protocol = "v2"`.
     #[serde(skip_serializing)]
     pub send_proxy_v2: Option<bool>,
@@ -349,8 +394,6 @@ pub struct UpstreamConfig {
     pub matrix_send_proxy_v2: Option<bool>,
     #[serde(skip_serializing)]
     pub auth_send_proxy_v2: Option<bool>,
-    #[serde(skip_serializing)]
-    pub rtc_send_proxy_v2: Option<bool>,
     pub connect_timeout_secs: u64,
     pub request_timeout_secs: u64,
     pub danger_accept_invalid_certs: bool,
@@ -365,7 +408,6 @@ impl Default for UpstreamConfig {
             upstream_matrix_rtc_url: None,
             upstream_matrix_host_header: None,
             upstream_auth_host_header: None,
-            upstream_rtc_host_header: None,
             upstream_rewrite_origins: Vec::new(),
             outbound_proxy: None,
             outbound_no_proxy: Vec::new(),
@@ -374,11 +416,9 @@ impl Default for UpstreamConfig {
             upstream_proxy_protocol: ProxyProtocol::Off,
             upstream_matrix_proxy_protocol: None,
             upstream_auth_proxy_protocol: None,
-            upstream_rtc_proxy_protocol: None,
             send_proxy_v2: None,
             matrix_send_proxy_v2: None,
             auth_send_proxy_v2: None,
-            rtc_send_proxy_v2: None,
             connect_timeout_secs: 15,
             request_timeout_secs: 0,
             danger_accept_invalid_certs: false,
@@ -391,7 +431,6 @@ impl Default for UpstreamConfig {
 pub struct RoutingConfig {
     pub auth_mode: AuthRouteMode,
     pub auth_prefix: String,
-    pub rtc_prefix: String,
     pub proxy_prefix: String,
     pub matrix_extra_prefixes: Vec<String>,
     pub auth_matrix_prefixes: Vec<String>,
@@ -402,7 +441,6 @@ impl Default for RoutingConfig {
         Self {
             auth_mode: AuthRouteMode::Root,
             auth_prefix: "/_auth".to_string(),
-            rtc_prefix: "/_rtc".to_string(),
             proxy_prefix: "/_proxy".to_string(),
             matrix_extra_prefixes: Vec::new(),
             auth_matrix_prefixes: Vec::new(),
@@ -414,6 +452,17 @@ impl Default for RoutingConfig {
 #[serde(default)]
 pub struct DiscoveryConfig {
     pub auth_proxy_mode: AuthProxyMode,
+    /// Delegated MatrixRTC (`mrtc` / LiveKit JWT) service URL advertised directly in `/.well-known/matrix/client`
+    /// (`"https://..."` | `"upstream"` / `""` | `"off"`).
+    #[serde(
+        alias = "mrtc_url",
+        alias = "rtc_foci_url",
+        alias = "livekit_service_url"
+    )]
+    pub matrix_rtc_url: Option<String>,
+    /// Optional list of delegated MatrixRTC (`mrtc` / LiveKit JWT) service URLs.
+    #[serde(alias = "mrtc_urls", alias = "rtc_foci_urls")]
+    pub matrix_rtc_urls: Vec<String>,
     pub rewrite_issuer: bool,
     pub force_msc2965_well_known: bool,
     pub rewrite_auth_body: bool,
@@ -426,6 +475,8 @@ impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
             auth_proxy_mode: AuthProxyMode::Full,
+            matrix_rtc_url: None,
+            matrix_rtc_urls: Vec::new(),
             rewrite_issuer: true,
             force_msc2965_well_known: false,
             rewrite_auth_body: true,
@@ -469,19 +520,15 @@ pub struct ProxyProfileInput {
     pub upstream_matrix_auth_url: Option<String>,
     #[serde(alias = "server_name")]
     pub upstream_matrix_server_name: Option<String>,
-    #[serde(alias = "rtc_url")]
-    pub upstream_matrix_rtc_url: Option<String>,
     #[serde(alias = "matrix_host_header")]
     pub upstream_matrix_host_header: Option<String>,
     #[serde(alias = "auth_host_header")]
     pub upstream_auth_host_header: Option<String>,
-    #[serde(alias = "rtc_host_header")]
-    pub upstream_rtc_host_header: Option<String>,
     #[serde(alias = "rewrite_origins")]
     pub upstream_rewrite_origins: Option<Vec<String>>,
-    /// Optional per-profile outbound proxy override (`http://`, `https://`, `socks5://`, `socks5h://`, or `"direct"` to bypass global `[server].outbound_proxy`).
+    /// Optional per-profile outbound proxy override (`http://`, `https://`, `socks5://`, `socks5h://`, or `"direct"` to bypass global `[defaults].outbound_proxy`).
     pub outbound_proxy: Option<String>,
-    /// Optional per-profile `outbound_no_proxy` override (inherits `[server].outbound_no_proxy` when omitted).
+    /// Optional per-profile `outbound_no_proxy` override (inherits `[defaults].outbound_no_proxy` when omitted).
     pub outbound_no_proxy: Option<Vec<String>>,
     pub client_ip_mode: Option<ClientIpMode>,
     #[serde(alias = "proxy_protocol")]
@@ -490,28 +537,36 @@ pub struct ProxyProfileInput {
     pub upstream_matrix_proxy_protocol: Option<ProxyProtocol>,
     #[serde(alias = "auth_proxy_protocol")]
     pub upstream_auth_proxy_protocol: Option<ProxyProtocol>,
-    #[serde(alias = "rtc_proxy_protocol")]
-    pub upstream_rtc_proxy_protocol: Option<ProxyProtocol>,
     #[serde(skip_serializing)]
     pub send_proxy_v2: Option<bool>,
     #[serde(skip_serializing)]
     pub matrix_send_proxy_v2: Option<bool>,
     #[serde(skip_serializing)]
     pub auth_send_proxy_v2: Option<bool>,
-    #[serde(skip_serializing)]
-    pub rtc_send_proxy_v2: Option<bool>,
     pub connect_timeout_secs: Option<u64>,
     pub request_timeout_secs: Option<u64>,
     pub danger_accept_invalid_certs: Option<bool>,
 
     pub auth_mode: Option<AuthRouteMode>,
     pub auth_prefix: Option<String>,
-    pub rtc_prefix: Option<String>,
     pub proxy_prefix: Option<String>,
     pub matrix_extra_prefixes: Option<Vec<String>>,
     pub auth_matrix_prefixes: Option<Vec<String>>,
 
     pub auth_proxy_mode: Option<AuthProxyMode>,
+    /// Optional per-node MatrixRTC (`mrtc` / LiveKit JWT) delegation URL written directly into `/.well-known/matrix/client`
+    /// (`"https://..."` | `"upstream"` / `""` | `"off"`). Overrides `[defaults].matrix_rtc_url`.
+    #[serde(
+        alias = "mrtc_url",
+        alias = "rtc_foci_url",
+        alias = "livekit_service_url",
+        alias = "upstream_matrix_rtc_url",
+        alias = "rtc_url"
+    )]
+    pub matrix_rtc_url: Option<String>,
+    /// Optional per-node list of delegated MatrixRTC (`mrtc` / LiveKit JWT) URLs.
+    #[serde(alias = "mrtc_urls", alias = "rtc_foci_urls")]
+    pub matrix_rtc_urls: Option<Vec<String>>,
     pub rewrite_issuer: Option<bool>,
     pub force_msc2965_well_known: Option<bool>,
     pub rewrite_auth_body: Option<bool>,
@@ -539,6 +594,8 @@ pub struct ProxyProfile {
     pub upstream: UpstreamConfig,
     pub routing: RoutingConfig,
     pub discovery: DiscoveryConfig,
+    /// Resolved direct MatrixRTC delegation policy advertised in `/.well-known/matrix/client`.
+    pub matrix_rtc: MatrixRtcDelegation,
     pub parsed_rewrite_origins: Vec<String>,
 }
 
@@ -565,16 +622,8 @@ impl ProxyProfile {
             .unwrap_or(self.upstream.upstream_proxy_protocol)
     }
 
-    pub fn rtc_proxy_protocol(&self) -> ProxyProtocol {
-        self.upstream
-            .upstream_rtc_proxy_protocol
-            .unwrap_or(self.upstream.upstream_proxy_protocol)
-    }
-
     pub fn uses_outbound_proxy_protocol(&self) -> bool {
-        self.matrix_proxy_protocol().is_enabled()
-            || self.auth_proxy_protocol().is_enabled()
-            || self.rtc_proxy_protocol().is_enabled()
+        self.matrix_proxy_protocol().is_enabled() || self.auth_proxy_protocol().is_enabled()
     }
 }
 
@@ -732,9 +781,6 @@ impl Config {
         if let Some(v) = d.upstream_auth_proxy_protocol {
             self.upstream.upstream_auth_proxy_protocol = Some(v);
         }
-        if let Some(v) = d.upstream_rtc_proxy_protocol {
-            self.upstream.upstream_rtc_proxy_protocol = Some(v);
-        }
         if let Some(v) = d.upstream_rewrite_origins {
             self.upstream.upstream_rewrite_origins = v;
         }
@@ -753,9 +799,6 @@ impl Config {
         if let Some(v) = d.auth_prefix {
             self.routing.auth_prefix = v;
         }
-        if let Some(v) = d.rtc_prefix {
-            self.routing.rtc_prefix = v;
-        }
         if let Some(v) = d.proxy_prefix {
             self.routing.proxy_prefix = v;
         }
@@ -767,6 +810,12 @@ impl Config {
         }
         if let Some(v) = d.auth_proxy_mode {
             self.discovery.auth_proxy_mode = v;
+        }
+        if let Some(v) = d.matrix_rtc_url {
+            self.discovery.matrix_rtc_url = Some(v);
+        }
+        if let Some(v) = d.matrix_rtc_urls {
+            self.discovery.matrix_rtc_urls = v;
         }
         if let Some(v) = d.rewrite_issuer {
             self.discovery.rewrite_issuer = v;
@@ -908,10 +957,15 @@ impl Config {
         {
             self.upstream.upstream_matrix_server_name = Some(v);
         }
-        if let Some(v) =
-            env_non_empty("UPSTREAM_MATRIX_RTC_URL").or_else(|| env_non_empty("RTC_UPSTREAM"))
+        if let Some(v) = env_non_empty("MATRIX_RTC_URL")
+            .or_else(|| env_non_empty("MRTC_URL"))
+            .or_else(|| env_non_empty("UPSTREAM_MATRIX_RTC_URL"))
+            .or_else(|| env_non_empty("RTC_UPSTREAM"))
         {
-            self.upstream.upstream_matrix_rtc_url = Some(v);
+            self.discovery.matrix_rtc_url = Some(v);
+        }
+        if let Some(v) = env_non_empty("MATRIX_RTC_URLS").or_else(|| env_non_empty("MRTC_URLS")) {
+            self.discovery.matrix_rtc_urls = split_csv(&v);
         }
         if let Some(v) = env_non_empty("UPSTREAM_MATRIX_HOST_HEADER")
             .or_else(|| env_non_empty("MATRIX_HOST_HEADER"))
@@ -922,11 +976,6 @@ impl Config {
             env_non_empty("UPSTREAM_AUTH_HOST_HEADER").or_else(|| env_non_empty("AUTH_HOST_HEADER"))
         {
             self.upstream.upstream_auth_host_header = Some(v);
-        }
-        if let Some(v) =
-            env_non_empty("UPSTREAM_RTC_HOST_HEADER").or_else(|| env_non_empty("RTC_HOST_HEADER"))
-        {
-            self.upstream.upstream_rtc_host_header = Some(v);
         }
         if let Some(v) =
             env_non_empty("UPSTREAM_REWRITE_ORIGINS").or_else(|| env_non_empty("REWRITE_ORIGINS"))
@@ -960,13 +1009,6 @@ impl Config {
         } else if let Some(v) = env_bool("AUTH_SEND_PROXY_V2")? {
             self.upstream.upstream_auth_proxy_protocol = Some(bool_to_ppv2(v));
         }
-        if let Some(v) = env_non_empty("UPSTREAM_RTC_PROXY_PROTOCOL")
-            .or_else(|| env_non_empty("RTC_PROXY_PROTOCOL"))
-        {
-            self.upstream.upstream_rtc_proxy_protocol = Some(parse_proxy_protocol(&v)?);
-        } else if let Some(v) = env_bool("RTC_SEND_PROXY_V2")? {
-            self.upstream.upstream_rtc_proxy_protocol = Some(bool_to_ppv2(v));
-        }
         if let Some(v) = env_parse::<u64>("CONNECT_TIMEOUT_SECS")? {
             self.upstream.connect_timeout_secs = v;
         }
@@ -986,9 +1028,6 @@ impl Config {
         }
         if let Some(v) = env_non_empty("AUTH_PREFIX") {
             self.routing.auth_prefix = v;
-        }
-        if let Some(v) = env_non_empty("RTC_PREFIX") {
-            self.routing.rtc_prefix = v;
         }
         if let Some(v) = env_non_empty("PROXY_PREFIX") {
             self.routing.proxy_prefix = v;
@@ -1039,13 +1078,20 @@ impl Config {
         normalize_http_url_opt(&mut self.upstream.upstream_matrix_server_url);
         normalize_http_url_opt(&mut self.upstream.upstream_matrix_auth_url);
         normalize_opt_string(&mut self.upstream.upstream_matrix_server_name);
-        normalize_http_url_opt(&mut self.upstream.upstream_matrix_rtc_url);
+        normalize_opt_string(&mut self.upstream.upstream_matrix_rtc_url);
         normalize_opt_string(&mut self.upstream.upstream_matrix_host_header);
         normalize_opt_string(&mut self.upstream.upstream_auth_host_header);
-        normalize_opt_string(&mut self.upstream.upstream_rtc_host_header);
         normalize_opt_string(&mut self.upstream.outbound_proxy);
         self.upstream.outbound_no_proxy = normalize_no_proxy_list(&self.upstream.outbound_no_proxy);
+        normalize_opt_string(&mut self.discovery.matrix_rtc_url);
         normalize_http_url_opt(&mut self.discovery.identity_server_url);
+
+        if self.discovery.matrix_rtc_url.is_none()
+            && self.discovery.matrix_rtc_urls.is_empty()
+            && self.upstream.upstream_matrix_rtc_url.is_some()
+        {
+            self.discovery.matrix_rtc_url = self.upstream.upstream_matrix_rtc_url.clone();
+        }
 
         if self.server.tls_cert_path.is_some() ^ self.server.tls_key_path.is_some() {
             bail!(
@@ -1057,7 +1103,6 @@ impl Config {
 
         self.routing.auth_prefix =
             normalize_prefix("routing.auth_prefix", &self.routing.auth_prefix)?;
-        self.routing.rtc_prefix = normalize_prefix("routing.rtc_prefix", &self.routing.rtc_prefix)?;
         self.routing.proxy_prefix =
             normalize_prefix("routing.proxy_prefix", &self.routing.proxy_prefix)?;
 
@@ -1164,11 +1209,6 @@ impl Config {
                 .or_else(|| raw.auth_send_proxy_v2.map(bool_to_ppv2))
                 .or(self.upstream.upstream_auth_proxy_protocol)
                 .or_else(|| self.upstream.auth_send_proxy_v2.map(bool_to_ppv2));
-            let upstream_rtc_proxy_protocol = raw
-                .upstream_rtc_proxy_protocol
-                .or_else(|| raw.rtc_send_proxy_v2.map(bool_to_ppv2))
-                .or(self.upstream.upstream_rtc_proxy_protocol)
-                .or_else(|| self.upstream.rtc_send_proxy_v2.map(bool_to_ppv2));
 
             let effective_outbound_proxy = opt_trim(raw.outbound_proxy.as_deref())
                 .or_else(|| opt_trim(self.upstream.outbound_proxy.as_deref()))
@@ -1190,10 +1230,9 @@ impl Config {
                 upstream_matrix_server_url: raw.upstream_matrix_server_url.clone(),
                 upstream_matrix_auth_url: raw.upstream_matrix_auth_url.clone(),
                 upstream_matrix_server_name: raw.upstream_matrix_server_name.clone(),
-                upstream_matrix_rtc_url: raw.upstream_matrix_rtc_url.clone(),
+                upstream_matrix_rtc_url: None,
                 upstream_matrix_host_header: raw.upstream_matrix_host_header.clone(),
                 upstream_auth_host_header: raw.upstream_auth_host_header.clone(),
-                upstream_rtc_host_header: raw.upstream_rtc_host_header.clone(),
                 upstream_rewrite_origins: effective_rewrite_origins,
                 outbound_proxy: effective_outbound_proxy,
                 outbound_no_proxy: effective_outbound_no_proxy,
@@ -1202,11 +1241,9 @@ impl Config {
                 upstream_proxy_protocol: default_outbound_pp,
                 upstream_matrix_proxy_protocol,
                 upstream_auth_proxy_protocol,
-                upstream_rtc_proxy_protocol,
                 send_proxy_v2: None,
                 matrix_send_proxy_v2: None,
                 auth_send_proxy_v2: None,
-                rtc_send_proxy_v2: None,
                 connect_timeout_secs: raw
                     .connect_timeout_secs
                     .unwrap_or(self.upstream.connect_timeout_secs),
@@ -1227,12 +1264,6 @@ impl Config {
                     raw.auth_prefix
                         .as_deref()
                         .unwrap_or(&self.routing.auth_prefix),
-                )?,
-                rtc_prefix: normalize_prefix(
-                    &format!("proxies[{name}].rtc_prefix"),
-                    raw.rtc_prefix
-                        .as_deref()
-                        .unwrap_or(&self.routing.rtc_prefix),
                 )?,
                 proxy_prefix: normalize_prefix(
                     &format!("proxies[{name}].proxy_prefix"),
@@ -1263,10 +1294,26 @@ impl Config {
             normalize_http_url_opt(&mut id_url);
             let _ = parse_http_url_opt(&format!("proxies[{name}].identity_server_url"), &id_url)?;
 
+            let matrix_rtc = resolve_matrix_rtc_delegation(
+                &format!("proxies[{name}]"),
+                raw.matrix_rtc_url.as_deref(),
+                raw.matrix_rtc_urls.as_deref(),
+                self.discovery.matrix_rtc_url.as_deref(),
+                &self.discovery.matrix_rtc_urls,
+            )?;
+
             let discovery = DiscoveryConfig {
                 auth_proxy_mode: raw
                     .auth_proxy_mode
                     .unwrap_or(self.discovery.auth_proxy_mode),
+                matrix_rtc_url: raw
+                    .matrix_rtc_url
+                    .clone()
+                    .or_else(|| self.discovery.matrix_rtc_url.clone()),
+                matrix_rtc_urls: raw
+                    .matrix_rtc_urls
+                    .clone()
+                    .unwrap_or_else(|| self.discovery.matrix_rtc_urls.clone()),
                 rewrite_issuer: raw.rewrite_issuer.unwrap_or(self.discovery.rewrite_issuer),
                 force_msc2965_well_known: raw
                     .force_msc2965_well_known
@@ -1300,6 +1347,7 @@ impl Config {
                 upstream,
                 routing,
                 discovery,
+                matrix_rtc,
                 parsed_rewrite_origins,
             });
         }
@@ -1340,13 +1388,20 @@ impl Config {
         upstream.upstream_auth_proxy_protocol = upstream
             .upstream_auth_proxy_protocol
             .or_else(|| upstream.auth_send_proxy_v2.map(bool_to_ppv2));
-        upstream.upstream_rtc_proxy_protocol = upstream
-            .upstream_rtc_proxy_protocol
-            .or_else(|| upstream.rtc_send_proxy_v2.map(bool_to_ppv2));
         let parsed_rewrite_origins = validate_upstream("upstream", &mut upstream)?;
         let _ = parse_http_url_opt(
             "discovery.identity_server_url",
             &self.discovery.identity_server_url,
+        )?;
+        let matrix_rtc = resolve_matrix_rtc_delegation(
+            "discovery",
+            None,
+            None,
+            self.discovery
+                .matrix_rtc_url
+                .as_deref()
+                .or(upstream.upstream_matrix_rtc_url.as_deref()),
+            &self.discovery.matrix_rtc_urls,
         )?;
 
         let route_hosts = collect_profile_route_hosts(
@@ -1368,6 +1423,7 @@ impl Config {
             upstream,
             routing: self.routing.clone(),
             discovery: self.discovery.clone(),
+            matrix_rtc,
             parsed_rewrite_origins,
         })
     }
@@ -1472,14 +1528,76 @@ fn group_into_listeners(profiles: Vec<ProxyProfile>) -> Result<Vec<ListenerPlan>
     Ok(listeners)
 }
 
+fn resolve_matrix_rtc_delegation(
+    prefix: &str,
+    profile_url: Option<&str>,
+    profile_urls: Option<&[String]>,
+    default_url: Option<&str>,
+    default_urls: &[String],
+) -> Result<MatrixRtcDelegation> {
+    if let Some(list) = profile_urls {
+        return parse_matrix_rtc_url_list(&format!("{prefix}.matrix_rtc_urls"), list);
+    }
+    if let Some(raw) = profile_url {
+        return parse_matrix_rtc_single(&format!("{prefix}.matrix_rtc_url"), raw);
+    }
+    if !default_urls.is_empty() {
+        return parse_matrix_rtc_url_list("defaults.matrix_rtc_urls", default_urls);
+    }
+    if let Some(raw) = default_url {
+        return parse_matrix_rtc_single("defaults.matrix_rtc_url", raw);
+    }
+    Ok(MatrixRtcDelegation::Upstream)
+}
+
+fn parse_matrix_rtc_single(label: &str, raw: &str) -> Result<MatrixRtcDelegation> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("upstream") {
+        return Ok(MatrixRtcDelegation::Upstream);
+    }
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "off" | "none" | "disabled"
+    ) {
+        return Ok(MatrixRtcDelegation::Disabled);
+    }
+    let items: Vec<String> = trimmed
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    parse_matrix_rtc_url_list(label, &items)
+}
+
+fn parse_matrix_rtc_url_list(label: &str, items: &[String]) -> Result<MatrixRtcDelegation> {
+    if items.is_empty() {
+        return Ok(MatrixRtcDelegation::Upstream);
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for raw in items {
+        let mut s = Some(raw.clone());
+        normalize_http_url_opt(&mut s);
+        if let Some(parsed) = parse_http_url_opt(label, &s)? {
+            let norm = normalized_base_url(&parsed);
+            if !out.contains(&norm) {
+                out.push(norm);
+            }
+        }
+    }
+    if out.is_empty() {
+        Ok(MatrixRtcDelegation::Upstream)
+    } else {
+        Ok(MatrixRtcDelegation::Delegate(out))
+    }
+}
+
 fn validate_upstream(prefix: &str, upstream: &mut UpstreamConfig) -> Result<Vec<String>> {
     normalize_http_url_opt(&mut upstream.upstream_matrix_server_url);
     normalize_http_url_opt(&mut upstream.upstream_matrix_auth_url);
     normalize_opt_string(&mut upstream.upstream_matrix_server_name);
-    normalize_http_url_opt(&mut upstream.upstream_matrix_rtc_url);
     normalize_opt_string(&mut upstream.upstream_matrix_host_header);
     normalize_opt_string(&mut upstream.upstream_auth_host_header);
-    normalize_opt_string(&mut upstream.upstream_rtc_host_header);
     normalize_opt_string(&mut upstream.outbound_proxy);
     upstream.outbound_no_proxy = normalize_no_proxy_list(&upstream.outbound_no_proxy);
 
@@ -1498,10 +1616,6 @@ fn validate_upstream(prefix: &str, upstream: &mut UpstreamConfig) -> Result<Vec<
     let _ = parse_http_url_opt(
         &format!("{prefix}.upstream_matrix_auth_url"),
         &upstream.upstream_matrix_auth_url,
-    )?;
-    let _ = parse_http_url_opt(
-        &format!("{prefix}.upstream_matrix_rtc_url"),
-        &upstream.upstream_matrix_rtc_url,
     )?;
 
     if let Some(proxy) = upstream.outbound_proxy.clone() {
@@ -1919,9 +2033,10 @@ mod tests {
             cfg.upstream.upstream_matrix_auth_url.as_deref(),
             Some("https://auth.example.org")
         );
+        let rt = cfg.into_runtime().unwrap();
         assert_eq!(
-            cfg.upstream.upstream_matrix_rtc_url.as_deref(),
-            Some("https://rtc.example.org")
+            rt.listeners[0].profiles[0].matrix_rtc,
+            MatrixRtcDelegation::Delegate(vec!["https://rtc.example.org".to_string()])
         );
 
         let ts_cfg = Config::from_toml_str(
@@ -2123,8 +2238,8 @@ mod tests {
             Some("https://auth.example.org:8443")
         );
         assert_eq!(
-            p.upstream.upstream_matrix_rtc_url.as_deref(),
-            Some("https://rtc.example.org")
+            p.matrix_rtc,
+            MatrixRtcDelegation::Delegate(vec!["https://rtc.example.org".to_string()])
         );
         assert_eq!(
             p.upstream.upstream_matrix_server_name.as_deref(),

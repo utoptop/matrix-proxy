@@ -162,11 +162,6 @@ fn warn_if_pp_on_standard_https_port(profile: &ProxyProfile) {
             profile.auth_proxy_protocol(),
             profile.upstream.upstream_matrix_auth_url.as_deref(),
         ),
-        (
-            "upstream_matrix_rtc_url",
-            profile.rtc_proxy_protocol(),
-            profile.upstream.upstream_matrix_rtc_url.as_deref(),
-        ),
     ] {
         if proto.is_enabled()
             && let Some(raw) = raw_url
@@ -495,12 +490,7 @@ async fn handle_request(
         if let Some(inst) = state.vhost.resolve(req_host.as_deref())
             && let Ok(upstreams) = inst.discovery.get_upstreams().await
         {
-            let public = PublicContext::from_request(
-                &inst.profile,
-                &client,
-                req.headers(),
-                upstreams.rtc_url.is_some(),
-            );
+            let public = PublicContext::from_request(&inst.profile, &client, req.headers());
             return handle_profile_info(&state, &live.metrics, &inst, &public, &upstreams, &client);
         }
         return handle_listener_summary_info(&state, &live.metrics, &client);
@@ -596,16 +586,10 @@ async fn handle_request(
         }
     };
 
-    let public = PublicContext::from_request(
-        &inst.profile,
-        &client,
-        req.headers(),
-        upstreams.rtc_url.is_some(),
-    );
+    let public = PublicContext::from_request(&inst.profile, &client, req.headers());
     let target = classify_request(
         &inst.profile,
         &public,
-        &upstreams,
         &client,
         req.headers(),
         req.uri().path(),
@@ -728,34 +712,6 @@ async fn handle_request(
             )
             .await
         }
-
-        RouteTarget::Rtc {
-            upstream_path_and_query,
-        } => {
-            if method == Method::OPTIONS {
-                return cors_preflight_response(req.headers(), false);
-            }
-            let Some(rtc_base) = &upstreams.rtc_url else {
-                return json_error(
-                    StatusCode::NOT_FOUND,
-                    "M_NOT_FOUND",
-                    "RTC upstream not configured",
-                );
-            };
-            let target_url = build_upstream_target_url(rtc_base, &upstream_path_and_query);
-            forward_request(
-                &state,
-                &inst,
-                &public,
-                &upstreams,
-                &client,
-                req,
-                target_url,
-                ForwardKind::Rtc,
-                false,
-            )
-            .await
-        }
     }
 }
 
@@ -813,9 +769,9 @@ fn handle_listener_summary_info(
                 "matrix_proxy_public_url": inst.profile.matrix_proxy_public_url.as_ref().map(normalized_base_url),
                 "outbound_proxy": inst.profile.upstream.outbound_proxy.as_deref().map(redact_proxy_url),
                 "auth_proxy_mode": inst.profile.discovery.auth_proxy_mode,
+                "matrix_rtc": inst.profile.matrix_rtc.info_json(),
                 "upstream_matrix_proxy_protocol": inst.profile.matrix_proxy_protocol(),
                 "upstream_auth_proxy_protocol": inst.profile.auth_proxy_protocol(),
-                "upstream_rtc_proxy_protocol": inst.profile.rtc_proxy_protocol(),
                 "client_ip_mode": inst.profile.upstream.client_ip_mode,
             })
         })
@@ -857,7 +813,6 @@ fn handle_profile_info(
         "public": {
             "matrix_proxy_public_url": normalized_base_url(&public.matrix_base),
             "matrix_proxy_public_auth_url": normalized_base_url(&public.auth_base),
-            "rtc_url": public.rtc_base.as_ref().map(normalized_base_url),
             "dual_domain": public.dual_domain,
             "auth_mode": inst.profile.routing.auth_mode,
             "auth_prefix": public.auth_prefix,
@@ -866,16 +821,15 @@ fn handle_profile_info(
             "upstream_matrix_server_url": normalized_base_url(&upstreams.matrix_url),
             "upstream_matrix_auth_url": normalized_base_url(upstreams.effective_auth_url()),
             "auth_is_separate": upstreams.auth_is_separate(),
-            "upstream_matrix_rtc_url": upstreams.rtc_url.as_ref().map(normalized_base_url),
             "outbound_proxy": inst.profile.upstream.outbound_proxy.as_deref().map(redact_proxy_url),
             "outbound_no_proxy": inst.profile.upstream.outbound_no_proxy,
             "client_ip_mode": inst.profile.upstream.client_ip_mode,
             "upstream_matrix_proxy_protocol": inst.profile.matrix_proxy_protocol(),
             "upstream_auth_proxy_protocol": inst.profile.auth_proxy_protocol(),
-            "upstream_rtc_proxy_protocol": inst.profile.rtc_proxy_protocol(),
         },
         "discovery": {
             "auth_proxy_mode": inst.profile.discovery.auth_proxy_mode,
+            "matrix_rtc": inst.profile.matrix_rtc.info_json(),
             "rewrite_issuer": inst.profile.discovery.rewrite_issuer,
             "rewrite_auth_body": inst.profile.discovery.rewrite_auth_body,
             "observed_auth_origins": upstreams.observed_auth_origins,
@@ -1185,7 +1139,6 @@ async fn fetch_metadata_json(
 enum ForwardKind {
     Matrix,
     Auth,
-    Rtc,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1210,10 +1163,6 @@ async fn forward_request(
         ForwardKind::Auth => (
             inst.profile.auth_proxy_protocol(),
             inst.profile.upstream.upstream_auth_host_header.as_deref(),
-        ),
-        ForwardKind::Rtc => (
-            inst.profile.rtc_proxy_protocol(),
-            inst.profile.upstream.upstream_rtc_host_header.as_deref(),
         ),
     };
 

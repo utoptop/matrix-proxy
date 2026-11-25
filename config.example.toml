@@ -1,5 +1,5 @@
 # =============================================================================
-# matrix-proxy v1.4.3 — Clean Configuration Reference
+# matrix-proxy v1.5.0 — Clean Configuration Reference
 # =============================================================================
 # THREE SIMPLE LAYERS (Highest -> Lowest Precedence):
 #   1. `[[proxies]]`  — Per-node config (ALWAYS wins over `[defaults]` & `[server]`)
@@ -73,7 +73,7 @@ listen_backlog = 4096
 # any `[[proxies]]` block to override it for that specific node.
 # =============================================================================
 [defaults]
-# Global outbound proxy for all upstreams (HTTP, Auth, RTC, Discovery, WebSocket & PROXY Protocol).
+# Global outbound proxy for all upstreams (HTTP, Auth, Discovery, WebSocket & PROXY Protocol).
 # Supported values:
 #   ""                                   -> direct (or ambient OS env proxy)
 #   "direct"                             -> force direct, ignoring OS HTTP_PROXY/ALL_PROXY
@@ -106,11 +106,17 @@ auth_mode = "root"                  # "root" (recommended for MAS/OIDC) | "prefi
 #                            MAS `graphql_endpoint`) on the official Auth origin so multi-hop external IdPs
 #                            (Mozilla Accounts, Google, Apple, Passkey) work cleanly, while still proxying
 #                            `token_endpoint`, `registration_endpoint`, `revocation_endpoint`, `jwks_uri`,
-#                            Matrix API and RTC 24/7
-#   "direct"               — pass Auth/OIDC metadata through verbatim; proxy Matrix API & RTC only
+#                            and Matrix API 24/7
+#   "direct"               — pass Auth/OIDC metadata through verbatim; proxy Matrix API only
 auth_proxy_mode = "full"
+
+# Direct MatrixRTC (`mrtc` / LiveKit JWT) delegation written to `/.well-known/matrix/client` (`org.matrix.msc4143.rtc_foci`):
+#   "" / "upstream"        — keep the upstream homeserver's `.well-known` `rtc_foci` untouched
+#   "https://mrtc.host"    — delegate calls directly to your reachable MatrixRTC / LiveKit JWT server (no HTTP proxying)
+#   "off"                  — omit `org.matrix.msc4143.rtc_foci` from `/.well-known/matrix/client`
+# (Use `matrix_rtc_urls = ["https://..."]` to advertise multiple foci.)
+matrix_rtc_url = ""
 auth_prefix = "/_auth"
-rtc_prefix = "/_rtc"
 proxy_prefix = "/_proxy"
 rewrite_issuer = true
 rewrite_auth_body = true
@@ -139,7 +145,7 @@ matrix_proxy_public_url = "https://matrix1.example.com"
 upstream_matrix_server_url = "https://matrix-client.example.org"
 upstream_matrix_auth_url = "https://account.example.org"
 upstream_matrix_server_name = "example.org"
-upstream_matrix_rtc_url = "https://livekit-jwt.example.org"
+matrix_rtc_url = "https://mrtc.example.org"
 
 
 # -----------------------------------------------------------------------------
@@ -153,12 +159,11 @@ matrix_proxy_public_url = "https://matrix2.example.com"
 upstream_matrix_server_url = "https://origin.example.net:8443"
 upstream_matrix_auth_url = "https://origin.example.net:8443"
 upstream_matrix_server_name = "origin.example.net"
-upstream_matrix_rtc_url = "https://rtc.example.net"
+matrix_rtc_url = "https://mrtc.example.net"
 upstream_matrix_host_header = "origin.example.net"
 upstream_auth_host_header = "origin.example.net"
 upstream_matrix_proxy_protocol = "v2"
 upstream_auth_proxy_protocol = "v2"
-upstream_rtc_proxy_protocol = "off"
 outbound_proxy = "direct"
 upstream_rewrite_origins = ["https://public-origin.example.net"]
 
@@ -176,7 +181,7 @@ upstream_rewrite_origins = ["https://public-origin.example.net"]
 # upstream_matrix_server_url = "https://matrix-client.matrix.org"
 # upstream_matrix_auth_url = "https://account.matrix.org"
 # upstream_matrix_server_name = "matrix.org"
-# upstream_matrix_rtc_url = "https://livekit-jwt.call.matrix.org"
+# matrix_rtc_url = "upstream"                              # Keep upstream rtc_foci or point to your own mrtc URL
 # outbound_proxy = "socks5h://user:pass@127.0.0.1:1080"    # Per-node SOCKS5h override (wins over [defaults])
 # outbound_no_proxy = ["127.0.0.1", "100.64.0.0/10"]
 
@@ -212,7 +217,7 @@ upstream_rewrite_origins = ["https://public-origin.example.net"]
 # Node 6 (Optional Multi-Hop Third-Party OIDC IdP — `auth_proxy_mode = "token_only"`)
 # Use when the upstream Matrix Auth redirects to external IdPs (Mozilla Accounts,
 # Google, Apple, Passkey): initial browser login runs on the official Auth origin,
-# while token refresh, Matrix sync/media, and LiveKit RTC stay proxied 24/7.
+# while token refresh and Matrix sync/media stay proxied 24/7.
 # -----------------------------------------------------------------------------
 # [[proxies]]
 # name = "mozilla-chat"

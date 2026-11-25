@@ -1,6 +1,5 @@
 use crate::client_ip::ClientInfo;
 use crate::config::{AuthRouteMode, ProxyProfile, strip_host_port};
-use crate::discovery::ResolvedUpstreams;
 use crate::rewrite::{PublicContext, is_safe_host_header, path_has_prefix, strip_path_prefix};
 use http::HeaderMap;
 use std::collections::HashMap;
@@ -23,9 +22,6 @@ pub enum RouteTarget {
     Auth {
         upstream_path_and_query: String,
         stripped_prefix: bool,
-    },
-    Rtc {
-        upstream_path_and_query: String,
     },
 }
 
@@ -146,7 +142,6 @@ pub fn extract_request_host(client: &ClientInfo, headers: &HeaderMap) -> Option<
 pub fn classify_request(
     profile: &ProxyProfile,
     public: &PublicContext,
-    upstreams: &ResolvedUpstreams,
     client: &ClientInfo,
     headers: &HeaderMap,
     path: &str,
@@ -186,13 +181,6 @@ pub fn classify_request(
     {
         return RouteTarget::AuthMetadata {
             requested_path: path.to_string(),
-        };
-    }
-
-    if upstreams.rtc_url.is_some() && path_has_prefix(path, &profile.routing.rtc_prefix) {
-        let stripped = strip_path_prefix(path, &profile.routing.rtc_prefix);
-        return RouteTarget::Rtc {
-            upstream_path_and_query: join_pq(stripped, query),
         };
     }
 

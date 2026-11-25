@@ -14,7 +14,6 @@ use url::Url;
 pub struct ResolvedUpstreams {
     pub matrix_url: Url,
     pub auth_url: Option<Url>,
-    pub rtc_url: Option<Url>,
     pub upstream_well_known: Option<Value>,
     pub discovered_issuer: Option<String>,
     /// Extra auth origins observed dynamically from `auth_metadata` (crucial when `auth_url`
@@ -24,7 +23,6 @@ pub struct ResolvedUpstreams {
     /// Precomputed normalized origin strings (avoids repeated `Url` formatting on hot paths).
     pub matrix_origin: String,
     pub auth_origin: String,
-    pub rtc_origin: Option<String>,
     pub wk_hs_origin: Option<String>,
 }
 
@@ -32,7 +30,6 @@ impl ResolvedUpstreams {
     pub fn new(
         matrix_url: Url,
         auth_url: Option<Url>,
-        rtc_url: Option<Url>,
         upstream_well_known: Option<Value>,
         discovered_issuer: Option<String>,
         observed_auth_origins: Vec<String>,
@@ -42,7 +39,6 @@ impl ResolvedUpstreams {
             .as_ref()
             .map(origin_string)
             .unwrap_or_else(|| matrix_origin.clone());
-        let rtc_origin = rtc_url.as_ref().map(origin_string);
         let wk_hs_origin = upstream_well_known
             .as_ref()
             .and_then(|wk| wk.pointer("/m.homeserver/base_url"))
@@ -53,13 +49,11 @@ impl ResolvedUpstreams {
         Self {
             matrix_url,
             auth_url,
-            rtc_url,
             upstream_well_known,
             discovered_issuer,
             observed_auth_origins,
             matrix_origin,
             auth_origin,
-            rtc_origin,
             wk_hs_origin,
         }
     }
@@ -177,7 +171,7 @@ impl DiscoveryManager {
             matrix_upstream = %resolved.matrix_url,
             auth_upstream = %resolved.effective_auth_url(),
             auth_separate = resolved.auth_is_separate(),
-            rtc_upstream = ?resolved.rtc_url.as_ref().map(|u| u.as_str()),
+            matrix_rtc = %self.profile.matrix_rtc.summary(),
             matrix_proxy_protocol = %self.profile.matrix_proxy_protocol(),
             auth_proxy_protocol = %self.profile.auth_proxy_protocol(),
             "upstream discovery initialized"
@@ -330,7 +324,6 @@ impl DiscoveryManager {
             let updated = ResolvedUpstreams::new(
                 prev.matrix_url.clone(),
                 new_auth_url,
-                prev.rtc_url.clone(),
                 prev.upstream_well_known.clone(),
                 new_issuer,
                 guard.observed_auth_origins.clone(),
@@ -513,15 +506,9 @@ impl DiscoveryManager {
             }
         }
 
-        let rtc_url = match &self.profile.upstream.upstream_matrix_rtc_url {
-            Some(raw) => Some(Url::parse(raw).context("invalid upstream_matrix_rtc_url")?),
-            None => None,
-        };
-
         let resolved = Arc::new(ResolvedUpstreams::new(
             matrix_url,
             auth_url,
-            rtc_url,
             upstream_well_known,
             discovered_issuer,
             observed_origins.clone(),
