@@ -1,22 +1,23 @@
 use crate::client_ip::{ClientInfo, InboundPeer, IpRateLimiter, apply_upstream_client_ip_headers};
 use crate::config::{
     AuthProxyMode, ExposeInfoMode, ListenerPlan, ProxyProfile, ProxyProtocol, RuntimeConfig,
-    ServerConfig, normalized_base_url, origin_string, redact_proxy_url,
-    should_bypass_outbound_proxy,
+    ServerConfig, normalized_base_url, redact_proxy_url, should_bypass_outbound_proxy,
 };
 use crate::discovery::{DiscoveryManager, ResolvedUpstreams};
 use crate::media_cache::{
-    CachedMediaMeta, IMMUTABLE_MEDIA_CACHE_CONTROL, InFlightGuard, InFlightOutcome,
+    CacheKey, CompactMeta, IMMUTABLE_MEDIA_CACHE_CONTROL, InFlightGuard, InFlightOutcome,
     MAX_PRELOAD_SCAN_RAW_BYTES, MediaCache, MediaCacheTeeStream, MediaPreloader, MediaRouteInfo,
-    PreloadScanTeeStream, extract_bearer_token, extract_cache_meta_headers,
-    is_cacheable_media_headers, is_preload_scan_path, now_epoch_secs, parse_matrix_media_route,
+    PreloadScanTeeStream, build_compact_meta_from_headers, extract_bearer_token,
+    is_cacheable_media_headers, is_preload_scan_path, parse_matrix_media_route,
 };
 use crate::metrics::ProxyMetrics;
 use crate::ppv2_client::{Ppv2Client, maybe_gunzip};
 use crate::rewrite::{PublicContext, RewriteEngine, build_upstream_target_url};
 use crate::router::{RouteTarget, VhostRouter, classify_request, extract_request_host};
 use crate::ws::{build_client_tls_config, is_websocket_upgrade, proxy_websocket};
+use ahash::{AHashMap, AHashSet};
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
@@ -27,12 +28,12 @@ use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::borrow::Cow;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, warn};
@@ -57,9 +58,9 @@ pub type ReloadFn = Arc<
 >;
 
 /// Hot-swappable handle shared across all connections on a listening socket.
-/// Swapping `ListenerState` takes effect immediately for both new and existing keep-alive/H2 connections.
+/// Uses wait-free `ArcSwap` so hot-path request dispatch acquires zero locks (~2ns atomic load).
 pub struct LiveListener {
-    state: RwLock<Arc<ListenerState>>,
+    state: ArcSwap<ListenerState>,
     pub metrics: Arc<ProxyMetrics>,
     reload_fn: Option<ReloadFn>,
 }
@@ -71,7 +72,7 @@ impl LiveListener {
         reload_fn: Option<ReloadFn>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            state: RwLock::new(initial),
+            state: ArcSwap::new(initial),
             metrics,
             reload_fn,
         })
@@ -82,21 +83,77 @@ impl LiveListener {
         Self::new(initial, metrics, None)
     }
 
-    /// Lock-free-for-readers atomic snapshot of the current listener state.
+    /// Wait-free lock-free atomic snapshot of the current listener state.
     pub fn current(&self) -> Arc<ListenerState> {
-        let guard = self.state.read().unwrap_or_else(|e| e.into_inner());
-        Arc::clone(&guard)
+        self.state.load_full()
     }
 
     /// Atomically replaces the active listener state (zero downtime for in-flight requests).
     pub fn swap(&self, next: Arc<ListenerState>) {
-        let mut guard = self.state.write().unwrap_or_else(|e| e.into_inner());
-        *guard = next;
+        self.state.store(next);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SharedClientKey {
+    outbound_proxy: Option<String>,
+    outbound_proxy_direct: bool,
+    outbound_no_proxy: Vec<String>,
+    connect_timeout_secs: u64,
+    request_timeout_secs: u64,
+    danger_accept_invalid_certs: bool,
+}
+
+#[derive(Clone)]
+struct SharedClientBundle {
+    stream_client: reqwest::Client,
+    rewrite_client: reqwest::Client,
+    well_known_client: reqwest::Client,
+    ws_tls_config: Arc<rustls::ClientConfig>,
+}
+
+/// Deduplicates `reqwest::Client` pools and TLS configs across profiles sharing identical outbound
+/// transport settings (e.g., 4 profiles on one listener share 3 pools instead of creating 12).
+#[derive(Default)]
+struct ClientPoolRegistry {
+    bundles: AHashMap<SharedClientKey, SharedClientBundle>,
+}
+
+impl ClientPoolRegistry {
+    fn get_or_build(
+        &mut self,
+        server: &ServerConfig,
+        profile: &ProxyProfile,
+    ) -> Result<SharedClientBundle> {
+        let key = SharedClientKey {
+            outbound_proxy: profile.upstream.outbound_proxy.clone(),
+            outbound_proxy_direct: profile.upstream.outbound_proxy_direct,
+            outbound_no_proxy: profile.upstream.outbound_no_proxy.clone(),
+            connect_timeout_secs: profile.upstream.connect_timeout_secs,
+            request_timeout_secs: profile.upstream.request_timeout_secs,
+            danger_accept_invalid_certs: profile.upstream.danger_accept_invalid_certs,
+        };
+        if let Some(existing) = self.bundles.get(&key) {
+            return Ok(existing.clone());
+        }
+        let bundle = SharedClientBundle {
+            stream_client: build_http_client(server, profile, false, false)?,
+            rewrite_client: build_http_client(server, profile, true, false)?,
+            well_known_client: build_http_client(server, profile, true, true)?,
+            ws_tls_config: build_client_tls_config(
+                profile.upstream.danger_accept_invalid_certs,
+                &[b"http/1.1".as_slice()],
+            )?,
+        };
+        self.bundles.insert(key, bundle.clone());
+        Ok(bundle)
     }
 }
 
 pub struct ProxyInstance {
     pub profile: Arc<ProxyProfile>,
+    /// Precomputed `PublicContext` when `matrix_proxy_public_url` is configured (zero allocs per request).
+    pub static_public_ctx: Option<PublicContext>,
     pub discovery: Arc<DiscoveryManager>,
     /// Streaming HTTP client (preserves upstream Content-Encoding byte-for-byte).
     pub stream_client: reqwest::Client,
@@ -117,10 +174,20 @@ impl ProxyInstance {
         metrics: Option<Arc<ProxyMetrics>>,
         media_cache: Option<Arc<MediaCache>>,
     ) -> Result<Arc<Self>> {
+        let mut reg = ClientPoolRegistry::default();
+        Self::build_with_registry(server, profile, metrics, media_cache, &mut reg)
+    }
+
+    fn build_with_registry(
+        server: &ServerConfig,
+        profile: ProxyProfile,
+        metrics: Option<Arc<ProxyMetrics>>,
+        media_cache: Option<Arc<MediaCache>>,
+        registry: &mut ClientPoolRegistry,
+    ) -> Result<Arc<Self>> {
         let profile = Arc::new(profile);
-        let stream_client = build_http_client(server, &profile, false, false)?;
-        let rewrite_client = build_http_client(server, &profile, true, false)?;
-        let well_known_client = build_http_client(server, &profile, true, true)?;
+        let static_public_ctx = PublicContext::from_profile_static(&profile);
+        let bundle = registry.get_or_build(server, &profile)?;
 
         warn_if_pp_on_standard_https_port(&profile);
 
@@ -137,15 +204,10 @@ impl ProxyInstance {
             None
         };
 
-        let ws_tls_config = build_client_tls_config(
-            profile.upstream.danger_accept_invalid_certs,
-            &[b"http/1.1".as_slice()],
-        )?;
-
         let discovery = Arc::new(DiscoveryManager::new(
             Arc::clone(&profile),
-            rewrite_client.clone(),
-            well_known_client,
+            bundle.rewrite_client.clone(),
+            bundle.well_known_client,
             ppv2_client.clone(),
         ));
 
@@ -157,7 +219,7 @@ impl ProxyInstance {
                 Arc::clone(&profile),
                 cache,
                 m,
-                stream_client.clone(),
+                bundle.stream_client.clone(),
                 ppv2_client.clone(),
             ))
         } else {
@@ -166,13 +228,28 @@ impl ProxyInstance {
 
         Ok(Arc::new(Self {
             profile,
+            static_public_ctx,
             discovery,
-            stream_client,
-            rewrite_client,
+            stream_client: bundle.stream_client,
+            rewrite_client: bundle.rewrite_client,
             ppv2_client,
-            ws_tls_config,
+            ws_tls_config: bundle.ws_tls_config,
             preloader,
         }))
+    }
+
+    /// Zero-allocation borrow of precomputed `PublicContext` when `matrix_proxy_public_url` is set.
+    #[inline]
+    pub fn resolve_public_context<'a>(
+        &'a self,
+        client: &ClientInfo,
+        headers: &HeaderMap,
+    ) -> Cow<'a, PublicContext> {
+        if let Some(static_ctx) = &self.static_public_ctx {
+            Cow::Borrowed(static_ctx)
+        } else {
+            Cow::Owned(PublicContext::from_request(&self.profile, client, headers))
+        }
     }
 }
 
@@ -253,12 +330,14 @@ impl ListenerState {
         media_cache: Option<Arc<MediaCache>>,
     ) -> Result<Arc<Self>> {
         let mut entries = Vec::with_capacity(plan.profiles.len());
+        let mut client_registry = ClientPoolRegistry::default();
         for profile in &plan.profiles {
-            let inst = ProxyInstance::build(
+            let inst = ProxyInstance::build_with_registry(
                 &runtime.server,
                 profile.clone(),
                 Some(Arc::clone(&metrics)),
                 media_cache.clone(),
+                &mut client_registry,
             )?;
             entries.push((
                 profile.route_hosts.clone(),
@@ -389,8 +468,8 @@ fn build_http_client(
         .pool_idle_timeout(Duration::from_secs(server.pool_idle_timeout_secs))
         .tcp_nodelay(server.tcp_nodelay)
         .http2_adaptive_window(true)
-        .http2_initial_stream_window_size(1024 * 1024)
-        .http2_initial_connection_window_size(4 * 1024 * 1024)
+        .http2_initial_stream_window_size(512 * 1024)
+        .http2_initial_connection_window_size(2 * 1024 * 1024)
         .http2_keep_alive_interval(Duration::from_secs(30))
         .http2_keep_alive_timeout(Duration::from_secs(20))
         .http2_keep_alive_while_idle(true);
@@ -536,10 +615,10 @@ async fn handle_request(
         if let Some(denied) = check_info_access(&state, &client) {
             return denied;
         }
-        if let Some(inst) = state.vhost.resolve(req_host.as_deref())
+        if let Some(inst) = state.vhost.resolve(req_host)
             && let Ok(upstreams) = inst.discovery.get_upstreams().await
         {
-            let public = PublicContext::from_request(&inst.profile, &client, req.headers());
+            let public = inst.resolve_public_context(&client, req.headers());
             return handle_profile_info(&state, &live.metrics, &inst, &public, &upstreams, &client);
         }
         return handle_listener_summary_info(&state, &live.metrics, &client);
@@ -602,7 +681,7 @@ async fn handle_request(
     }
 
     // 6. Resolve target upstream profile by Host (shared port) or dedicated port.
-    let Some(inst) = state.vhost.resolve(req_host.as_deref()) else {
+    let Some(inst) = state.vhost.resolve(req_host) else {
         warn!(
             listener = %state.plan.listen,
             host = ?req_host,
@@ -635,7 +714,7 @@ async fn handle_request(
         }
     };
 
-    let public = PublicContext::from_request(&inst.profile, &client, req.headers());
+    let public = inst.resolve_public_context(&client, req.headers());
     let target = classify_request(
         &inst.profile,
         &public,
@@ -1287,15 +1366,14 @@ async fn forward_request(
         .filter(|_| inst.profile.media.cache_enabled);
     let has_range_request = parts.headers.contains_key(http::header::RANGE);
 
-    let mut media_cache_key: Option<String> = None;
+    let mut media_cache_key: Option<CacheKey> = None;
     let mut in_flight_guard: Option<InFlightGuard> = None;
 
     if let (Some(route), Some(cache)) = (&media_route, profile_media_cache) {
         if let Some(spec) = &route.thumbnail_spec {
             cache.observe_avatar_thumb_size(&inst.profile.name, spec);
         }
-        let upstream_origin = origin_string(&upstreams.matrix_url);
-        let key = route.cache_key(&inst.profile.name, &upstream_origin);
+        let key = route.cache_key(&inst.profile.name, &upstreams.matrix_origin);
         let caller_verified = bearer_token
             .as_deref()
             .is_some_and(|t| cache.is_token_verified(&inst.profile.name, t));
@@ -1326,6 +1404,7 @@ async fn forward_request(
                         preloader.enqueue_full_download_for_thumbnail(
                             route,
                             &upstreams.matrix_url,
+                            &upstreams.matrix_origin,
                             bearer_token.clone(),
                             client,
                         );
@@ -1375,6 +1454,7 @@ async fn forward_request(
                                 preloader.enqueue_full_download_for_thumbnail(
                                     route,
                                     &upstreams.matrix_url,
+                                    &upstreams.matrix_origin,
                                     bearer_token.clone(),
                                     client,
                                 );
@@ -1393,13 +1473,15 @@ async fn forward_request(
         media_cache_key = Some(key);
     }
 
-    // Collect dynamic hop-by-hop headers declared via RFC 9110 `Connection: ...`.
+    // Collect dynamic hop-by-hop headers declared via RFC 9110 `Connection: ...` (zero alloc when absent).
     let dynamic_req_hop = collect_connection_headers(&parts.headers);
-    let mut out_headers = HeaderMap::new();
+    let mut out_headers = HeaderMap::with_capacity(parts.headers.len() + 3);
 
     for (name, value) in &parts.headers {
         if is_hop_by_hop_header(name)
-            || dynamic_req_hop.contains(name.as_str())
+            || dynamic_req_hop
+                .as_ref()
+                .is_some_and(|set| set.contains(name.as_str()))
             || name == http::header::HOST
             || is_upstream_stripped_forwarded_header(name)
         {
@@ -1457,6 +1539,7 @@ async fn forward_request(
         inst,
         media_cache: profile_media_cache,
         upstream_matrix_url: &upstreams.matrix_url,
+        upstream_matrix_origin: &upstreams.matrix_origin,
         client,
         method: &req_method,
         target_path: target_url.path(),
@@ -1594,12 +1677,13 @@ struct MediaResponseContext<'a> {
     inst: &'a ProxyInstance,
     media_cache: Option<&'a Arc<MediaCache>>,
     upstream_matrix_url: &'a Url,
+    upstream_matrix_origin: &'a str,
     client: &'a ClientInfo,
     method: &'a Method,
     target_path: &'a str,
     bearer_token: Option<String>,
     media_route: Option<MediaRouteInfo>,
-    cache_key: Option<String>,
+    cache_key: Option<CacheKey>,
     in_flight_guard: Option<InFlightGuard>,
     has_range_request: bool,
 }
@@ -1608,8 +1692,8 @@ enum ResponseStreamHook {
     None,
     MediaCache {
         cache: Arc<MediaCache>,
-        key: String,
-        meta: CachedMediaMeta,
+        key: CacheKey,
+        meta: CompactMeta,
         max_bytes: usize,
         initial_capacity: usize,
         in_flight: Option<InFlightGuard>,
@@ -1618,6 +1702,7 @@ enum ResponseStreamHook {
         preloader: Arc<MediaPreloader>,
         content_encoding: String,
         upstream_matrix_url: Url,
+        upstream_matrix_origin: String,
         bearer_token: Option<String>,
         client: ClientInfo,
     },
@@ -1652,6 +1737,7 @@ fn prepare_media_and_preload_hook(
             preloader.enqueue_full_download_for_thumbnail(
                 route,
                 ctx.upstream_matrix_url,
+                ctx.upstream_matrix_origin,
                 ctx.bearer_token.clone(),
                 ctx.client,
             );
@@ -1667,21 +1753,16 @@ fn prepare_media_and_preload_hook(
                 && !ctx.has_range_request
                 && is_cacheable_media_headers(resp_headers, cache.max_item_bytes());
             if cacheable {
-                let (content_type, content_disposition, etag) =
-                    extract_cache_meta_headers(resp_headers);
                 let content_len_hint = resp_headers
                     .get(http::header::CONTENT_LENGTH)
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(0);
-                let meta = CachedMediaMeta {
-                    content_type,
-                    content_disposition,
-                    etag: etag.unwrap_or_else(|| format!("\"{}\"", &key[..24])),
-                    requires_auth: route.requires_auth() || ctx.bearer_token.is_some(),
-                    body_len: content_len_hint as u64,
-                    stored_epoch_secs: now_epoch_secs(),
-                };
+                let meta = build_compact_meta_from_headers(
+                    resp_headers,
+                    route.requires_auth() || ctx.bearer_token.is_some(),
+                    content_len_hint as u64,
+                );
                 return (
                     true,
                     Some("MISS"),
@@ -1732,6 +1813,7 @@ fn prepare_media_and_preload_hook(
                     preloader: Arc::clone(preloader),
                     content_encoding,
                     upstream_matrix_url: ctx.upstream_matrix_url.clone(),
+                    upstream_matrix_origin: ctx.upstream_matrix_origin.to_string(),
                     bearer_token: ctx.bearer_token,
                     client: ctx.client.clone(),
                 },
@@ -1804,13 +1886,15 @@ async fn finish_hyper_response(
     media_ctx: MediaResponseContext<'_>,
     upstream_resp: Response<hyper::body::Incoming>,
 ) -> Response<Body> {
-    let status = upstream_resp.status();
-    let resp_headers = upstream_resp.headers().clone();
+    // Zero-clone response parts split (eliminates full HeaderMap::clone() on every response!).
+    let (resp_parts, resp_body) = upstream_resp.into_parts();
+    let status = resp_parts.status;
+    let resp_headers = &resp_parts.headers;
 
     let (rewrite_mode, content_encoding, max_bytes) = check_body_rewrite(
         kind,
         status,
-        &resp_headers,
+        resp_headers,
         rewriter.profile.discovery.auth_proxy_mode,
         should_maybe_rewrite_body,
         server_cfg.max_rewrite_body_bytes,
@@ -1818,11 +1902,11 @@ async fn finish_hyper_response(
     let do_body_rewrite = rewrite_mode != BodyRewriteMode::None;
 
     let (immutable_media, cache_header, stream_hook) =
-        prepare_media_and_preload_hook(kind, status, &resp_headers, do_body_rewrite, media_ctx);
+        prepare_media_and_preload_hook(kind, status, resp_headers, do_body_rewrite, media_ctx);
 
     let out_builder = build_rewritten_response_headers(
         status,
-        &resp_headers,
+        resp_headers,
         rewriter,
         public,
         req_headers,
@@ -1833,7 +1917,7 @@ async fn finish_hyper_response(
     );
 
     if do_body_rewrite {
-        match read_bounded_incoming(upstream_resp.into_body(), max_bytes).await {
+        match read_bounded_incoming(resp_body, max_bytes).await {
             Ok(BoundedBody::Buffered(bytes)) => {
                 let out =
                     apply_buffered_body_rewrite(rewrite_mode, rewriter, &content_encoding, bytes);
@@ -1851,7 +1935,7 @@ async fn finish_hyper_response(
         }
     } else {
         let body = match stream_hook {
-            ResponseStreamHook::None => Body::new(upstream_resp.into_body()),
+            ResponseStreamHook::None => Body::new(resp_body),
             ResponseStreamHook::MediaCache {
                 cache,
                 key,
@@ -1860,7 +1944,7 @@ async fn finish_hyper_response(
                 initial_capacity,
                 in_flight,
             } => Body::from_stream(MediaCacheTeeStream::new(
-                upstream_resp.into_body().into_data_stream(),
+                resp_body.into_data_stream(),
                 cache,
                 key,
                 meta,
@@ -1872,16 +1956,18 @@ async fn finish_hyper_response(
                 preloader,
                 content_encoding,
                 upstream_matrix_url,
+                upstream_matrix_origin,
                 bearer_token,
                 client,
             } => Body::from_stream(PreloadScanTeeStream::new(
-                upstream_resp.into_body().into_data_stream(),
+                resp_body.into_data_stream(),
                 MAX_PRELOAD_SCAN_RAW_BYTES,
                 move |raw| {
                     preloader.enqueue_from_json_payload(
                         raw,
                         content_encoding,
                         upstream_matrix_url,
+                        upstream_matrix_origin,
                         bearer_token,
                         client,
                     );
@@ -1906,32 +1992,42 @@ async fn finish_reqwest_response(
     upstream_resp: reqwest::Response,
 ) -> Response<Body> {
     let status = upstream_resp.status();
-    let resp_headers = upstream_resp.headers().clone();
+    // Borrow upstream headers directly without cloning HeaderMap!
+    let (rewrite_mode, content_encoding, max_bytes, do_body_rewrite, stream_hook, out_builder) = {
+        let resp_headers = upstream_resp.headers();
+        let (rewrite_mode, content_encoding, max_bytes) = check_body_rewrite(
+            kind,
+            status,
+            resp_headers,
+            rewriter.profile.discovery.auth_proxy_mode,
+            should_maybe_rewrite_body,
+            server_cfg.max_rewrite_body_bytes,
+        );
+        let do_body_rewrite = rewrite_mode != BodyRewriteMode::None;
 
-    let (rewrite_mode, content_encoding, max_bytes) = check_body_rewrite(
-        kind,
-        status,
-        &resp_headers,
-        rewriter.profile.discovery.auth_proxy_mode,
-        should_maybe_rewrite_body,
-        server_cfg.max_rewrite_body_bytes,
-    );
-    let do_body_rewrite = rewrite_mode != BodyRewriteMode::None;
+        let (immutable_media, cache_header, stream_hook) =
+            prepare_media_and_preload_hook(kind, status, resp_headers, do_body_rewrite, media_ctx);
 
-    let (immutable_media, cache_header, stream_hook) =
-        prepare_media_and_preload_hook(kind, status, &resp_headers, do_body_rewrite, media_ctx);
-
-    let out_builder = build_rewritten_response_headers(
-        status,
-        &resp_headers,
-        rewriter,
-        public,
-        req_headers,
-        kind,
-        do_body_rewrite,
-        immutable_media,
-        cache_header,
-    );
+        let out_builder = build_rewritten_response_headers(
+            status,
+            resp_headers,
+            rewriter,
+            public,
+            req_headers,
+            kind,
+            do_body_rewrite,
+            immutable_media,
+            cache_header,
+        );
+        (
+            rewrite_mode,
+            content_encoding,
+            max_bytes,
+            do_body_rewrite,
+            stream_hook,
+            out_builder,
+        )
+    };
 
     if do_body_rewrite {
         match read_bounded_reqwest(upstream_resp, max_bytes).await {
@@ -1980,6 +2076,7 @@ async fn finish_reqwest_response(
                 preloader,
                 content_encoding,
                 upstream_matrix_url,
+                upstream_matrix_origin,
                 bearer_token,
                 client,
             } => Body::from_stream(PreloadScanTeeStream::new(
@@ -1990,6 +2087,7 @@ async fn finish_reqwest_response(
                         raw,
                         content_encoding,
                         upstream_matrix_url,
+                        upstream_matrix_origin,
                         bearer_token,
                         client,
                     );
@@ -2069,7 +2167,11 @@ fn build_rewritten_response_headers(
     let mut has_acao = false;
 
     for (name, value) in resp_headers {
-        if is_hop_by_hop_header(name) || dynamic_resp_hop.contains(name.as_str()) {
+        if is_hop_by_hop_header(name)
+            || dynamic_resp_hop
+                .as_ref()
+                .is_some_and(|set| set.contains(name.as_str()))
+        {
             continue;
         }
         if !public.public_is_https()
@@ -2210,14 +2312,22 @@ async fn read_bounded_incoming(
     Ok(BoundedBody::Buffered(buf))
 }
 
-fn collect_connection_headers(headers: &HeaderMap) -> HashSet<String> {
-    let mut out = HashSet::new();
+/// Zero-allocation fast path when no custom `Connection` header tokens exist (99.9%+ of H2 traffic).
+fn collect_connection_headers(headers: &HeaderMap) -> Option<AHashSet<String>> {
+    if !headers.contains_key(http::header::CONNECTION) {
+        return None;
+    }
+    let mut out: Option<AHashSet<String>> = None;
     for val in headers.get_all(http::header::CONNECTION) {
         if let Ok(s) = val.to_str() {
             for token in s.split(',') {
-                let t = token.trim().to_ascii_lowercase();
-                if !t.is_empty() && t != "keep-alive" && t != "close" {
-                    out.insert(t);
+                let t = token.trim();
+                if !t.is_empty()
+                    && !t.eq_ignore_ascii_case("keep-alive")
+                    && !t.eq_ignore_ascii_case("close")
+                {
+                    out.get_or_insert_with(AHashSet::new)
+                        .insert(t.to_ascii_lowercase());
                 }
             }
         }

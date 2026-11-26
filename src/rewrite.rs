@@ -45,15 +45,16 @@ pub struct PublicContext {
     /// Present only in single-domain `prefix` mode (e.g. `"/_auth"`).
     pub auth_prefix: Option<String>,
     pub dual_domain: bool,
+    /// Precomputed normalized origin & base URL strings (zero formatting on hot path).
+    pub matrix_origin_str: String,
+    pub auth_origin_str: String,
+    pub matrix_base_str: String,
+    pub auth_base_str: String,
+    pub is_https: bool,
 }
 
 impl PublicContext {
-    pub fn from_request(profile: &ProxyProfile, client: &ClientInfo, headers: &HeaderMap) -> Self {
-        let matrix_base = profile
-            .matrix_proxy_public_url
-            .clone()
-            .unwrap_or_else(|| infer_public_url(client, headers));
-
+    fn from_matrix_base(profile: &ProxyProfile, matrix_base: Url) -> Self {
         let (auth_base, auth_prefix, dual_domain) =
             if let Some(explicit_auth) = &profile.matrix_proxy_public_auth_url {
                 (explicit_auth.clone(), None, true)
@@ -72,24 +73,52 @@ impl PublicContext {
                 }
             };
 
+        let matrix_origin_str = origin_string(&matrix_base);
+        let auth_origin_str = origin_string(&auth_base);
+        let matrix_base_str = normalized_base_url(&matrix_base);
+        let auth_base_str = normalized_base_url(&auth_base);
+        let is_https = matrix_base.scheme().eq_ignore_ascii_case("https");
+
         Self {
             matrix_base,
             auth_base,
             auth_prefix,
             dual_domain,
+            matrix_origin_str,
+            auth_origin_str,
+            matrix_base_str,
+            auth_base_str,
+            is_https,
         }
     }
 
-    pub fn matrix_origin(&self) -> String {
-        origin_string(&self.matrix_base)
+    /// Precomputes a static `PublicContext` once per profile when `matrix_proxy_public_url` is configured,
+    /// avoiding all per-request `Url` cloning and origin string allocations on the hot path.
+    pub fn from_profile_static(profile: &ProxyProfile) -> Option<Self> {
+        profile
+            .matrix_proxy_public_url
+            .clone()
+            .map(|base| Self::from_matrix_base(profile, base))
     }
 
-    pub fn auth_origin(&self) -> String {
-        origin_string(&self.auth_base)
+    pub fn from_request(profile: &ProxyProfile, client: &ClientInfo, headers: &HeaderMap) -> Self {
+        let matrix_base = profile
+            .matrix_proxy_public_url
+            .clone()
+            .unwrap_or_else(|| infer_public_url(client, headers));
+        Self::from_matrix_base(profile, matrix_base)
+    }
+
+    pub fn matrix_origin(&self) -> &str {
+        &self.matrix_origin_str
+    }
+
+    pub fn auth_origin(&self) -> &str {
+        &self.auth_origin_str
     }
 
     pub fn public_is_https(&self) -> bool {
-        self.matrix_base.scheme().eq_ignore_ascii_case("https")
+        self.is_https
     }
 }
 
@@ -194,13 +223,13 @@ impl<'a> RewriteEngine<'a> {
             && (raw_origin != matrix_origin || prefer_auth))
             || (prefer_auth && (matches_extra_auth || matches_configured_rewrite))
         {
-            Some(normalized_base_url(&self.public.auth_base))
+            Some(self.public.auth_base_str.as_str())
         } else if raw_origin == matrix_origin
             || wk_hs_origin == Some(raw_origin.as_str())
             || matches_configured_rewrite
             || matches_extra_auth
         {
-            Some(normalized_base_url(&self.public.matrix_base))
+            Some(self.public.matrix_base_str.as_str())
         } else {
             None
         };
@@ -210,7 +239,7 @@ impl<'a> RewriteEngine<'a> {
         };
 
         let mut out = String::with_capacity(raw.len() + 32);
-        out.push_str(&base);
+        out.push_str(base);
 
         let path = parsed.path();
         if path == "/" {
@@ -591,12 +620,12 @@ impl<'a> RewriteEngine<'a> {
 
         for orig in self.all_auth_origins() {
             if orig != pub_auth && result.contains(orig) {
-                result = result.replace(orig, &pub_auth);
+                result = result.replace(orig, pub_auth);
             }
         }
         let matrix_origin = self.upstreams.matrix_origin.as_str();
         if matrix_origin != pub_matrix && result.contains(matrix_origin) {
-            result = result.replace(matrix_origin, &pub_matrix);
+            result = result.replace(matrix_origin, pub_matrix);
         }
         if !self.public.public_is_https() {
             // Avoid browsers upgrading `http://ip:port` assets/forms to non-existent HTTPS.
@@ -659,7 +688,7 @@ impl<'a> RewriteEngine<'a> {
             if trimmed == pub_origin {
                 return Some(target_origin);
             }
-            if let Some(rest) = trimmed.strip_prefix(&pub_origin)
+            if let Some(rest) = trimmed.strip_prefix(pub_origin)
                 && (rest.is_empty() || rest.starts_with('/'))
             {
                 let clean_rest = if strip_auth_prefix {

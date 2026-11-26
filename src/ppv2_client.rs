@@ -4,18 +4,19 @@ use crate::metrics::ProxyMetrics;
 use crate::ws::{
     build_client_tls_config, connect_via_proxy, fallback_dst_addr, trim_ipv6_brackets,
 };
+use ahash::AHashMap;
 use anyhow::{Context, Result, anyhow};
 use axum::body::Body;
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use parking_lot::Mutex;
 use rustls::pki_types::ServerName;
 use socket2::{SockRef, TcpKeepalive};
-use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -66,23 +67,23 @@ pub struct Ppv2Client {
     tcp_keepalive: Duration,
     tcp_nodelay: bool,
     max_entries: usize,
-    h2_pool: Mutex<HashMap<PoolKey, H2Entry>>,
-    h1_pool: Mutex<HashMap<PoolKey, Vec<H1Entry>>>,
+    h2_pool: Mutex<AHashMap<PoolKey, H2Entry>>,
+    h1_pool: Mutex<AHashMap<PoolKey, Vec<H1Entry>>>,
     /// Per-key singleflight coalescing map preventing cold-start TLS/H2 handshake stampedes.
-    in_flight: Arc<Mutex<HashMap<PoolKey, Arc<Notify>>>>,
+    in_flight: Arc<Mutex<AHashMap<PoolKey, Arc<Notify>>>>,
     last_sweep: Mutex<Instant>,
     metrics: Option<Arc<ProxyMetrics>>,
 }
 
 struct InFlightGuard {
-    map: Arc<Mutex<HashMap<PoolKey, Arc<Notify>>>>,
+    map: Arc<Mutex<AHashMap<PoolKey, Arc<Notify>>>>,
     key: PoolKey,
     notify: Arc<Notify>,
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.map.lock();
         if map
             .get(&self.key)
             .is_some_and(|existing| Arc::ptr_eq(existing, &self.notify))
@@ -119,9 +120,9 @@ impl Ppv2Client {
             tcp_keepalive: Duration::from_secs(server.tcp_keepalive_secs),
             tcp_nodelay: server.tcp_nodelay,
             max_entries: server.proxy_protocol_pool_max_entries.max(64),
-            h2_pool: Mutex::new(HashMap::with_capacity(256)),
-            h1_pool: Mutex::new(HashMap::with_capacity(64)),
-            in_flight: Arc::new(Mutex::new(HashMap::with_capacity(64))),
+            h2_pool: Mutex::new(AHashMap::with_capacity(64)),
+            h1_pool: Mutex::new(AHashMap::with_capacity(16)),
+            in_flight: Arc::new(Mutex::new(AHashMap::with_capacity(32))),
             last_sweep: Mutex::new(Instant::now()),
             metrics,
         })
@@ -285,8 +286,7 @@ impl Ppv2Client {
     }
 
     fn evict_h2(&self, key: &PoolKey) {
-        let mut pool = self.h2_pool.lock().unwrap_or_else(|e| e.into_inner());
-        pool.remove(key);
+        self.h2_pool.lock().remove(key);
     }
 
     fn record_retry(&self) {
@@ -360,7 +360,7 @@ impl Ppv2Client {
     fn try_checkout_pooled(&self, key: &PoolKey) -> Option<SelectedConn> {
         // 1. Fast path: reuse warm multiplexed H2 connection for this `(upstream, proto, client_ip)`.
         {
-            let mut pool = self.h2_pool.lock().unwrap_or_else(|e| e.into_inner());
+            let mut pool = self.h2_pool.lock();
             if let Some(entry) = pool.get_mut(key) {
                 if !entry.sender.is_closed() && entry.last_used.elapsed() < self.idle_timeout {
                     entry.last_used = Instant::now();
@@ -372,7 +372,7 @@ impl Ppv2Client {
 
         // 2. Fast path: reuse idle H1 connection for this `(upstream, proto, client_ip)`.
         {
-            let mut pool = self.h1_pool.lock().unwrap_or_else(|e| e.into_inner());
+            let mut pool = self.h1_pool.lock();
             if let Some(vec) = pool.get_mut(key) {
                 while let Some(entry) = vec.pop() {
                     if !entry.sender.is_closed() && entry.last_used.elapsed() < self.idle_timeout {
@@ -404,7 +404,7 @@ impl Ppv2Client {
         // Singleflight cold-dial coalescing: if another task is already dialing this exact PoolKey,
         // wait briefly for it to populate `h2_pool` instead of opening redundant TLS/H2 connections.
         let (waiter, leader_guard) = {
-            let mut inflight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+            let mut inflight = self.in_flight.lock();
             if let Some(existing) = inflight.get(key) {
                 (Some(Arc::clone(existing)), None)
             } else {
@@ -467,8 +467,8 @@ impl Ppv2Client {
             h2_builder
                 .timer(TokioTimer::new())
                 .adaptive_window(true)
-                .initial_stream_window_size(1024 * 1024)
-                .initial_connection_window_size(4 * 1024 * 1024)
+                .initial_stream_window_size(512 * 1024)
+                .initial_connection_window_size(2 * 1024 * 1024)
                 .keep_alive_interval(Duration::from_secs(30))
                 .keep_alive_timeout(Duration::from_secs(20))
                 .keep_alive_while_idle(true);
@@ -564,7 +564,7 @@ impl Ppv2Client {
 
     fn maybe_sweep_stale_pools(&self, now: Instant) {
         let should_sweep = {
-            let mut last = self.last_sweep.lock().unwrap_or_else(|e| e.into_inner());
+            let mut last = self.last_sweep.lock();
             if now.duration_since(*last) >= Duration::from_secs(60) {
                 *last = now;
                 true
@@ -576,7 +576,7 @@ impl Ppv2Client {
             return;
         }
         {
-            let mut pool = self.h2_pool.lock().unwrap_or_else(|e| e.into_inner());
+            let mut pool = self.h2_pool.lock();
             if pool.len() > 32 {
                 pool.retain(|_, v| {
                     !v.sender.is_closed() && now.duration_since(v.last_used) < self.idle_timeout
@@ -584,7 +584,7 @@ impl Ppv2Client {
             }
         }
         {
-            let mut pool = self.h1_pool.lock().unwrap_or_else(|e| e.into_inner());
+            let mut pool = self.h1_pool.lock();
             if pool.len() > 32 {
                 pool.retain(|_, vec| {
                     vec.retain(|e| {
@@ -599,7 +599,7 @@ impl Ppv2Client {
     fn store_h2(&self, key: PoolKey, sender: hyper::client::conn::http2::SendRequest<Body>) {
         let now = Instant::now();
         self.maybe_sweep_stale_pools(now);
-        let mut pool = self.h2_pool.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pool = self.h2_pool.lock();
         if pool.len() >= self.max_entries {
             pool.retain(|_, v| {
                 !v.sender.is_closed() && now.duration_since(v.last_used) < self.idle_timeout
@@ -625,7 +625,7 @@ impl Ppv2Client {
     }
 
     fn return_h1(&self, key: PoolKey, sender: hyper::client::conn::http1::SendRequest<Body>) {
-        let mut pool = self.h1_pool.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pool = self.h1_pool.lock();
         let now = Instant::now();
         if pool.len() >= self.max_entries {
             pool.retain(|_, vec| {

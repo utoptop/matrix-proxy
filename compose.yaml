@@ -1,5 +1,5 @@
 # =============================================================================
-# matrix-proxy v1.6 — Hardened Docker Compose Example
+# matrix-proxy v2.0 — Hardened Docker Compose Example
 # Quick start:
 #   cp config.example.toml config.toml
 #   docker compose up -d

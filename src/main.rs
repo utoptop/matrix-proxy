@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow};
+use arc_swap::ArcSwap;
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use clap::Parser;
@@ -19,6 +20,7 @@ use matrix_proxy::proxy::{
     ListenerState, LiveListener, ReloadFn, ReloadReport, build_live_listener_router,
 };
 use matrix_proxy::ws::build_client_tls_config;
+use parking_lot::RwLock;
 use rustls::pki_types::{PrivateKeyDer, ServerName};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::{HashMap, HashSet};
@@ -26,8 +28,8 @@ use std::fs::File;
 use std::io::BufReader;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -37,6 +39,12 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tower::ServiceExt;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
+
+/// Ultra-low-fragmentation global slab allocator (`mimalloc`) with fast OS page purging
+/// (`MIMALLOC_PURGE_DELAY=500`), eliminating glibc `ptmalloc2` multi-arena RSS retention.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -144,7 +152,7 @@ impl Drop for ConnGuard {
 
 struct ActiveListener {
     live: Arc<LiveListener>,
-    accept_cfg: Arc<RwLock<AcceptConfig>>,
+    accept_cfg: Arc<ArcSwap<AcceptConfig>>,
     stop_tx: watch::Sender<bool>,
     join: tokio::task::JoinHandle<Result<()>>,
 }
@@ -177,12 +185,11 @@ impl ReloadCoordinator {
 
     fn resolve_media_cache(&self, runtime: &RuntimeConfig) -> Option<Arc<MediaCache>> {
         if !runtime.server.media_cache.enabled {
-            let mut guard = self.media_cache.write().unwrap_or_else(|e| e.into_inner());
-            *guard = None;
+            *self.media_cache.write() = None;
             return None;
         }
         {
-            let guard = self.media_cache.read().unwrap_or_else(|e| e.into_inner());
+            let guard = self.media_cache.read();
             if let Some(existing) = guard.as_ref()
                 && existing.config() == &runtime.server.media_cache
             {
@@ -193,8 +200,7 @@ impl ReloadCoordinator {
             runtime.server.media_cache.clone(),
             Arc::clone(&self.metrics),
         );
-        let mut guard = self.media_cache.write().unwrap_or_else(|e| e.into_inner());
-        *guard = Some(Arc::clone(&fresh));
+        *self.media_cache.write() = Some(Arc::clone(&fresh));
         Some(fresh)
     }
 
@@ -213,9 +219,8 @@ impl ReloadCoordinator {
     }
 
     async fn start_initial(self: &Arc<Self>, runtime: Arc<RuntimeConfig>) -> Result<()> {
-        *self.grace_secs.write().unwrap_or_else(|e| e.into_inner()) =
-            runtime.server.shutdown_grace_secs;
-        *self.watched_tls.write().unwrap_or_else(|e| e.into_inner()) = runtime.tls_watched_paths();
+        *self.grace_secs.write() = runtime.server.shutdown_grace_secs;
+        *self.watched_tls.write() = runtime.tls_watched_paths();
 
         let prepared = self.prepare_listeners(&runtime).await?;
         let reload_fn = self.make_reload_fn();
@@ -300,10 +305,7 @@ impl ReloadCoordinator {
             if let Some(existing) = map.get(&listen_addr) {
                 existing.live.swap(state);
                 let new_accept = AcceptConfig::from_plan(Arc::clone(&runtime), &plan, tls_acceptor);
-                *existing
-                    .accept_cfg
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner()) = new_accept;
+                existing.accept_cfg.store(Arc::new(new_accept));
                 info!(
                     listen = %listen_addr,
                     tls = plan.tls_enabled(),
@@ -342,9 +344,8 @@ impl ReloadCoordinator {
             }
         }
 
-        *self.grace_secs.write().unwrap_or_else(|e| e.into_inner()) =
-            runtime.server.shutdown_grace_secs;
-        *self.watched_tls.write().unwrap_or_else(|e| e.into_inner()) = runtime.tls_watched_paths();
+        *self.grace_secs.write() = runtime.server.shutdown_grace_secs;
+        *self.watched_tls.write() = runtime.tls_watched_paths();
 
         let generation = self.metrics.record_reload_success();
         info!(
@@ -429,7 +430,7 @@ impl ReloadCoordinator {
 
         let live = LiveListener::new(state, Arc::clone(&self.metrics), reload_fn);
         let app = build_live_listener_router(Arc::clone(&live));
-        let accept_cfg = Arc::new(RwLock::new(AcceptConfig::from_plan(
+        let accept_cfg = Arc::new(ArcSwap::from_pointee(AcceptConfig::from_plan(
             Arc::clone(runtime),
             &plan,
             tls_acceptor,
@@ -458,7 +459,7 @@ impl ReloadCoordinator {
         if let Some(cfg) = &self.config_path {
             paths.push(cfg.clone());
         }
-        let tls = self.watched_tls.read().unwrap_or_else(|e| e.into_inner());
+        let tls = self.watched_tls.read();
         for p in tls.iter() {
             if !paths.contains(p) {
                 paths.push(p.clone());
@@ -468,9 +469,7 @@ impl ReloadCoordinator {
     }
 
     async fn shutdown_all(&self) {
-        let grace = Duration::from_secs(
-            (*self.grace_secs.read().unwrap_or_else(|e| e.into_inner())).max(1),
-        );
+        let grace = Duration::from_secs((*self.grace_secs.read()).max(1));
         let drained: Vec<ActiveListener> = {
             let mut map = self.listeners.lock().await;
             map.drain().map(|(_, v)| v).collect()
@@ -499,8 +498,20 @@ impl ReloadCoordinator {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Bounded Tokio runtime: caps blocking thread pool at 16 with 15s idle expiry
+    // so short-lived disk/scan bursts never accumulate idle thread stacks or thread-local caches.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(16)
+        .thread_keep_alive(Duration::from_secs(15))
+        .build()
+        .context("failed to build Tokio async runtime")?;
+
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let cli = Cli::parse();
@@ -720,7 +731,7 @@ fn bind_high_perf_listener(addr: SocketAddr, backlog: u32) -> Result<TcpListener
 async fn serve_listener(
     listen_addr: SocketAddr,
     listener: TcpListener,
-    accept_cfg: Arc<RwLock<AcceptConfig>>,
+    accept_cfg: Arc<ArcSwap<AcceptConfig>>,
     app: axum::Router,
     tracker: Arc<ConnectionTracker>,
     mut shutdown: watch::Receiver<bool>,
@@ -741,7 +752,7 @@ async fn serve_listener(
                     }
                 };
 
-                let cfg = accept_cfg.read().unwrap_or_else(|e| e.into_inner()).clone();
+                let cfg = accept_cfg.load_full();
                 configure_tcp_socket(&tcp_stream, cfg.tcp_nodelay, cfg.keepalive);
 
                 let app = app.clone();
@@ -809,13 +820,13 @@ async fn serve_listener(
                         .http2()
                         .timer(TokioTimer::new())
                         .adaptive_window(true)
-                        .initial_stream_window_size(1024 * 1024)
-                        .initial_connection_window_size(4 * 1024 * 1024)
+                        .initial_stream_window_size(512 * 1024)
+                        .initial_connection_window_size(2 * 1024 * 1024)
                         .max_concurrent_streams(256)
                         .keep_alive_interval(Duration::from_secs(30))
                         .keep_alive_timeout(Duration::from_secs(20));
 
-                    if let Some(acceptor) = cfg.tls_acceptor {
+                    if let Some(acceptor) = cfg.tls_acceptor.as_ref() {
                         let tls_stream = match tokio::time::timeout(
                             Duration::from_secs(10),
                             acceptor.accept(tcp_stream),
@@ -1283,7 +1294,9 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
 
-            let accept_cfg = Arc::new(RwLock::new(AcceptConfig::from_plan(runtime, &plan, None)));
+            let accept_cfg = Arc::new(ArcSwap::from_pointee(AcceptConfig::from_plan(
+                runtime, &plan, None,
+            )));
             let tracker = Arc::new(ConnectionTracker::default());
             let (tx, rx) = watch::channel(false);
             let server_task = tokio::spawn(async move {

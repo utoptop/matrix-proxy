@@ -3,6 +3,7 @@ use crate::config::{AvatarThumbSpec, MediaCacheConfig, ProxyProfile};
 use crate::metrics::ProxyMetrics;
 use crate::ppv2_client::Ppv2Client;
 use crate::rewrite::build_upstream_target_url;
+use ahash::{AHashMap, AHashSet};
 use anyhow::{Context, Result, anyhow};
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, Method, Response, StatusCode};
@@ -10,16 +11,17 @@ use bytes::{Bytes, BytesMut};
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use futures_util::{Stream, StreamExt};
 use http_body_util::BodyExt;
+use parking_lot::Mutex;
 use ring::digest;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -28,17 +30,37 @@ use tracing::{debug, info, warn};
 use url::Url;
 
 const DISK_CACHE_MAGIC: &[u8; 8] = b"MPMC01\0\0";
-const MAX_VERIFIED_TOKENS: usize = 4096;
+const CACHE_SHARDS: usize = 16;
+const MAX_VERIFIED_TOKENS_PER_SHARD: usize = 256; // 4096 total across 16 shards
 const MAX_OBSERVED_AVATAR_SIZES: usize = 2;
-const MAX_EFFECTIVE_AVATAR_SIZES: usize = 4;
+const MAX_EFFECTIVE_AVATAR_SIZES: usize = 2;
 const MAX_DECOMPRESSED_SCAN_BYTES: usize = 8 * 1024 * 1024;
+const STREAM_SCAN_CHUNK_BYTES: usize = 32 * 1024;
+const STREAM_SCAN_OVERLAP_BYTES: usize = 1024;
 pub const MAX_PRELOAD_SCAN_RAW_BYTES: usize = 2 * 1024 * 1024;
 const PRELOAD_QUEUE_CAPACITY: usize = 128;
 const PRELOAD_RECENT_TTL: Duration = Duration::from_secs(600);
 const PRELOAD_RECENT_MAX_ENTRIES: usize = 4096;
-const MAX_HINTS_PER_PAYLOAD: usize = 48;
+const MAX_HINTS_PER_PAYLOAD: usize = 24;
 const DISK_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 pub const IMMUTABLE_MEDIA_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
+
+/// Fixed-size binary SHA-256 cache key (32 bytes inline, zero heap allocations).
+pub type CacheKey = [u8; 32];
+
+#[inline]
+fn shard_of(key: &CacheKey) -> usize {
+    (key[0] as usize) & (CACHE_SHARDS - 1)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorePolicy {
+    /// Real client fetch: populate both L1 hot RAM (if small enough) and L2 disk.
+    ClientHot,
+    /// Background proactive preloader: write L2 disk ONLY when disk is enabled (never evict
+    /// hot L1 RAM items); falls back to L1 only in RAM-only mode without disk.
+    BackgroundPreload,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaEndpointFamily {
@@ -83,7 +105,7 @@ impl MediaRouteInfo {
         self.family.requires_auth()
     }
 
-    pub fn cache_key(&self, profile_name: &str, upstream_origin: &str) -> String {
+    pub fn cache_key(&self, profile_name: &str, upstream_origin: &str) -> CacheKey {
         if self.is_thumbnail {
             compute_cache_key_raw(
                 profile_name,
@@ -114,6 +136,16 @@ impl MediaRouteInfo {
             self.media_id
         )
     }
+
+    /// Returns true if this thumbnail looks like a small square avatar (`width == height <= 256`),
+    /// which clients almost never tap to fetch a multi-MB full download.
+    pub fn is_avatar_sized_thumbnail(&self) -> bool {
+        self.is_thumbnail
+            && self
+                .thumbnail_spec
+                .as_ref()
+                .is_some_and(|s| s.width == s.height && s.width <= 256)
+    }
 }
 
 pub fn cache_key_for_download(
@@ -121,7 +153,7 @@ pub fn cache_key_for_download(
     upstream_origin: &str,
     server_name: &str,
     media_id: &str,
-) -> String {
+) -> CacheKey {
     compute_cache_key_raw(
         profile_name,
         upstream_origin,
@@ -138,7 +170,7 @@ pub fn cache_key_for_thumbnail(
     server_name: &str,
     media_id: &str,
     spec: &AvatarThumbSpec,
-) -> String {
+) -> CacheKey {
     let query = format!(
         "height={}&method={}&width={}",
         spec.height, spec.method, spec.width
@@ -160,10 +192,23 @@ fn compute_cache_key_raw(
     server_name: &str,
     media_id: &str,
     extra: &str,
-) -> String {
-    let raw =
-        format!("{profile_name}\0{upstream_origin}\0{kind}\0{server_name}\0{media_id}\0{extra}");
-    sha256_hex(raw.as_bytes())
+) -> CacheKey {
+    let mut ctx = digest::Context::new(&digest::SHA256);
+    ctx.update(profile_name.as_bytes());
+    ctx.update(b"\0");
+    ctx.update(upstream_origin.as_bytes());
+    ctx.update(b"\0");
+    ctx.update(kind.as_bytes());
+    ctx.update(b"\0");
+    ctx.update(server_name.as_bytes());
+    ctx.update(b"\0");
+    ctx.update(media_id.as_bytes());
+    ctx.update(b"\0");
+    ctx.update(extra.as_bytes());
+    let d = ctx.finish();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(d.as_ref());
+    out
 }
 
 /// Parses Matrix Client-Server media download/thumbnail GET/HEAD routes into a canonical descriptor.
@@ -234,40 +279,44 @@ pub fn parse_matrix_media_route(method: &Method, url: &Url) -> Option<MediaRoute
 }
 
 fn canonicalize_thumbnail_query(query: Option<&str>) -> (String, Option<AvatarThumbSpec>) {
-    let mut params: BTreeMap<String, String> = BTreeMap::new();
+    let mut params: BTreeMap<&'static str, String> = BTreeMap::new();
     if let Some(q) = query {
         for (k, v) in url::form_urlencoded::parse(q.as_bytes()) {
-            let key = k.to_ascii_lowercase();
-            match key.as_str() {
-                "width" | "height" => {
+            let key_lower = k.to_ascii_lowercase();
+            match key_lower.as_str() {
+                "width" => {
                     let val = v.trim().to_ascii_lowercase();
                     if !val.is_empty() {
-                        params.insert(key, val);
+                        params.insert("width", val);
+                    }
+                }
+                "height" => {
+                    let val = v.trim().to_ascii_lowercase();
+                    if !val.is_empty() {
+                        params.insert("height", val);
                     }
                 }
                 // Per Matrix spec (MSC2705 / v1.11+), omitting `animated` defaults to `false`;
-                // normalize `animated=false` / `0` away so preloaded thumbnails match real clients
-                // (e.g. Element X / matrix-rust-sdk sending `?method=scale&width=192&height=192&animated=false`).
+                // normalize `animated=false` / `0` away so preloaded thumbnails match Element X / matrix-rust-sdk.
                 "animated" => {
                     let val = v.trim().to_ascii_lowercase();
                     if val == "true" || val == "1" {
-                        params.insert(key, "true".to_string());
+                        params.insert("animated", "true".to_string());
                     }
                 }
                 "allow_redirect" => {
                     let val = v.trim().to_ascii_lowercase();
                     if val == "true" || val == "1" {
-                        params.insert(key, "true".to_string());
+                        params.insert("allow_redirect", "true".to_string());
                     }
                 }
                 "method" => {
                     let val = v.trim().to_ascii_lowercase();
                     if val == "crop" || val == "scale" {
-                        params.insert(key, val);
+                        params.insert("method", val);
                     }
                 }
-                // Strip transport-only parameters (`allow_remote`, `timeout_ms`) so identical
-                // thumbnails requested with different client timeout settings share 1 cache entry.
+                // Strip transport-only parameters (`allow_remote`, `timeout_ms`).
                 _ => {}
             }
         }
@@ -347,6 +396,7 @@ pub fn is_preload_scan_path(method: &Method, path: &str) -> bool {
     false
 }
 
+/// On-disk JSON metadata format (100% compatible with v1.6.x `.cache` files).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedMediaMeta {
     pub content_type: String,
@@ -357,21 +407,136 @@ pub struct CachedMediaMeta {
     pub stored_epoch_secs: u64,
 }
 
+/// Zero-heap-allocation MIME representation for 99.9% of Matrix media entries in RAM.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CompactMime {
+    ImagePng,
+    ImageJpeg,
+    ImageWebp,
+    ImageGif,
+    ImageAvif,
+    ImageSvg,
+    VideoMp4,
+    VideoWebm,
+    AudioOgg,
+    AudioMpeg,
+    AudioMp4,
+    AppOctetStream,
+    AppPdf,
+    Other(Box<str>),
+}
+
+impl CompactMime {
+    fn from_str(raw: &str) -> Self {
+        match raw {
+            "image/png" => Self::ImagePng,
+            "image/jpeg" | "image/jpg" => Self::ImageJpeg,
+            "image/webp" => Self::ImageWebp,
+            "image/gif" => Self::ImageGif,
+            "image/avif" => Self::ImageAvif,
+            "image/svg+xml" => Self::ImageSvg,
+            "video/mp4" => Self::VideoMp4,
+            "video/webm" => Self::VideoWebm,
+            "audio/ogg" => Self::AudioOgg,
+            "audio/mpeg" => Self::AudioMpeg,
+            "audio/mp4" => Self::AudioMp4,
+            "application/octet-stream" => Self::AppOctetStream,
+            "application/pdf" => Self::AppPdf,
+            other => Self::Other(other.into()),
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Self::ImagePng => "image/png",
+            Self::ImageJpeg => "image/jpeg",
+            Self::ImageWebp => "image/webp",
+            Self::ImageGif => "image/gif",
+            Self::ImageAvif => "image/avif",
+            Self::ImageSvg => "image/svg+xml",
+            Self::VideoMp4 => "video/mp4",
+            Self::VideoWebm => "video/webm",
+            Self::AudioOgg => "audio/ogg",
+            Self::AudioMpeg => "audio/mpeg",
+            Self::AudioMp4 => "audio/mp4",
+            Self::AppOctetStream => "application/octet-stream",
+            Self::AppPdf => "application/pdf",
+            Self::Other(s) => s,
+        }
+    }
+}
+
+/// Compact in-memory metadata (~56 bytes inline, 0 heap allocs for standard thumbnails/avatars).
+#[derive(Debug, Clone)]
+pub struct CompactMeta {
+    mime: CompactMime,
+    content_disposition: Option<Box<str>>,
+    /// `None` means default deterministic ETag (`"<first 24 hex chars of key>"`), saving heap allocs.
+    custom_etag: Option<Box<str>>,
+    pub requires_auth: bool,
+    pub body_len: u64,
+    pub stored_epoch_secs: u64,
+}
+
+impl CompactMeta {
+    pub fn from_cached(key: &CacheKey, meta: &CachedMediaMeta) -> Self {
+        let default_etag = default_etag_for_key(key);
+        let custom_etag = if meta.etag == default_etag {
+            None
+        } else {
+            Some(meta.etag.clone().into_boxed_str())
+        };
+        Self {
+            mime: CompactMime::from_str(&meta.content_type),
+            content_disposition: meta
+                .content_disposition
+                .as_deref()
+                .map(|s| s.to_string().into_boxed_str()),
+            custom_etag,
+            requires_auth: meta.requires_auth,
+            body_len: meta.body_len,
+            stored_epoch_secs: meta.stored_epoch_secs,
+        }
+    }
+
+    pub fn content_type(&self) -> &str {
+        self.mime.as_str()
+    }
+
+    pub fn etag(&self, key: &CacheKey) -> String {
+        match &self.custom_etag {
+            Some(e) => e.to_string(),
+            None => default_etag_for_key(key),
+        }
+    }
+
+    pub fn to_disk_meta(&self, key: &CacheKey) -> CachedMediaMeta {
+        CachedMediaMeta {
+            content_type: self.mime.as_str().to_string(),
+            content_disposition: self.content_disposition.as_deref().map(ToString::to_string),
+            etag: self.etag(key),
+            requires_auth: self.requires_auth,
+            body_len: self.body_len,
+            stored_epoch_secs: self.stored_epoch_secs,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum CacheHit {
     Ram {
-        meta: CachedMediaMeta,
+        meta: CompactMeta,
         data: Bytes,
     },
     Disk {
-        meta: CachedMediaMeta,
+        meta: CompactMeta,
         path: PathBuf,
         data_offset: u64,
     },
 }
 
 impl CacheHit {
-    pub fn meta(&self) -> &CachedMediaMeta {
+    pub fn meta(&self) -> &CompactMeta {
         match self {
             Self::Ram { meta, .. } | Self::Disk { meta, .. } => meta,
         }
@@ -382,32 +547,167 @@ impl CacheHit {
     }
 }
 
-struct L1Entry {
-    meta: CachedMediaMeta,
-    data: Bytes,
-    last_seq: u64,
+// =============================================================================
+// Strict O(1) Safe Doubly-Linked Arena LRU Map (Zero Unsafe, Zero Linear Scans)
+// =============================================================================
+
+const LRU_NONE: usize = usize::MAX;
+
+struct LruNode<V> {
+    key: CacheKey,
+    value: V,
+    bytes: u64,
+    prev: usize,
+    next: usize,
 }
 
-#[derive(Default)]
-struct L1State {
-    entries: HashMap<String, L1Entry>,
-    total_bytes: usize,
-    seq: u64,
+struct LruMap<V> {
+    index: AHashMap<CacheKey, usize>,
+    nodes: Vec<Option<LruNode<V>>>,
+    free_slots: Vec<usize>,
+    head: usize, // MRU
+    tail: usize, // LRU (evicted in O(1))
+    total_bytes: u64,
+}
+
+impl<V> Default for LruMap<V> {
+    fn default() -> Self {
+        Self {
+            index: AHashMap::new(),
+            nodes: Vec::new(),
+            free_slots: Vec::new(),
+            head: LRU_NONE,
+            tail: LRU_NONE,
+            total_bytes: 0,
+        }
+    }
+}
+
+impl<V> LruMap<V> {
+    fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    fn contains_key(&self, key: &CacheKey) -> bool {
+        self.index.contains_key(key)
+    }
+
+    fn get_and_touch(&mut self, key: &CacheKey) -> Option<&V> {
+        let &slot = self.index.get(key)?;
+        self.move_to_front(slot);
+        self.nodes[slot].as_ref().map(|n| &n.value)
+    }
+
+    fn insert(&mut self, key: CacheKey, value: V, bytes: u64) -> Option<(CacheKey, V, u64)> {
+        let prev = self.remove(&key);
+        let slot = if let Some(free) = self.free_slots.pop() {
+            self.nodes[free] = Some(LruNode {
+                key,
+                value,
+                bytes,
+                prev: LRU_NONE,
+                next: self.head,
+            });
+            free
+        } else {
+            let slot = self.nodes.len();
+            self.nodes.push(Some(LruNode {
+                key,
+                value,
+                bytes,
+                prev: LRU_NONE,
+                next: self.head,
+            }));
+            slot
+        };
+        if self.head != LRU_NONE
+            && let Some(old_head) = self.nodes[self.head].as_mut()
+        {
+            old_head.prev = slot;
+        } else {
+            self.tail = slot;
+        }
+        self.head = slot;
+        self.index.insert(key, slot);
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+        prev
+    }
+
+    fn remove(&mut self, key: &CacheKey) -> Option<(CacheKey, V, u64)> {
+        let slot = self.index.remove(key)?;
+        let node = self.nodes[slot].take()?;
+        self.unlink_links(node.prev, node.next);
+        self.free_slots.push(slot);
+        self.total_bytes = self.total_bytes.saturating_sub(node.bytes);
+        Some((node.key, node.value, node.bytes))
+    }
+
+    fn pop_lru(&mut self) -> Option<(CacheKey, V, u64)> {
+        if self.tail == LRU_NONE {
+            return None;
+        }
+        let slot = self.tail;
+        let node = self.nodes[slot].take()?;
+        self.index.remove(&node.key);
+        self.unlink_links(node.prev, node.next);
+        self.free_slots.push(slot);
+        self.total_bytes = self.total_bytes.saturating_sub(node.bytes);
+        Some((node.key, node.value, node.bytes))
+    }
+
+    fn move_to_front(&mut self, slot: usize) {
+        if self.head == slot {
+            return;
+        }
+        let (prev, next) = match self.nodes[slot].as_ref() {
+            Some(n) => (n.prev, n.next),
+            None => return,
+        };
+        self.unlink_links(prev, next);
+        if let Some(node) = self.nodes[slot].as_mut() {
+            node.prev = LRU_NONE;
+            node.next = self.head;
+        }
+        if self.head != LRU_NONE
+            && let Some(old_head) = self.nodes[self.head].as_mut()
+        {
+            old_head.prev = slot;
+        } else {
+            self.tail = slot;
+        }
+        self.head = slot;
+    }
+
+    fn unlink_links(&mut self, prev: usize, next: usize) {
+        if prev != LRU_NONE {
+            if let Some(p) = self.nodes[prev].as_mut() {
+                p.next = next;
+            }
+        } else {
+            self.head = next;
+        }
+        if next != LRU_NONE {
+            if let Some(n) = self.nodes[next].as_mut() {
+                n.prev = prev;
+            }
+        } else {
+            self.tail = prev;
+        }
+    }
+}
+
+struct L1Entry {
+    meta: CompactMeta,
+    data: Bytes,
 }
 
 struct L2Entry {
-    meta: CachedMediaMeta,
-    path: PathBuf,
-    file_bytes: u64,
+    meta: CompactMeta,
     data_offset: u64,
-    last_seq: u64,
-}
-
-#[derive(Default)]
-struct L2State {
-    entries: HashMap<String, L2Entry>,
-    total_bytes: u64,
-    seq: u64,
 }
 
 pub enum InFlightOutcome {
@@ -417,72 +717,86 @@ pub enum InFlightOutcome {
 
 pub struct InFlightGuard {
     cache: Arc<MediaCache>,
-    key: String,
+    key: CacheKey,
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        let notify = {
-            let mut map = self
-                .cache
-                .in_flight
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            map.remove(&self.key)
-        };
+        let notify = self.cache.in_flight[shard_of(&self.key)]
+            .lock()
+            .remove(&self.key);
         if let Some(n) = notify {
             n.notify_waiters();
         }
     }
 }
 
-/// Auth-safe two-tier immutable Matrix media cache:
-/// - L1 hot RAM LRU (avatars/thumbnails `<= ram_max_item_kb`, strictly capped at `ram_max_mb`)
-/// - L2 optional persistent SSD/disk LRU (single atomic file per object, strictly capped at `disk_max_mb`)
-/// - Singleflight miss coalescing + verified Bearer token SHA-256 cache + adaptive avatar size tracking.
+/// Auth-safe 16-shard O(1) two-tier immutable Matrix media cache:
+/// - L1 hot RAM LRU (16 shards, strict O(1) eviction, ONLY populated by real client traffic unless RAM-only)
+/// - L2 optional persistent SSD/disk LRU (16 shards, compact ~64B/entry index with zero PathBuf storage)
+/// - 16-shard singleflight miss coalescing + SHA-256 verified Bearer token cache.
 pub struct MediaCache {
     config: MediaCacheConfig,
     metrics: Arc<ProxyMetrics>,
-    ram_max_bytes: usize,
+    ram_max_bytes: u64,
+    ram_shard_cap: u64,
     ram_max_item_bytes: usize,
     disk_max_bytes: u64,
+    disk_shard_cap: u64,
     max_item_bytes: usize,
     auth_ttl: Duration,
-    l1: Mutex<L1State>,
+    l1_shards: Vec<Mutex<LruMap<L1Entry>>>,
     disk_dir: Option<PathBuf>,
-    l2: Mutex<L2State>,
-    verified_tokens: Mutex<HashMap<[u8; 32], Instant>>,
-    observed_avatar_sizes: Mutex<HashMap<String, VecDeque<AvatarThumbSpec>>>,
-    in_flight: Mutex<HashMap<String, Arc<Notify>>>,
+    l2_shards: Vec<Mutex<LruMap<L2Entry>>>,
+    verified_tokens: Vec<Mutex<AHashMap<CacheKey, Instant>>>,
+    observed_avatar_sizes: Mutex<AHashMap<String, VecDeque<AvatarThumbSpec>>>,
+    in_flight: Vec<Mutex<AHashMap<CacheKey, Arc<Notify>>>>,
     tmp_seq: AtomicU64,
 }
 
 impl MediaCache {
     pub fn new(config: MediaCacheConfig, metrics: Arc<ProxyMetrics>) -> Arc<Self> {
-        let ram_max_bytes = config.ram_max_bytes();
+        let ram_max_bytes = config.ram_max_bytes() as u64;
         let ram_max_item_bytes = config.ram_max_item_bytes();
         let disk_max_bytes = config.disk_max_bytes();
         let max_item_bytes = config.max_item_bytes();
         let auth_ttl = Duration::from_secs(config.auth_cache_ttl_secs.clamp(5, 3600));
 
-        let (disk_dir, initial_l2) = if disk_max_bytes > 0
+        let ram_shard_cap = if ram_max_bytes == 0 {
+            0
+        } else {
+            (ram_max_bytes / CACHE_SHARDS as u64).max(ram_max_item_bytes as u64)
+        };
+        let disk_shard_cap = if disk_max_bytes == 0 {
+            0
+        } else {
+            (disk_max_bytes / CACHE_SHARDS as u64).max(max_item_bytes as u64)
+        };
+
+        let mut l2_shards: Vec<LruMap<L2Entry>> =
+            (0..CACHE_SHARDS).map(|_| LruMap::default()).collect();
+        let mut initial_disk_bytes = 0u64;
+
+        let disk_dir = if disk_max_bytes > 0
             && let Some(raw_dir) = config
                 .dir
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
         {
-            match init_disk_cache_dir(Path::new(raw_dir), disk_max_bytes) {
-                Ok((dir, state)) => {
+            match init_disk_cache_dir(Path::new(raw_dir), disk_shard_cap, &mut l2_shards) {
+                Ok((dir, entries, total_bytes)) => {
+                    initial_disk_bytes = total_bytes;
                     info!(
                         dir = %dir.display(),
-                        existing_entries = state.entries.len(),
-                        existing_bytes = state.total_bytes,
+                        existing_entries = entries,
+                        existing_bytes = initial_disk_bytes,
                         disk_max_mb = config.disk_max_mb,
                         ram_max_mb = config.ram_max_mb,
-                        "media edge cache initialized (L1 RAM + L2 disk)"
+                        shards = CACHE_SHARDS,
+                        "media edge cache initialized (16-shard O(1) L1 RAM + L2 disk)"
                     );
-                    (Some(dir), state)
+                    Some(dir)
                 }
                 Err(err) => {
                     warn!(
@@ -490,37 +804,51 @@ impl MediaCache {
                         error = %format!("{err:#}"),
                         "media edge cache disk directory unavailable; falling back to L1 RAM cache only"
                     );
-                    (None, L2State::default())
+                    None
                 }
             }
         } else {
             info!(
                 ram_max_mb = config.ram_max_mb,
                 ram_max_item_kb = config.ram_max_item_kb,
-                "media edge cache initialized (L1 RAM only)"
+                shards = CACHE_SHARDS,
+                "media edge cache initialized (16-shard O(1) L1 RAM only)"
             );
-            (None, L2State::default())
+            None
         };
 
         metrics.media_cache_ram_bytes.store(0, Ordering::Relaxed);
         metrics
             .media_cache_disk_bytes
-            .store(initial_l2.total_bytes, Ordering::Relaxed);
+            .store(initial_disk_bytes, Ordering::Relaxed);
+
+        let l1_shards = (0..CACHE_SHARDS)
+            .map(|_| Mutex::new(LruMap::default()))
+            .collect();
+        let l2_shards = l2_shards.into_iter().map(Mutex::new).collect();
+        let verified_tokens = (0..CACHE_SHARDS)
+            .map(|_| Mutex::new(AHashMap::with_capacity(16)))
+            .collect();
+        let in_flight = (0..CACHE_SHARDS)
+            .map(|_| Mutex::new(AHashMap::with_capacity(8)))
+            .collect();
 
         Arc::new(Self {
             config,
             metrics,
             ram_max_bytes,
+            ram_shard_cap,
             ram_max_item_bytes,
             disk_max_bytes,
+            disk_shard_cap,
             max_item_bytes,
             auth_ttl,
-            l1: Mutex::new(L1State::default()),
+            l1_shards,
             disk_dir,
-            l2: Mutex::new(initial_l2),
-            verified_tokens: Mutex::new(HashMap::new()),
-            observed_avatar_sizes: Mutex::new(HashMap::new()),
-            in_flight: Mutex::new(HashMap::new()),
+            l2_shards,
+            verified_tokens,
+            observed_avatar_sizes: Mutex::new(AHashMap::with_capacity(8)),
+            in_flight,
             tmp_seq: AtomicU64::new(1),
         })
     }
@@ -540,21 +868,12 @@ impl MediaCache {
     pub fn record_verified_token(&self, profile: &str, token: &str) {
         let hash = token_hash(profile, token);
         let now = Instant::now();
-        let mut map = self
-            .verified_tokens
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if map.len() >= MAX_VERIFIED_TOKENS && !map.contains_key(&hash) {
+        let mut map = self.verified_tokens[shard_of(&hash)].lock();
+        if map.len() >= MAX_VERIFIED_TOKENS_PER_SHARD && !map.contains_key(&hash) {
             let ttl = self.auth_ttl;
             map.retain(|_, ts| now.duration_since(*ts) < ttl);
-            if map.len() >= MAX_VERIFIED_TOKENS {
-                // Evict oldest quarter to stay strictly bounded.
-                let mut by_age: Vec<([u8; 32], Instant)> =
-                    map.iter().map(|(k, v)| (*k, *v)).collect();
-                by_age.sort_by_key(|(_, ts)| *ts);
-                for (k, _) in by_age.into_iter().take(MAX_VERIFIED_TOKENS / 4) {
-                    map.remove(&k);
-                }
+            if map.len() >= MAX_VERIFIED_TOKENS_PER_SHARD {
+                map.clear();
             }
         }
         map.insert(hash, now);
@@ -562,20 +881,13 @@ impl MediaCache {
 
     pub fn revoke_token(&self, profile: &str, token: &str) {
         let hash = token_hash(profile, token);
-        let mut map = self
-            .verified_tokens
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        map.remove(&hash);
+        self.verified_tokens[shard_of(&hash)].lock().remove(&hash);
     }
 
     pub fn is_token_verified(&self, profile: &str, token: &str) -> bool {
         let hash = token_hash(profile, token);
         let now = Instant::now();
-        let mut map = self
-            .verified_tokens
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut map = self.verified_tokens[shard_of(&hash)].lock();
         match map.get(&hash).copied() {
             Some(ts) if now.duration_since(ts) < self.auth_ttl => true,
             Some(_) => {
@@ -592,10 +904,7 @@ impl MediaCache {
         if spec.width != spec.height || !(24..=256).contains(&spec.width) {
             return;
         }
-        let mut map = self
-            .observed_avatar_sizes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut map = self.observed_avatar_sizes.lock();
         let queue = map.entry(profile.to_string()).or_default();
         if let Some(pos) = queue.iter().position(|existing| existing == spec) {
             queue.remove(pos);
@@ -613,10 +922,7 @@ impl MediaCache {
     ) -> Vec<AvatarThumbSpec> {
         let mut out = Vec::with_capacity(MAX_EFFECTIVE_AVATAR_SIZES);
         {
-            let map = self
-                .observed_avatar_sizes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let map = self.observed_avatar_sizes.lock();
             if let Some(observed) = map.get(profile) {
                 for spec in observed {
                     if out.len() >= MAX_EFFECTIVE_AVATAR_SIZES {
@@ -639,113 +945,83 @@ impl MediaCache {
         out
     }
 
-    pub fn contains_key(&self, key: &str) -> bool {
-        {
-            let l1 = self.l1.lock().unwrap_or_else(|e| e.into_inner());
-            if l1.entries.contains_key(key) {
-                return true;
-            }
+    pub fn contains_key(&self, key: &CacheKey) -> bool {
+        let s = shard_of(key);
+        if self.l1_shards[s].lock().contains_key(key) {
+            return true;
         }
-        let l2 = self.l2.lock().unwrap_or_else(|e| e.into_inner());
-        l2.entries.contains_key(key)
+        self.disk_dir.is_some() && self.l2_shards[s].lock().contains_key(key)
     }
 
-    pub fn begin_in_flight(self: &Arc<Self>, key: &str) -> InFlightOutcome {
-        let mut map = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+    pub fn begin_in_flight(self: &Arc<Self>, key: &CacheKey) -> InFlightOutcome {
+        let mut map = self.in_flight[shard_of(key)].lock();
         if let Some(notify) = map.get(key) {
             return InFlightOutcome::Waiter(Arc::clone(notify));
         }
         let notify = Arc::new(Notify::new());
-        map.insert(key.to_string(), notify);
+        map.insert(*key, notify);
         InFlightOutcome::Leader(InFlightGuard {
             cache: Arc::clone(self),
-            key: key.to_string(),
+            key: *key,
         })
     }
 
-    pub fn lookup(&self, key: &str, caller_is_verified: bool) -> Option<CacheHit> {
+    pub fn lookup(&self, key: &CacheKey, caller_is_verified: bool) -> Option<CacheHit> {
+        let s = shard_of(key);
         {
-            let mut l1 = self.l1.lock().unwrap_or_else(|e| e.into_inner());
-            if l1.entries.contains_key(key) {
-                l1.seq = l1.seq.wrapping_add(1);
-                let seq = l1.seq;
-                if let Some(entry) = l1.entries.get_mut(key) {
-                    if entry.meta.requires_auth && !caller_is_verified {
-                        return None;
-                    }
-                    entry.last_seq = seq;
-                    return Some(CacheHit::Ram {
-                        meta: entry.meta.clone(),
-                        data: entry.data.clone(),
-                    });
+            let mut l1 = self.l1_shards[s].lock();
+            if let Some(entry) = l1.get_and_touch(key) {
+                if entry.meta.requires_auth && !caller_is_verified {
+                    return None;
                 }
+                return Some(CacheHit::Ram {
+                    meta: entry.meta.clone(),
+                    data: entry.data.clone(),
+                });
             }
         }
 
-        if self.disk_dir.is_some() {
-            let mut l2 = self.l2.lock().unwrap_or_else(|e| e.into_inner());
-            if l2.entries.contains_key(key) {
-                l2.seq = l2.seq.wrapping_add(1);
-                let seq = l2.seq;
-                if let Some(entry) = l2.entries.get_mut(key) {
-                    if entry.meta.requires_auth && !caller_is_verified {
-                        return None;
-                    }
-                    entry.last_seq = seq;
-                    return Some(CacheHit::Disk {
-                        meta: entry.meta.clone(),
-                        path: entry.path.clone(),
-                        data_offset: entry.data_offset,
-                    });
+        if let Some(dir) = &self.disk_dir {
+            let mut l2 = self.l2_shards[s].lock();
+            if let Some(entry) = l2.get_and_touch(key) {
+                if entry.meta.requires_auth && !caller_is_verified {
+                    return None;
                 }
+                return Some(CacheHit::Disk {
+                    meta: entry.meta.clone(),
+                    path: disk_path_for_key(dir, key),
+                    data_offset: entry.data_offset,
+                });
             }
         }
 
         None
     }
 
-    pub fn promote_to_l1(&self, key: &str, meta: CachedMediaMeta, data: Bytes) {
+    pub fn promote_to_l1(&self, key: &CacheKey, meta: CompactMeta, data: Bytes) {
+        let item_len = data.len() as u64;
         if self.ram_max_bytes == 0
             || data.len() > self.ram_max_item_bytes
-            || data.len() > self.ram_max_bytes
+            || item_len > self.ram_shard_cap
         {
             return;
         }
-        let mut l1 = self.l1.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(prev) = l1.entries.remove(key) {
-            l1.total_bytes = l1.total_bytes.saturating_sub(prev.data.len());
-        }
+        let s = shard_of(key);
+        let mut l1 = self.l1_shards[s].lock();
+        let before = l1.total_bytes();
+        let _ = l1.remove(key);
+
         let mut evicted = 0u64;
-        while l1.total_bytes.saturating_add(data.len()) > self.ram_max_bytes
-            && !l1.entries.is_empty()
+        while l1.total_bytes().saturating_add(item_len) > self.ram_shard_cap
+            && l1.pop_lru().is_some()
         {
-            if let Some(oldest_key) = l1
-                .entries
-                .iter()
-                .min_by_key(|(_, e)| e.last_seq)
-                .map(|(k, _)| k.clone())
-                && let Some(removed) = l1.entries.remove(&oldest_key)
-            {
-                l1.total_bytes = l1.total_bytes.saturating_sub(removed.data.len());
-                evicted += 1;
-            } else {
-                break;
-            }
+            evicted += 1;
         }
-        l1.seq = l1.seq.wrapping_add(1);
-        let seq = l1.seq;
-        l1.total_bytes = l1.total_bytes.saturating_add(data.len());
-        l1.entries.insert(
-            key.to_string(),
-            L1Entry {
-                meta,
-                data,
-                last_seq: seq,
-            },
-        );
-        self.metrics
-            .media_cache_ram_bytes
-            .store(l1.total_bytes as u64, Ordering::Relaxed);
+        l1.insert(*key, L1Entry { meta, data }, item_len);
+        let after = l1.total_bytes();
+        drop(l1);
+
+        update_atomic_gauge(&self.metrics.media_cache_ram_bytes, before, after);
         if evicted > 0 {
             self.metrics
                 .media_cache_evictions_total
@@ -753,15 +1029,22 @@ impl MediaCache {
         }
     }
 
-    pub async fn store(&self, key: String, meta: CachedMediaMeta, data: Bytes) {
+    pub async fn store(&self, key: CacheKey, meta: CompactMeta, data: Bytes, policy: StorePolicy) {
         if data.len() > self.max_item_bytes {
             return;
         }
 
         let mut stored_anywhere = false;
-        if self.ram_max_bytes > 0
+        let should_promote_l1 = match policy {
+            StorePolicy::ClientHot => true,
+            // Background preload NEVER evicts hot L1 RAM when L2 disk is active.
+            StorePolicy::BackgroundPreload => self.disk_dir.is_none(),
+        };
+
+        if should_promote_l1
+            && self.ram_max_bytes > 0
             && data.len() <= self.ram_max_item_bytes
-            && data.len() <= self.ram_max_bytes
+            && (data.len() as u64) <= self.ram_shard_cap
         {
             self.promote_to_l1(&key, meta.clone(), data.clone());
             stored_anywhere = true;
@@ -769,68 +1052,45 @@ impl MediaCache {
 
         if let Some(disk_dir) = &self.disk_dir
             && self.disk_max_bytes > 0
-            && (data.len() as u64) < self.disk_max_bytes
+            && (data.len() as u64) < self.disk_shard_cap
         {
             let dir = disk_dir.clone();
-            let key_clone = key.clone();
-            let meta_clone = meta.clone();
+            let disk_meta = meta.to_disk_meta(&key);
             let data_clone = data.clone();
             let seq = self.tmp_seq.fetch_add(1, Ordering::Relaxed);
             match tokio::task::spawn_blocking(move || {
-                write_disk_cache_file(&dir, &key_clone, &meta_clone, &data_clone, seq)
+                write_disk_cache_file(&dir, &key, &disk_meta, &data_clone, seq)
             })
             .await
             {
-                Ok(Ok((final_path, file_bytes, data_offset))) => {
+                Ok(Ok((file_bytes, data_offset))) => {
                     stored_anywhere = true;
-                    let paths_to_delete = {
-                        let mut l2 = self.l2.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(prev) = l2.entries.remove(&key) {
-                            l2.total_bytes = l2.total_bytes.saturating_sub(prev.file_bytes);
-                        }
-                        let mut delete_list = Vec::new();
-                        while l2.total_bytes.saturating_add(file_bytes) > self.disk_max_bytes
-                            && !l2.entries.is_empty()
-                        {
-                            if let Some(oldest_key) = l2
-                                .entries
-                                .iter()
-                                .min_by_key(|(_, e)| e.last_seq)
-                                .map(|(k, _)| k.clone())
-                                && let Some(removed) = l2.entries.remove(&oldest_key)
-                            {
-                                l2.total_bytes = l2.total_bytes.saturating_sub(removed.file_bytes);
-                                delete_list.push(removed.path);
+                    let s = shard_of(&key);
+                    let mut keys_to_delete: Vec<CacheKey> = Vec::new();
+                    let (before, after) = {
+                        let mut l2 = self.l2_shards[s].lock();
+                        let before = l2.total_bytes();
+                        let _ = l2.remove(&key);
+                        while l2.total_bytes().saturating_add(file_bytes) > self.disk_shard_cap {
+                            if let Some((evicted_key, _, _)) = l2.pop_lru() {
+                                keys_to_delete.push(evicted_key);
                             } else {
                                 break;
                             }
                         }
-                        l2.seq = l2.seq.wrapping_add(1);
-                        let access_seq = l2.seq;
-                        l2.total_bytes = l2.total_bytes.saturating_add(file_bytes);
-                        l2.entries.insert(
-                            key,
-                            L2Entry {
-                                meta,
-                                path: final_path,
-                                file_bytes,
-                                data_offset,
-                                last_seq: access_seq,
-                            },
-                        );
-                        self.metrics
-                            .media_cache_disk_bytes
-                            .store(l2.total_bytes, Ordering::Relaxed);
-                        delete_list
+                        l2.insert(key, L2Entry { meta, data_offset }, file_bytes);
+                        (before, l2.total_bytes())
                     };
+                    update_atomic_gauge(&self.metrics.media_cache_disk_bytes, before, after);
 
-                    if !paths_to_delete.is_empty() {
+                    if !keys_to_delete.is_empty() {
                         self.metrics
                             .media_cache_evictions_total
-                            .fetch_add(paths_to_delete.len() as u64, Ordering::Relaxed);
+                            .fetch_add(keys_to_delete.len() as u64, Ordering::Relaxed);
+                        let dir_for_rm = disk_dir.clone();
                         let _ = tokio::task::spawn_blocking(move || {
-                            for p in paths_to_delete {
-                                let _ = std::fs::remove_file(p);
+                            for k in keys_to_delete {
+                                let _ = std::fs::remove_file(disk_path_for_key(&dir_for_rm, &k));
                             }
                         })
                         .await;
@@ -854,22 +1114,24 @@ impl MediaCache {
 
     pub async fn build_hit_response(
         self: &Arc<Self>,
-        key: &str,
+        key: &CacheKey,
         hit: CacheHit,
         method: &Method,
         req_headers: &HeaderMap,
     ) -> Result<Response<Body>> {
         let meta = hit.meta().clone();
+        let etag = meta.etag(key);
         let cache_tag = if hit.is_ram() { "HIT-RAM" } else { "HIT-DISK" };
 
         if let Some(inm) = req_headers
             .get(http::header::IF_NONE_MATCH)
             .and_then(|v| v.to_str().ok())
-            && etag_matches(inm, &meta.etag)
+            && etag_matches(inm, &etag)
         {
             return Ok(build_common_media_headers(
                 Response::builder().status(StatusCode::NOT_MODIFIED),
                 &meta,
+                &etag,
                 cache_tag,
                 false,
             )
@@ -880,6 +1142,7 @@ impl MediaCache {
             return Ok(build_common_media_headers(
                 Response::builder().status(StatusCode::OK),
                 &meta,
+                &etag,
                 cache_tag,
                 true,
             )
@@ -896,6 +1159,7 @@ impl MediaCache {
             return Ok(build_common_media_headers(
                 Response::builder().status(StatusCode::RANGE_NOT_SATISFIABLE),
                 &meta,
+                &etag,
                 cache_tag,
                 false,
             )
@@ -908,12 +1172,11 @@ impl MediaCache {
 
         match (hit, range_req) {
             (CacheHit::Ram { data, .. }, Some(RangeParse::Satisfiable(start, end))) => {
-                let start_usize = start as usize;
-                let end_usize = end as usize;
-                let slice = data.slice(start_usize..=end_usize);
+                let slice = data.slice((start as usize)..=(end as usize));
                 Ok(build_common_media_headers(
                     Response::builder().status(StatusCode::PARTIAL_CONTENT),
                     &meta,
+                    &etag,
                     cache_tag,
                     true,
                 )
@@ -927,6 +1190,7 @@ impl MediaCache {
             (CacheHit::Ram { data, .. }, None) => Ok(build_common_media_headers(
                 Response::builder().status(StatusCode::OK),
                 &meta,
+                &etag,
                 cache_tag,
                 true,
             )
@@ -947,6 +1211,7 @@ impl MediaCache {
                 Ok(build_common_media_headers(
                     Response::builder().status(StatusCode::PARTIAL_CONTENT),
                     &meta,
+                    &etag,
                     cache_tag,
                     true,
                 )
@@ -968,9 +1233,10 @@ impl MediaCache {
                     .with_context(|| format!("failed to open L2 cache file {}", path.display()))?;
                 file.seek(SeekFrom::Start(data_offset)).await?;
 
+                // Promote genuinely client-accessed small items from L2 SSD into L1 hot RAM!
                 if self.ram_max_bytes > 0
                     && meta.body_len <= self.ram_max_item_bytes as u64
-                    && meta.body_len <= self.ram_max_bytes as u64
+                    && meta.body_len <= self.ram_shard_cap
                 {
                     let mut buf = Vec::with_capacity(meta.body_len as usize);
                     file.take(meta.body_len).read_to_end(&mut buf).await?;
@@ -980,13 +1246,13 @@ impl MediaCache {
                         return Ok(build_common_media_headers(
                             Response::builder().status(StatusCode::OK),
                             &meta,
+                            &etag,
                             cache_tag,
                             true,
                         )
                         .header(http::header::CONTENT_LENGTH, bytes.len().to_string())
                         .body(Body::from(bytes))?);
                     }
-                    // Truncated disk entry: drop from L2 index and report error so caller falls back to upstream.
                     self.remove_l2_entry(key);
                     return Err(anyhow!("truncated L2 disk cache entry"));
                 }
@@ -995,6 +1261,7 @@ impl MediaCache {
                 Ok(build_common_media_headers(
                     Response::builder().status(StatusCode::OK),
                     &meta,
+                    &etag,
                     cache_tag,
                     true,
                 )
@@ -1005,35 +1272,40 @@ impl MediaCache {
         }
     }
 
-    pub fn remove_l2_entry(&self, key: &str) {
-        let removed_path = {
-            let mut l2 = self.l2.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(entry) = l2.entries.remove(key) {
-                l2.total_bytes = l2.total_bytes.saturating_sub(entry.file_bytes);
-                self.metrics
-                    .media_cache_disk_bytes
-                    .store(l2.total_bytes, Ordering::Relaxed);
-                Some(entry.path)
-            } else {
-                None
-            }
+    pub fn remove_l2_entry(&self, key: &CacheKey) {
+        let s = shard_of(key);
+        let (before, after, removed) = {
+            let mut l2 = self.l2_shards[s].lock();
+            let before = l2.total_bytes();
+            let removed = l2.remove(key).is_some();
+            (before, l2.total_bytes(), removed)
         };
-        if let Some(p) = removed_path {
-            let _ = std::fs::remove_file(p);
+        if removed {
+            update_atomic_gauge(&self.metrics.media_cache_disk_bytes, before, after);
+            if let Some(dir) = &self.disk_dir {
+                let _ = std::fs::remove_file(disk_path_for_key(dir, key));
+            }
         }
     }
 
     pub fn stats_json(&self) -> Value {
-        let (l1_entries, l1_bytes) = {
-            let l1 = self.l1.lock().unwrap_or_else(|e| e.into_inner());
-            (l1.entries.len(), l1.total_bytes)
-        };
-        let (l2_entries, l2_bytes) = {
-            let l2 = self.l2.lock().unwrap_or_else(|e| e.into_inner());
-            (l2.entries.len(), l2.total_bytes)
-        };
+        let mut l1_entries = 0usize;
+        let mut l1_bytes = 0u64;
+        for shard in &self.l1_shards {
+            let g = shard.lock();
+            l1_entries += g.len();
+            l1_bytes += g.total_bytes();
+        }
+        let mut l2_entries = 0usize;
+        let mut l2_bytes = 0u64;
+        for shard in &self.l2_shards {
+            let g = shard.lock();
+            l2_entries += g.len();
+            l2_bytes += g.total_bytes();
+        }
         serde_json::json!({
             "enabled": true,
+            "shards": CACHE_SHARDS,
             "disk_enabled": self.disk_dir.is_some(),
             "ram_max_mb": self.config.ram_max_mb,
             "ram_max_item_kb": self.config.ram_max_item_kb,
@@ -1057,16 +1329,28 @@ impl MediaCache {
     }
 }
 
+fn update_atomic_gauge(gauge: &AtomicU64, before: u64, after: u64) {
+    if after >= before {
+        gauge.fetch_add(after - before, Ordering::Relaxed);
+    } else {
+        let delta = before - after;
+        let _ = gauge.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            Some(cur.saturating_sub(delta))
+        });
+    }
+}
+
 fn build_common_media_headers(
     mut builder: axum::http::response::Builder,
-    meta: &CachedMediaMeta,
+    meta: &CompactMeta,
+    etag: &str,
     cache_tag: &'static str,
     include_representation_headers: bool,
 ) -> axum::http::response::Builder {
     builder = builder
         .header(http::header::CACHE_CONTROL, IMMUTABLE_MEDIA_CACHE_CONTROL)
         .header(http::header::ACCEPT_RANGES, "bytes")
-        .header(http::header::ETAG, &meta.etag)
+        .header(http::header::ETAG, etag)
         .header("x-matrix-proxy-cache", cache_tag)
         .header(http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
         .header(
@@ -1079,8 +1363,8 @@ fn build_common_media_headers(
         );
 
     if include_representation_headers {
-        builder = builder.header(http::header::CONTENT_TYPE, &meta.content_type);
-        if let Some(disp) = &meta.content_disposition
+        builder = builder.header(http::header::CONTENT_TYPE, meta.content_type());
+        if let Some(disp) = meta.content_disposition.as_deref()
             && let Ok(hv) = HeaderValue::from_str(disp)
         {
             builder = builder.header(http::header::CONTENT_DISPOSITION, hv);
@@ -1118,7 +1402,6 @@ pub enum RangeParse {
 }
 
 /// Parses single-range RFC 9110 `Range: bytes=...` headers.
-/// Returns `None` for non-bytes or multi-range headers (falling back to standard 200 OK).
 pub fn parse_http_byte_range(raw: &str, total_len: u64) -> Option<RangeParse> {
     let trimmed = raw.trim();
     let spec = trimmed
@@ -1180,17 +1463,25 @@ fn strip_weak_etag(etag: &str) -> &str {
         .unwrap_or_else(|| etag.trim())
 }
 
-fn init_disk_cache_dir(dir: &Path, disk_max_bytes: u64) -> Result<(PathBuf, L2State)> {
+fn disk_path_for_key(dir: &Path, key: &CacheKey) -> PathBuf {
+    let hex = encode_hex(key);
+    dir.join(&hex[..2]).join(format!("{hex}.cache"))
+}
+
+fn init_disk_cache_dir(
+    dir: &Path,
+    disk_shard_cap: u64,
+    shards: &mut [LruMap<L2Entry>],
+) -> Result<(PathBuf, usize, u64)> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("failed to create media cache directory {}", dir.display()))?;
 
-    // Verify directory is writable immediately (important for `read_only: true` containers).
     let probe_path = dir.join(format!(".write-probe-{}", std::process::id()));
     std::fs::write(&probe_path, b"ok")
         .with_context(|| format!("media cache directory {} is not writable", dir.display()))?;
     let _ = std::fs::remove_file(&probe_path);
 
-    let mut items: Vec<(String, L2Entry, SystemTime)> = Vec::new();
+    let mut items: Vec<(CacheKey, CompactMeta, u64, u64, SystemTime)> = Vec::new();
     let entries = std::fs::read_dir(dir)
         .with_context(|| format!("failed to scan media cache directory {}", dir.display()))?;
     for entry in entries.flatten() {
@@ -1210,26 +1501,17 @@ fn init_disk_cache_dir(dir: &Path, disk_max_bytes: u64) -> Result<(PathBuf, L2St
                 let _ = std::fs::remove_file(&p);
                 continue;
             }
-            let Some(key) = name.strip_suffix(".cache") else {
+            let Some(hex_key) = name.strip_suffix(".cache") else {
                 continue;
             };
-            if key.len() != 64 {
+            let Some(key) = decode_hex_key(hex_key) else {
                 let _ = std::fs::remove_file(&p);
                 continue;
-            }
+            };
             match read_disk_cache_header(&p) {
                 Ok((meta, file_bytes, data_offset, mtime)) => {
-                    items.push((
-                        key.to_string(),
-                        L2Entry {
-                            meta,
-                            path: p,
-                            file_bytes,
-                            data_offset,
-                            last_seq: 0,
-                        },
-                        mtime,
-                    ));
+                    let compact = CompactMeta::from_cached(&key, &meta);
+                    items.push((key, compact, file_bytes, data_offset, mtime));
                 }
                 Err(_) => {
                     let _ = std::fs::remove_file(&p);
@@ -1238,32 +1520,28 @@ fn init_disk_cache_dir(dir: &Path, disk_max_bytes: u64) -> Result<(PathBuf, L2St
         }
     }
 
-    // Order oldest-first so oldest items get lower `last_seq` and get evicted first on overflow.
-    items.sort_by_key(|(_, _, mtime)| *mtime);
-    let mut state = L2State::default();
-    for (key, mut entry, _) in items {
-        state.seq = state.seq.wrapping_add(1);
-        entry.last_seq = state.seq;
-        state.total_bytes = state.total_bytes.saturating_add(entry.file_bytes);
-        state.entries.insert(key, entry);
+    // Insert oldest-first so oldest items naturally sit at each shard's LRU tail.
+    items.sort_by_key(|(_, _, _, _, mtime)| *mtime);
+    for (key, meta, file_bytes, data_offset, _) in items {
+        let shard = &mut shards[shard_of(&key)];
+        shard.insert(key, L2Entry { meta, data_offset }, file_bytes);
     }
 
-    while state.total_bytes > disk_max_bytes && !state.entries.is_empty() {
-        if let Some(oldest_key) = state
-            .entries
-            .iter()
-            .min_by_key(|(_, e)| e.last_seq)
-            .map(|(k, _)| k.clone())
-            && let Some(removed) = state.entries.remove(&oldest_key)
-        {
-            state.total_bytes = state.total_bytes.saturating_sub(removed.file_bytes);
-            let _ = std::fs::remove_file(removed.path);
-        } else {
-            break;
+    let mut total_entries = 0usize;
+    let mut total_bytes = 0u64;
+    for shard in shards.iter_mut() {
+        while shard.total_bytes() > disk_shard_cap {
+            if let Some((evicted_key, _, _)) = shard.pop_lru() {
+                let _ = std::fs::remove_file(disk_path_for_key(dir, &evicted_key));
+            } else {
+                break;
+            }
         }
+        total_entries += shard.len();
+        total_bytes = total_bytes.saturating_add(shard.total_bytes());
     }
 
-    Ok((dir.to_path_buf(), state))
+    Ok((dir.to_path_buf(), total_entries, total_bytes))
 }
 
 fn read_disk_cache_header(path: &Path) -> Result<(CachedMediaMeta, u64, u64, SystemTime)> {
@@ -1293,13 +1571,13 @@ fn read_disk_cache_header(path: &Path) -> Result<(CachedMediaMeta, u64, u64, Sys
 
 fn write_disk_cache_file(
     dir: &Path,
-    key: &str,
+    key: &CacheKey,
     meta: &CachedMediaMeta,
     data: &[u8],
     seq: u64,
-) -> Result<(PathBuf, u64, u64)> {
-    let shard = &key[..2];
-    let shard_dir = dir.join(shard);
+) -> Result<(u64, u64)> {
+    let hex = encode_hex(key);
+    let shard_dir = dir.join(&hex[..2]);
     std::fs::create_dir_all(&shard_dir)?;
 
     let meta_bytes = serde_json::to_vec(meta)?;
@@ -1307,8 +1585,8 @@ fn write_disk_cache_file(
     let data_offset = 12u64 + meta_bytes.len() as u64;
     let file_bytes = data_offset + data.len() as u64;
 
-    let tmp_path = shard_dir.join(format!("{key}.tmp.{}.{}", std::process::id(), seq));
-    let final_path = shard_dir.join(format!("{key}.cache"));
+    let tmp_path = shard_dir.join(format!("{hex}.tmp.{}.{}", std::process::id(), seq));
+    let final_path = shard_dir.join(format!("{hex}.cache"));
 
     let write_res = (|| -> Result<()> {
         let mut f = std::fs::File::create(&tmp_path)?;
@@ -1330,7 +1608,7 @@ fn write_disk_cache_file(
         return Err(err.into());
     }
 
-    Ok((final_path, file_bytes, data_offset))
+    Ok((file_bytes, data_offset))
 }
 
 /// Zero-latency stream wrapper that yields every chunk straight to the client while accumulating a
@@ -1338,8 +1616,8 @@ fn write_disk_cache_file(
 pub struct MediaCacheTeeStream<S> {
     inner: Pin<Box<S>>,
     cache: Arc<MediaCache>,
-    key: String,
-    meta: CachedMediaMeta,
+    key: CacheKey,
+    meta: CompactMeta,
     max_bytes: usize,
     buf: Option<BytesMut>,
     in_flight: Option<InFlightGuard>,
@@ -1350,8 +1628,8 @@ impl<S> MediaCacheTeeStream<S> {
     pub fn new(
         inner: S,
         cache: Arc<MediaCache>,
-        key: String,
-        meta: CachedMediaMeta,
+        key: CacheKey,
+        meta: CompactMeta,
         max_bytes: usize,
         initial_capacity: usize,
         in_flight: Option<InFlightGuard>,
@@ -1386,7 +1664,6 @@ where
                     if buf.len().saturating_add(chunk.len()) <= this.max_bytes {
                         buf.extend_from_slice(&chunk);
                     } else {
-                        // Oversized stream without Content-Length: release buffer & singleflight guard immediately.
                         this.buf = None;
                         this.in_flight = None;
                     }
@@ -1405,12 +1682,12 @@ where
                     if let Some(buf) = this.buf.take() {
                         let data = buf.freeze();
                         let cache = Arc::clone(&this.cache);
-                        let key = this.key.clone();
+                        let key = this.key;
                         let mut meta = this.meta.clone();
                         meta.body_len = data.len() as u64;
                         let guard = this.in_flight.take();
                         tokio::spawn(async move {
-                            cache.store(key, meta, data).await;
+                            cache.store(key, meta, data, StorePolicy::ClientHot).await;
                             drop(guard);
                         });
                     } else {
@@ -1424,7 +1701,7 @@ where
 }
 
 /// Zero-latency stream wrapper that tees up to `max_bytes` of `/sync`, Sliding Sync, or room JSON
-/// responses so the proactive background preloader can extract `mxc://` URLs with zero client delay.
+/// responses so the zero-DOM streaming scanner can extract `mxc://` URLs with zero client delay.
 pub struct PreloadScanTeeStream<S> {
     inner: Pin<Box<S>>,
     max_bytes: usize,
@@ -1492,27 +1769,14 @@ pub enum MxcHint {
     MediaDownload { server: String, media_id: String },
 }
 
-/// Decompresses an optional `gzip`/`deflate`/`br`/`zstd` JSON response (bounded at 8 MiB) and
-/// extracts safe `mxc://` avatar & unencrypted media preload hints.
+/// Zero-DOM streaming byte scanner: decompresses `gzip`/`deflate`/`br`/`zstd`/plain responses
+/// incrementally into a fixed 32 KiB sliding window (peak ~32 KiB RAM instead of 30+ MiB
+/// `serde_json::Value` DOM trees!) and extracts safe `mxc://` avatar & unencrypted media hints.
 pub fn extract_mxc_hints_from_response(
     raw: &[u8],
     content_encoding: &str,
     max_preload_bytes: u64,
 ) -> Vec<MxcHint> {
-    let decoded = match decode_response_for_scan(raw, content_encoding) {
-        Some(b) => b,
-        None => return Vec::new(),
-    };
-    let Ok(val) = serde_json::from_slice::<Value>(&decoded) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    collect_mxc_hints(&val, max_preload_bytes, 0, &mut seen, &mut out);
-    out
-}
-
-fn decode_response_for_scan(raw: &[u8], content_encoding: &str) -> Option<Vec<u8>> {
     let enc = content_encoding
         .split(',')
         .next()
@@ -1520,133 +1784,323 @@ fn decode_response_for_scan(raw: &[u8], content_encoding: &str) -> Option<Vec<u8
         .trim()
         .to_ascii_lowercase();
     match enc.as_str() {
-        "" | "identity" => {
-            if raw.len() <= MAX_DECOMPRESSED_SCAN_BYTES {
-                Some(raw.to_vec())
+        "" | "identity" => scan_mxc_hints_reader(raw, max_preload_bytes),
+        "gzip" | "x-gzip" => scan_mxc_hints_reader(GzDecoder::new(raw), max_preload_bytes),
+        "deflate" => {
+            let out = scan_mxc_hints_reader(ZlibDecoder::new(raw), max_preload_bytes);
+            if !out.is_empty() {
+                out
+            } else {
+                scan_mxc_hints_reader(DeflateDecoder::new(raw), max_preload_bytes)
+            }
+        }
+        "br" => scan_mxc_hints_reader(brotli::Decompressor::new(raw, 4096), max_preload_bytes),
+        "zstd" => match ruzstd::decoding::StreamingDecoder::new(raw) {
+            Ok(dec) => scan_mxc_hints_reader(dec, max_preload_bytes),
+            Err(_) => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// Streams chunks of decompressed JSON through a fixed 32 KiB buffer with 512-byte overlap
+/// so `mxc://` references and their enclosing JSON key/context are classified in O(N) time
+/// with ~32 KiB constant memory and zero JSON DOM allocations.
+fn scan_mxc_hints_reader<R: Read>(mut reader: R, max_preload_bytes: u64) -> Vec<MxcHint> {
+    let mut out = Vec::new();
+    let mut seen: AHashSet<MxcHint> = AHashSet::with_capacity(MAX_HINTS_PER_PAYLOAD);
+    let mut window = vec![0u8; STREAM_SCAN_CHUNK_BYTES + STREAM_SCAN_OVERLAP_BYTES];
+    let mut carry = 0usize;
+    let mut total_read = 0usize;
+
+    loop {
+        if out.len() >= MAX_HINTS_PER_PAYLOAD || total_read >= MAX_DECOMPRESSED_SCAN_BYTES {
+            break;
+        }
+        let max_to_read = (MAX_DECOMPRESSED_SCAN_BYTES - total_read).min(STREAM_SCAN_CHUNK_BYTES);
+        let n = match reader.read(&mut window[carry..carry + max_to_read]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        total_read += n;
+        let filled = carry + n;
+        let slice = &window[..filled];
+
+        scan_mxc_slice(slice, max_preload_bytes, &mut seen, &mut out);
+
+        if filled > STREAM_SCAN_OVERLAP_BYTES {
+            let keep_start = filled - STREAM_SCAN_OVERLAP_BYTES;
+            window.copy_within(keep_start..filled, 0);
+            carry = STREAM_SCAN_OVERLAP_BYTES;
+        } else {
+            carry = filled;
+        }
+    }
+
+    out
+}
+
+fn scan_mxc_slice(
+    data: &[u8],
+    max_preload_bytes: u64,
+    seen: &mut AHashSet<MxcHint>,
+    out: &mut Vec<MxcHint>,
+) {
+    const NEEDLE: &[u8] = b"mxc://";
+    let mut pos = 0usize;
+    while pos + NEEDLE.len() < data.len() && out.len() < MAX_HINTS_PER_PAYLOAD {
+        let Some(rel) = find_subslice(&data[pos..], NEEDLE) else {
+            break;
+        };
+        let start = pos + rel;
+        let uri_start = start + NEEDLE.len();
+        let mut end = uri_start;
+        while end < data.len()
+            && end - uri_start < 512
+            && !matches!(data[end], b'"' | b'\\' | b' ' | b'\n' | b'\r' | b'\t')
+        {
+            end += 1;
+        }
+        pos = end.max(uri_start);
+
+        // Require closing quote so split URIs at chunk boundaries wait for the overlap pass.
+        if end >= data.len() || data[end] != b'"' {
+            continue;
+        }
+
+        let Ok(raw_uri) = std::str::from_utf8(&data[start..end]) else {
+            continue;
+        };
+        let Some((server, media_id)) = parse_mxc_uri(raw_uri) else {
+            continue;
+        };
+
+        if let Some(hint) =
+            classify_mxc_in_json_context(data, start, end, server, media_id, max_preload_bytes)
+            && seen.insert(hint.clone())
+        {
+            out.push(hint);
+        }
+    }
+}
+
+fn classify_mxc_in_json_context(
+    data: &[u8],
+    mxc_start: usize,
+    _mxc_end: usize,
+    server: String,
+    media_id: String,
+    max_preload_bytes: u64,
+) -> Option<MxcHint> {
+    // Walk backward from `"mxc://..."` across optional whitespace and `:` to find the JSON key name.
+    if mxc_start < 3 || data[mxc_start - 1] != b'"' {
+        return None;
+    }
+    let mut i = mxc_start - 1;
+    while i > 0 && matches!(data[i - 1], b' ' | b'\t' | b'\r' | b'\n') {
+        i -= 1;
+    }
+    if i == 0 || data[i - 1] != b':' {
+        return None;
+    }
+    let colon_pos = i - 1;
+    i = colon_pos;
+    while i > 0 && matches!(data[i - 1], b' ' | b'\t' | b'\r' | b'\n') {
+        i -= 1;
+    }
+    if i == 0 || data[i - 1] != b'"' {
+        return None;
+    }
+    let key_end = i - 1;
+    let search_from = key_end.saturating_sub(48);
+    let mut key_start = key_end;
+    while key_start > search_from && data[key_start - 1] != b'"' {
+        key_start -= 1;
+    }
+    if key_start == 0 || data[key_start - 1] != b'"' {
+        return None;
+    }
+    let key = &data[key_start..key_end];
+
+    match key {
+        b"avatar" | b"avatar_url" => Some(MxcHint::Avatar { server, media_id }),
+        b"thumbnail_url" => Some(MxcHint::MediaDownload { server, media_id }),
+        b"url" => {
+            // Bound inspection strictly to the enclosing `content` JSON object (and its parent
+            // event object) so adjacent timeline events never bleed into classification.
+            let (content_start, content_end) = enclosing_json_object(data, colon_pos, 1024)?;
+            let content = &data[content_start..content_end];
+
+            // `m.room.avatar` state events have `"type":"m.room.avatar"` on the parent event object
+            // and no `"msgtype"` in `content`.
+            if find_subslice(content, b"\"msgtype\"").is_none()
+                && let Some((ev_start, ev_end)) = enclosing_json_object(data, content_start, 1024)
+            {
+                let event = &data[ev_start..ev_end];
+                if find_subslice(event, b"\"m.room.avatar\"").is_some() {
+                    return Some(MxcHint::Avatar { server, media_id });
+                }
+                if find_subslice(event, b"\"m.sticker\"").is_some() {
+                    if let Some(size) = extract_nearby_json_u64(content, b"\"size\"")
+                        && size > max_preload_bytes
+                    {
+                        return None;
+                    }
+                    return Some(MxcHint::MediaDownload { server, media_id });
+                }
+            }
+
+            // Skip videos, audio, and generic files so we never waste bandwidth preloading big binaries.
+            if find_subslice(content, b"\"m.video\"").is_some()
+                || find_subslice(content, b"\"m.audio\"").is_some()
+                || find_subslice(content, b"\"m.file\"").is_some()
+                || find_subslice(content, b"\"video/").is_some()
+                || find_subslice(content, b"\"audio/").is_some()
+            {
+                return None;
+            }
+            if let Some(size) = extract_nearby_json_u64(content, b"\"size\"")
+                && size > max_preload_bytes
+            {
+                return None;
+            }
+            let is_image_like = find_subslice(content, b"\"m.image\"").is_some()
+                || find_subslice(content, b"\"m.sticker\"").is_some()
+                || find_subslice(content, b"\"image/").is_some();
+            if is_image_like {
+                Some(MxcHint::MediaDownload { server, media_id })
             } else {
                 None
             }
-        }
-        "gzip" | "x-gzip" => read_bounded(GzDecoder::new(raw), MAX_DECOMPRESSED_SCAN_BYTES),
-        "deflate" => read_bounded(ZlibDecoder::new(raw), MAX_DECOMPRESSED_SCAN_BYTES)
-            .or_else(|| read_bounded(DeflateDecoder::new(raw), MAX_DECOMPRESSED_SCAN_BYTES)),
-        "br" => read_bounded(
-            brotli::Decompressor::new(raw, 4096),
-            MAX_DECOMPRESSED_SCAN_BYTES,
-        ),
-        "zstd" => {
-            let decoder = ruzstd::decoding::StreamingDecoder::new(raw).ok()?;
-            read_bounded(decoder, MAX_DECOMPRESSED_SCAN_BYTES)
         }
         _ => None,
     }
 }
 
-fn read_bounded<R: Read>(reader: R, max_bytes: usize) -> Option<Vec<u8>> {
-    let mut buf = Vec::new();
-    let mut limited = reader.take((max_bytes as u64) + 1);
-    limited.read_to_end(&mut buf).ok()?;
-    if buf.len() > max_bytes {
+#[inline]
+fn is_unescaped_quote(data: &[u8], idx: usize) -> bool {
+    if data[idx] != b'"' {
+        return false;
+    }
+    let mut backslashes = 0usize;
+    let mut j = idx;
+    while j > 0 && data[j - 1] == b'\\' {
+        backslashes += 1;
+        j -= 1;
+    }
+    backslashes.is_multiple_of(2)
+}
+
+/// Finds the enclosing JSON `{ ... }` object around `outside_pos` (which must not be inside a
+/// JSON string literal), bounded by `max_radius` bytes in each direction.
+fn enclosing_json_object(
+    data: &[u8],
+    outside_pos: usize,
+    max_radius: usize,
+) -> Option<(usize, usize)> {
+    let min_start = outside_pos.saturating_sub(max_radius);
+    let mut i = outside_pos;
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut obj_start = None;
+    while i > min_start {
+        i -= 1;
+        let b = data[i];
+        if in_str {
+            if is_unescaped_quote(data, i) {
+                in_str = false;
+            }
+        } else {
+            match b {
+                b'"' if is_unescaped_quote(data, i) => in_str = true,
+                b'}' => depth += 1,
+                b'{' => {
+                    if depth == 0 {
+                        obj_start = Some(i);
+                        break;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    let start = obj_start?;
+
+    let max_end = (outside_pos + max_radius).min(data.len());
+    let mut j = outside_pos;
+    depth = 0;
+    in_str = false;
+    let mut obj_end = None;
+    while j < max_end {
+        let b = data[j];
+        if in_str {
+            if is_unescaped_quote(data, j) {
+                in_str = false;
+            }
+        } else {
+            match b {
+                b'"' if is_unescaped_quote(data, j) => in_str = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    if depth == 0 {
+                        obj_end = Some(j + 1);
+                        break;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        j += 1;
+    }
+    let end = obj_end.unwrap_or(max_end);
+    Some((start, end))
+}
+
+fn extract_nearby_json_u64(ctx: &[u8], key: &[u8]) -> Option<u64> {
+    let pos = find_subslice(ctx, key)?;
+    let mut i = pos + key.len();
+    while i < ctx.len() && matches!(ctx[i], b' ' | b'\t' | b'\r' | b'\n') {
+        i += 1;
+    }
+    if i >= ctx.len() || ctx[i] != b':' {
         return None;
     }
-    Some(buf)
+    i += 1;
+    while i < ctx.len() && matches!(ctx[i], b' ' | b'\t' | b'\r' | b'\n') {
+        i += 1;
+    }
+    let start = i;
+    while i < ctx.len() && ctx[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == start {
+        return None;
+    }
+    std::str::from_utf8(&ctx[start..i])
+        .ok()?
+        .parse::<u64>()
+        .ok()
 }
 
-fn collect_mxc_hints(
-    val: &Value,
-    max_preload_bytes: u64,
-    depth: usize,
-    seen: &mut HashSet<MxcHint>,
-    out: &mut Vec<MxcHint>,
-) {
-    if depth > 32 || out.len() >= MAX_HINTS_PER_PAYLOAD {
-        return;
+#[inline]
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    let first = *needle.first()?;
+    let nlen = needle.len();
+    if haystack.len() < nlen {
+        return None;
     }
-    match val {
-        Value::Object(map) => {
-            // Check for Matrix `m.room.avatar` state event (`{"type": "m.room.avatar", "content": {"url": "mxc://..."}}`).
-            let is_room_avatar_event = map
-                .get("type")
-                .and_then(Value::as_str)
-                .is_some_and(|t| t == "m.room.avatar");
-            if is_room_avatar_event
-                && let Some(url) = map
-                    .get("content")
-                    .and_then(|c| c.get("url"))
-                    .and_then(Value::as_str)
-                && let Some((server, media_id)) = parse_mxc_uri(url)
-            {
-                push_hint(MxcHint::Avatar { server, media_id }, seen, out);
-                return;
-            }
-
-            // Check avatar fields (`avatar`, `avatar_url`) — always plaintext even in E2EE rooms!
-            for avatar_key in ["avatar", "avatar_url"] {
-                if let Some(url) = map.get(avatar_key).and_then(Value::as_str)
-                    && let Some((server, media_id)) = parse_mxc_uri(url)
-                {
-                    push_hint(MxcHint::Avatar { server, media_id }, seen, out);
-                }
-            }
-
-            // Check `thumbnail_url` (usually small preview image for images/videos/stickers).
-            if let Some(url) = map.get("thumbnail_url").and_then(Value::as_str)
-                && let Some((server, media_id)) = parse_mxc_uri(url)
-            {
-                push_hint(MxcHint::MediaDownload { server, media_id }, seen, out);
-            }
-
-            // Check unencrypted media `url` on images/stickers (skip large videos/files).
-            if let Some(url) = map.get("url").and_then(Value::as_str)
-                && let Some((server, media_id)) = parse_mxc_uri(url)
-            {
-                let msgtype = map.get("msgtype").and_then(Value::as_str);
-                let info = map.get("info").and_then(Value::as_object);
-                let mimetype = info
-                    .and_then(|i| i.get("mimetype"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let size_opt = info.and_then(|i| i.get("size")).and_then(Value::as_u64);
-
-                let is_image_like = matches!(msgtype, Some("m.image" | "m.sticker"))
-                    || mimetype.starts_with("image/")
-                    || (msgtype.is_none()
-                        && info.is_some_and(|i| i.contains_key("w") && i.contains_key("h"))
-                        && !mimetype.starts_with("video/"));
-
-                let within_size = size_opt.map(|sz| sz <= max_preload_bytes).unwrap_or(true);
-                if is_image_like && within_size {
-                    push_hint(MxcHint::MediaDownload { server, media_id }, seen, out);
-                }
-            }
-
-            for child in map.values() {
-                if out.len() >= MAX_HINTS_PER_PAYLOAD {
-                    break;
-                }
-                if matches!(child, Value::Object(_) | Value::Array(_)) {
-                    collect_mxc_hints(child, max_preload_bytes, depth + 1, seen, out);
-                }
-            }
+    let mut i = 0;
+    let limit = haystack.len() - nlen;
+    while i <= limit {
+        if haystack[i] == first && &haystack[i..i + nlen] == needle {
+            return Some(i);
         }
-        Value::Array(items) => {
-            for item in items {
-                if out.len() >= MAX_HINTS_PER_PAYLOAD {
-                    break;
-                }
-                if matches!(item, Value::Object(_) | Value::Array(_)) {
-                    collect_mxc_hints(item, max_preload_bytes, depth + 1, seen, out);
-                }
-            }
-        }
-        _ => {}
+        i += 1;
     }
-}
-
-fn push_hint(hint: MxcHint, seen: &mut HashSet<MxcHint>, out: &mut Vec<MxcHint>) {
-    if out.len() < MAX_HINTS_PER_PAYLOAD && seen.insert(hint.clone()) {
-        out.push(hint);
-    }
+    None
 }
 
 pub fn parse_mxc_uri(raw: &str) -> Option<(String, String)> {
@@ -1660,7 +2114,7 @@ pub fn parse_mxc_uri(raw: &str) -> Option<(String, String)> {
 
 #[derive(Debug, Clone)]
 struct PreloadJob {
-    cache_key: String,
+    cache_key: CacheKey,
     target_url: Url,
     requires_auth: bool,
     bearer_token: Option<String>,
@@ -1668,13 +2122,14 @@ struct PreloadJob {
 }
 
 /// Bounded proactive background preloader for a single `ProxyInstance`.
-/// Worker exits cleanly when `ProxyInstance` is dropped (e.g. during hot reload or shutdown).
+/// Writes preloaded objects to L2 disk ONLY (never evicting hot L1 RAM entries), and exits
+/// cleanly when `ProxyInstance` is dropped on hot reload or shutdown.
 pub struct MediaPreloader {
     profile: Arc<ProxyProfile>,
     cache: Arc<MediaCache>,
     metrics: Arc<ProxyMetrics>,
     tx: mpsc::Sender<PreloadJob>,
-    recent: Mutex<HashMap<String, Instant>>,
+    recent: Mutex<AHashMap<CacheKey, Instant>>,
 }
 
 impl MediaPreloader {
@@ -1735,16 +2190,17 @@ impl MediaPreloader {
             cache,
             metrics,
             tx,
-            recent: Mutex::new(HashMap::new()),
+            recent: Mutex::new(AHashMap::with_capacity(256)),
         })
     }
 
-    /// Extracts `mxc://` hints from a Matrix JSON payload and enqueues uncached items in background.
+    /// Scans a Matrix JSON payload via the zero-DOM 32 KiB streaming scanner and enqueues uncached items.
     pub fn enqueue_from_json_payload(
         self: &Arc<Self>,
         raw_bytes: Vec<u8>,
         content_encoding: String,
         upstream_matrix_url: Url,
+        upstream_origin: String,
         bearer_token: Option<String>,
         client: ClientInfo,
     ) {
@@ -1761,7 +2217,6 @@ impl MediaPreloader {
                 return;
             }
 
-            let upstream_origin = crate::config::origin_string(&upstream_matrix_url);
             let avatar_sizes = this.cache.effective_avatar_sizes(
                 &this.profile.name,
                 &this.profile.media.preload_avatar_sizes,
@@ -1820,22 +2275,26 @@ impl MediaPreloader {
         });
     }
 
-    /// Triggered when a client fetches a `/thumbnail/{server}/{id}`: warms `/download/{server}/{id}`
-    /// in background so tapping an image opens instantaneously from edge cache.
+    /// Triggered when a client fetches a content `/thumbnail/{server}/{id}` (skips small square
+    /// avatar thumbnails `<= 256px` that clients never open as full downloads): warms `/download`
+    /// in background so tapping an inline photo opens instantaneously from edge cache.
     pub fn enqueue_full_download_for_thumbnail(
         &self,
         route: &MediaRouteInfo,
         upstream_matrix_url: &Url,
+        upstream_origin: &str,
         bearer_token: Option<String>,
         client: &ClientInfo,
     ) {
-        if !self.profile.media.preload_on_thumbnail || !route.is_thumbnail {
+        if !self.profile.media.preload_on_thumbnail
+            || !route.is_thumbnail
+            || route.is_avatar_sized_thumbnail()
+        {
             return;
         }
-        let upstream_origin = crate::config::origin_string(upstream_matrix_url);
         let key = cache_key_for_download(
             &self.profile.name,
-            &upstream_origin,
+            upstream_origin,
             &route.server_name,
             &route.media_id,
         );
@@ -1860,7 +2319,7 @@ impl MediaPreloader {
 
         let now = Instant::now();
         {
-            let mut recent = self.recent.lock().unwrap_or_else(|e| e.into_inner());
+            let mut recent = self.recent.lock();
             if let Some(ts) = recent.get(&job.cache_key)
                 && now.duration_since(*ts) < PRELOAD_RECENT_TTL
             {
@@ -1875,7 +2334,7 @@ impl MediaPreloader {
                     recent.clear();
                 }
             }
-            recent.insert(job.cache_key.clone(), now);
+            recent.insert(job.cache_key, now);
         }
 
         match self.tx.try_send(job) {
@@ -1919,14 +2378,14 @@ async fn execute_preload_job(
         }
     };
 
-    let mut out_headers = HeaderMap::new();
+    let mut out_headers = HeaderMap::with_capacity(6);
     out_headers.insert(
         http::header::ACCEPT_ENCODING,
         HeaderValue::from_static("identity"),
     );
     out_headers.insert(
         http::header::USER_AGENT,
-        HeaderValue::from_static("matrix-proxy-preloader/1.6"),
+        HeaderValue::from_static("matrix-proxy-preloader/2.0"),
     );
     if let Some(token) = &job.bearer_token
         && let Ok(hv) = HeaderValue::from_str(&format!("Bearer {token}"))
@@ -1976,15 +2435,17 @@ async fn execute_preload_job(
             etag,
             data,
         }) => {
-            let meta = CachedMediaMeta {
-                content_type,
-                content_disposition,
-                etag: etag.unwrap_or_else(|| format!("\"{}\"", &job.cache_key[..24])),
+            let meta = CompactMeta {
+                mime: CompactMime::from_str(&content_type),
+                content_disposition: content_disposition.map(String::into_boxed_str),
+                custom_etag: etag.map(String::into_boxed_str),
                 requires_auth: job.requires_auth || job.bearer_token.is_some(),
                 body_len: data.len() as u64,
                 stored_epoch_secs: now_epoch_secs(),
             };
-            cache.store(job.cache_key, meta, data).await;
+            cache
+                .store(job.cache_key, meta, data, StorePolicy::BackgroundPreload)
+                .await;
             metrics
                 .media_preload_completed_total
                 .fetch_add(1, Ordering::Relaxed);
@@ -2037,11 +2498,10 @@ async fn fetch_preload_reqwest(
     if resp.status() != StatusCode::OK {
         return Err(anyhow!("upstream returned HTTP {}", resp.status()));
     }
-    let resp_headers = resp.headers().clone();
-    if !is_cacheable_media_headers(&resp_headers, max_bytes) {
+    if !is_cacheable_media_headers(resp.headers(), max_bytes) {
         return Ok(PreloadFetchResult::Skipped);
     }
-    let (content_type, content_disposition, etag) = extract_cache_meta_headers(&resp_headers);
+    let (content_type, content_disposition, etag) = extract_cache_meta_headers(resp.headers());
     let mut buf = BytesMut::new();
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
@@ -2088,13 +2548,12 @@ async fn fetch_preload_ppv2(
     if resp.status() != StatusCode::OK {
         return Err(anyhow!("upstream returned HTTP {}", resp.status()));
     }
-    let resp_headers = resp.headers().clone();
-    if !is_cacheable_media_headers(&resp_headers, max_bytes) {
+    let (parts, mut body) = resp.into_parts();
+    if !is_cacheable_media_headers(&parts.headers, max_bytes) {
         return Ok(PreloadFetchResult::Skipped);
     }
-    let (content_type, content_disposition, etag) = extract_cache_meta_headers(&resp_headers);
+    let (content_type, content_disposition, etag) = extract_cache_meta_headers(&parts.headers);
     let mut buf = BytesMut::new();
-    let mut body = resp.into_body();
     let read_res = tokio::time::timeout(timeout, async {
         while let Some(frame) = body.frame().await {
             let frame = frame.context("PPv2 preload frame read error")?;
@@ -2119,6 +2578,22 @@ async fn fetch_preload_ppv2(
         etag,
         data: buf.freeze(),
     })
+}
+
+pub fn build_compact_meta_from_headers(
+    headers: &HeaderMap,
+    requires_auth: bool,
+    body_len: u64,
+) -> CompactMeta {
+    let (content_type, content_disposition, etag) = extract_cache_meta_headers(headers);
+    CompactMeta {
+        mime: CompactMime::from_str(&content_type),
+        content_disposition: content_disposition.map(String::into_boxed_str),
+        custom_etag: etag.map(String::into_boxed_str),
+        requires_auth,
+        body_len,
+        stored_epoch_secs: now_epoch_secs(),
+    }
 }
 
 pub fn is_cacheable_media_headers(headers: &HeaderMap, max_bytes: usize) -> bool {
@@ -2172,7 +2647,7 @@ pub fn now_epoch_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn token_hash(profile: &str, token: &str) -> [u8; 32] {
+fn token_hash(profile: &str, token: &str) -> CacheKey {
     let mut ctx = digest::Context::new(&digest::SHA256);
     ctx.update(profile.as_bytes());
     ctx.update(b"\0");
@@ -2183,15 +2658,50 @@ fn token_hash(profile: &str, token: &str) -> [u8; 32] {
     out
 }
 
-fn sha256_hex(input: &[u8]) -> String {
+fn default_etag_for_key(key: &CacheKey) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let d = digest::digest(&digest::SHA256, input);
+    let mut out = String::with_capacity(26);
+    out.push('"');
+    for &b in &key[..12] {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out.push('"');
+    out
+}
+
+fn encode_hex(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(64);
-    for &b in d.as_ref() {
+    for &b in bytes {
         out.push(HEX[(b >> 4) as usize] as char);
         out.push(HEX[(b & 0x0f) as usize] as char);
     }
     out
+}
+
+fn decode_hex_key(s: &str) -> Option<CacheKey> {
+    if s.len() != 64 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        let hi = hex_nibble(bytes[i * 2])?;
+        let lo = hex_nibble(bytes[i * 2 + 1])?;
+        out[i] = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+#[inline]
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -2199,6 +2709,13 @@ mod tests {
     use super::*;
     use flate2::Compression;
     use flate2::write::GzEncoder;
+
+    fn sha256_key(input: &[u8]) -> CacheKey {
+        let d = digest::digest(&digest::SHA256, input);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(d.as_ref());
+        out
+    }
 
     #[test]
     fn media_route_canonicalizes_thumbnail_queries_and_auth_flags() {
@@ -2219,6 +2736,7 @@ mod tests {
         let r_anim = parse_matrix_media_route(&Method::GET, &u_anim).unwrap();
         assert!(r1.requires_auth());
         assert!(r2.requires_auth());
+        assert!(r1.is_avatar_sized_thumbnail());
         assert_eq!(
             r1.cache_key("p", "https://hs.example.org"),
             r2.cache_key("p", "https://hs.example.org")
@@ -2265,7 +2783,7 @@ mod tests {
     }
 
     #[test]
-    fn extracts_mxc_hints_from_plain_and_gzip_sliding_sync_json() {
+    fn streaming_scanner_extracts_mxc_hints_from_plain_and_gzip_sliding_sync_json() {
         let payload = serde_json::json!({
             "rooms": {
                 "!r1:example.org": {
@@ -2320,13 +2838,12 @@ mod tests {
             server: "example.org".to_string(),
             media_id: "videoThumb".to_string(),
         }));
-        // Huge video raw URL must NOT be preloaded
         assert!(!hints.contains(&MxcHint::MediaDownload {
             server: "example.org".to_string(),
             media_id: "hugeVideo".to_string(),
         }));
 
-        // Verify gzip decompression path too
+        // Verify gzip streaming decompression path too
         let mut gz = GzEncoder::new(Vec::new(), Compression::fast());
         gz.write_all(&raw).unwrap();
         let gz_bytes = gz.finish().unwrap();
@@ -2334,10 +2851,28 @@ mod tests {
         assert_eq!(gz_hints.len(), hints.len());
     }
 
+    #[test]
+    fn lru_map_evicts_least_recently_used_in_o1() {
+        let mut lru: LruMap<u32> = LruMap::default();
+        let k1 = sha256_key(b"1");
+        let k2 = sha256_key(b"2");
+        let k3 = sha256_key(b"3");
+        lru.insert(k1, 1, 10);
+        lru.insert(k2, 2, 10);
+        lru.insert(k3, 3, 10);
+        // Touch k1 -> order becomes [k1, k3, k2], so k2 is now LRU!
+        assert_eq!(lru.get_and_touch(&k1), Some(&1));
+        assert_eq!(lru.pop_lru().map(|(k, v, _)| (k, v)), Some((k2, 2)));
+        assert_eq!(lru.pop_lru().map(|(k, v, _)| (k, v)), Some((k3, 3)));
+        assert_eq!(lru.pop_lru().map(|(k, v, _)| (k, v)), Some((k1, 1)));
+        assert!(lru.pop_lru().is_none());
+        assert_eq!(lru.total_bytes(), 0);
+    }
+
     #[tokio::test]
-    async fn l1_ram_and_l2_disk_lru_evict_strictly_within_caps_and_enforce_auth() {
+    async fn l1_ram_and_l2_disk_lru_enforce_caps_auth_and_background_preload_isolation() {
         let tmp_dir = std::env::temp_dir().join(format!(
-            "matrix-proxy-media-cache-test-{}",
+            "matrix-proxy-media-cache-v2-test-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -2347,59 +2882,68 @@ mod tests {
             enabled: true,
             dir: Some(tmp_dir.to_string_lossy().to_string()),
             ram_max_mb: 1,
-            ram_max_item_kb: 512,
-            disk_max_mb: 2,
+            ram_max_item_kb: 256,
+            disk_max_mb: 8,
             max_item_mb: 2,
             auth_cache_ttl_secs: 60,
         };
         let cache = MediaCache::new(cfg, Arc::clone(&metrics));
 
-        let payload_a = Bytes::from(vec![b'A'; 400 * 1024]);
-        let payload_b = Bytes::from(vec![b'B'; 400 * 1024]);
-        let payload_c = Bytes::from(vec![b'C'; 400 * 1024]);
-        let key_a = sha256_hex(b"key-a");
-        let key_b = sha256_hex(b"key-b");
-        let key_c = sha256_hex(b"key-c");
+        let hot_data = Bytes::from(vec![b'H'; 32 * 1024]);
+        let preload_data = Bytes::from(vec![b'P'; 32 * 1024]);
+        let key_hot = sha256_key(b"hot-client");
+        let key_bg = sha256_key(b"bg-preload");
+        let key_pub = sha256_key(b"public-item");
 
-        for (k, d, auth) in [
-            (&key_a, &payload_a, true),
-            (&key_b, &payload_b, true),
-            (&key_c, &payload_c, false),
-        ] {
-            cache
-                .store(
-                    k.clone(),
-                    CachedMediaMeta {
-                        content_type: "image/png".to_string(),
-                        content_disposition: None,
-                        etag: format!("\"{}\"", &k[..16]),
-                        requires_auth: auth,
-                        body_len: d.len() as u64,
-                        stored_epoch_secs: now_epoch_secs(),
-                    },
-                    d.clone(),
-                )
-                .await;
-        }
+        let mk_meta = |len: usize, auth: bool| CompactMeta {
+            mime: CompactMime::ImagePng,
+            content_disposition: None,
+            custom_etag: None,
+            requires_auth: auth,
+            body_len: len as u64,
+            stored_epoch_secs: now_epoch_secs(),
+        };
 
-        // L1 RAM cap is 1 MiB, so inserting 3x400 KiB must evict key_a from L1 RAM (still on L2 disk!).
-        assert!(metrics.media_cache_ram_bytes.load(Ordering::Relaxed) <= 1024 * 1024);
-        // Unverified caller MUST NOT get key_a or key_b (requires_auth = true)
-        assert!(cache.lookup(&key_a, false).is_none());
-        assert!(cache.lookup(&key_b, false).is_none());
-        // Public key_c is readable without auth
+        cache
+            .store(
+                key_hot,
+                mk_meta(hot_data.len(), true),
+                hot_data.clone(),
+                StorePolicy::ClientHot,
+            )
+            .await;
+        // Background preload MUST land on L2 disk ONLY (never polluting L1 RAM when disk is enabled!)
+        cache
+            .store(
+                key_bg,
+                mk_meta(preload_data.len(), true),
+                preload_data.clone(),
+                StorePolicy::BackgroundPreload,
+            )
+            .await;
+        cache
+            .store(
+                key_pub,
+                mk_meta(hot_data.len(), false),
+                hot_data.clone(),
+                StorePolicy::ClientHot,
+            )
+            .await;
+
+        assert!(cache.lookup(&key_hot, false).is_none());
+        assert!(cache.lookup(&key_bg, false).is_none());
         assert!(matches!(
-            cache.lookup(&key_c, false),
+            cache.lookup(&key_pub, false),
             Some(CacheHit::Ram { .. })
         ));
-        // Verified caller gets key_a from L2 disk and key_b from L1 RAM
         assert!(matches!(
-            cache.lookup(&key_a, true),
+            cache.lookup(&key_hot, true),
+            Some(CacheHit::Ram { .. })
+        ));
+        // Preloaded entry sits cleanly on L2 disk, NOT in L1 RAM!
+        assert!(matches!(
+            cache.lookup(&key_bg, true),
             Some(CacheHit::Disk { .. })
-        ));
-        assert!(matches!(
-            cache.lookup(&key_b, true),
-            Some(CacheHit::Ram { .. })
         ));
 
         // Token verification + immediate revocation

@@ -1,9 +1,10 @@
 use crate::config::{ClientIpMode, ProxyProtocol, RuntimeConfig, canonical_ip};
+use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
 use http::{HeaderMap, HeaderValue};
-use std::collections::HashMap;
+use parking_lot::Mutex;
+use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -27,8 +28,8 @@ pub struct ClientInfo {
     pub client_ip: IpAddr,
     /// Authoritative client source port (from inbound PPv2 when available; otherwise TCP peer port).
     pub client_port: u16,
-    /// Effective client scheme (`"https"` or `"http"`).
-    pub client_proto: String,
+    /// Effective client scheme (`"https"` or `"http"` — static zero-allocation str).
+    pub client_proto: &'static str,
     /// Sanitized incoming `X-Forwarded-For` chain (only retained when `peer_is_trusted`).
     pub trusted_xff_chain: Option<String>,
 }
@@ -68,33 +69,42 @@ impl ClientInfo {
             client_port = real_src.port();
         } else if peer_is_trusted {
             // 1. Check X-Forwarded-For right-to-left, skipping trusted proxy hops.
+            // Fast path: single-IP XFF (99%+ of reverse-proxy setups like HAProxy `set-header X-Forwarded-For %[src]`)
+            // avoids allocating any temporary Vec<IpAddr> or joined String unless multiple hops exist.
             if let Some(xff_raw) = headers
                 .get("x-forwarded-for")
                 .and_then(|v| v.to_str().ok())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
-                let mut valid_ips: Vec<IpAddr> = Vec::new();
-                for part in xff_raw.split(',') {
-                    if let Some(ip) = parse_header_ip(part) {
-                        valid_ips.push(ip);
+                if !xff_raw.contains(',') {
+                    if let Some(ip) = parse_header_ip(xff_raw) {
+                        client_ip = ip;
+                        trusted_xff_chain = Some(ip.to_string());
                     }
-                }
-                if !valid_ips.is_empty() {
-                    trusted_xff_chain = Some(
-                        valid_ips
+                } else {
+                    let mut valid_ips: Vec<IpAddr> = Vec::with_capacity(4);
+                    for part in xff_raw.split(',') {
+                        if let Some(ip) = parse_header_ip(part) {
+                            valid_ips.push(ip);
+                        }
+                    }
+                    if !valid_ips.is_empty() {
+                        trusted_xff_chain = Some(
+                            valid_ips
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        );
+                        // Rightmost untrusted IP is the authoritative client IP; fallback to leftmost if all trusted.
+                        client_ip = valid_ips
                             .iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                    );
-                    // Rightmost untrusted IP is the authoritative client IP; fallback to leftmost if all trusted.
-                    client_ip = valid_ips
-                        .iter()
-                        .rev()
-                        .copied()
-                        .find(|ip| !runtime.is_trusted_proxy(*ip))
-                        .unwrap_or(valid_ips[0]);
+                            .rev()
+                            .copied()
+                            .find(|ip| !runtime.is_trusted_proxy(*ip))
+                            .unwrap_or(valid_ips[0]);
+                    }
                 }
             }
 
@@ -117,23 +127,23 @@ impl ClientInfo {
             }
         }
 
-        let client_proto = if peer_is_trusted {
+        let default_proto: &'static str = if listener_is_tls { "https" } else { "http" };
+        let client_proto: &'static str = if peer_is_trusted {
             headers
                 .get("x-forwarded-proto")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.split(',').next())
                 .map(str::trim)
-                .filter(|s| s.eq_ignore_ascii_case("http") || s.eq_ignore_ascii_case("https"))
-                .map(|s| s.to_ascii_lowercase())
+                .and_then(normalize_static_proto)
                 .or_else(|| {
                     headers
                         .get("forwarded")
                         .and_then(|v| v.to_str().ok())
                         .and_then(parse_forwarded_proto)
                 })
-                .unwrap_or_else(|| if listener_is_tls { "https" } else { "http" }.to_string())
+                .unwrap_or(default_proto)
         } else {
-            if listener_is_tls { "https" } else { "http" }.to_string()
+            default_proto
         };
 
         Self {
@@ -156,7 +166,7 @@ impl ClientInfo {
             ClientIpMode::Off => None,
             ClientIpMode::Replace => {
                 let ip_str = self.client_ip.to_string();
-                let fwd = format_rfc7239_forwarded(self.client_ip, &self.client_proto);
+                let fwd = format_rfc7239_forwarded(self.client_ip, self.client_proto);
                 Some((ip_str.clone(), ip_str, fwd))
             }
             ClientIpMode::Append => {
@@ -172,7 +182,7 @@ impl ClientInfo {
                     }
                     None => ip_str.clone(),
                 };
-                let fwd = format_rfc7239_forwarded(self.client_ip, &self.client_proto);
+                let fwd = format_rfc7239_forwarded(self.client_ip, self.client_proto);
                 Some((xff, ip_str, fwd))
             }
         }
@@ -244,7 +254,17 @@ fn parse_forwarded_for(raw: &str) -> Option<IpAddr> {
     None
 }
 
-fn parse_forwarded_proto(raw: &str) -> Option<String> {
+fn normalize_static_proto(raw: &str) -> Option<&'static str> {
+    if raw.eq_ignore_ascii_case("https") {
+        Some("https")
+    } else if raw.eq_ignore_ascii_case("http") {
+        Some("http")
+    } else {
+        None
+    }
+}
+
+fn parse_forwarded_proto(raw: &str) -> Option<&'static str> {
     if let Some(first) = raw.split(',').next() {
         for part in first.split(';') {
             let mut kv = part.trim().splitn(2, '=');
@@ -252,8 +272,8 @@ fn parse_forwarded_proto(raw: &str) -> Option<String> {
                 && k.eq_ignore_ascii_case("proto")
             {
                 let clean = v.trim().trim_matches('"');
-                if clean.eq_ignore_ascii_case("http") || clean.eq_ignore_ascii_case("https") {
-                    return Some(clean.to_ascii_lowercase());
+                if let Some(proto) = normalize_static_proto(clean) {
+                    return Some(proto);
                 }
             }
         }
@@ -518,8 +538,10 @@ pub async fn read_ppv2_header<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Op
 }
 
 // =============================================================================
-// Bounded Per-IP Token-Bucket Rate Limiter (Zero External Crate Overhead)
+// 16-Shard Lock-Striped Per-IP Token-Bucket Rate Limiter (AHash + parking_lot)
 // =============================================================================
+
+const RATE_LIMITER_SHARDS: usize = 16;
 
 struct Bucket {
     tokens: f64,
@@ -529,8 +551,8 @@ struct Bucket {
 pub struct IpRateLimiter {
     rps: f64,
     burst: f64,
-    max_entries: usize,
-    buckets: Mutex<HashMap<IpAddr, Bucket>>,
+    max_entries_per_shard: usize,
+    shards: Vec<Mutex<AHashMap<IpAddr, Bucket>>>,
 }
 
 impl IpRateLimiter {
@@ -539,27 +561,32 @@ impl IpRateLimiter {
             return None;
         }
         let effective_burst = if burst == 0 { rps.max(1) } else { burst } as f64;
+        let shards = (0..RATE_LIMITER_SHARDS)
+            .map(|_| Mutex::new(AHashMap::with_capacity(64)))
+            .collect();
         Some(Self {
             rps: rps as f64,
             burst: effective_burst,
-            max_entries: 65_536,
-            buckets: Mutex::new(HashMap::with_capacity(1024)),
+            max_entries_per_shard: 65_536 / RATE_LIMITER_SHARDS,
+            shards,
         })
     }
 
     pub fn allow(&self, ip: IpAddr) -> bool {
+        let canonical = canonical_ip(ip);
+        let shard_idx = ip_shard_index(&canonical);
         let now = Instant::now();
-        let mut guard = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.shards[shard_idx].lock();
 
-        if guard.len() >= self.max_entries {
+        if guard.len() >= self.max_entries_per_shard {
             let stale_cutoff = Duration::from_secs(120);
             guard.retain(|_, b| now.duration_since(b.last_refill) < stale_cutoff);
-            if guard.len() >= self.max_entries {
+            if guard.len() >= self.max_entries_per_shard {
                 guard.clear();
             }
         }
 
-        let bucket = guard.entry(canonical_ip(ip)).or_insert_with(|| Bucket {
+        let bucket = guard.entry(canonical).or_insert_with(|| Bucket {
             tokens: self.burst,
             last_refill: now,
         });
@@ -575,6 +602,12 @@ impl IpRateLimiter {
             false
         }
     }
+}
+
+fn ip_shard_index(ip: &IpAddr) -> usize {
+    let mut hasher = ahash::AHasher::default();
+    ip.hash(&mut hasher);
+    (hasher.finish() as usize) & (RATE_LIMITER_SHARDS - 1)
 }
 
 #[cfg(test)]

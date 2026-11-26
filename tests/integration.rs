@@ -2622,6 +2622,7 @@ async fn proactive_media_preloader_warms_avatars_images_and_thumbnail_downloads(
     assert!(dl_before >= 1, "expected preloader to warm inline image");
 
     // 2. Client's VERY FIRST request for room avatar (including Element X's `animated=false` default param) hits L1 RAM cache with 0 upstream calls!
+    // Also verifies avatar-sized thumbnail (`96x96`) does NOT wastefully trigger a full `/download` preload.
     let r_ava = app
         .clone()
         .oneshot(
@@ -2641,6 +2642,12 @@ async fn proactive_media_preloader_warms_avatars_images_and_thumbnail_downloads(
     );
     assert_eq!(body_text(r_ava).await, "THUMB-roomAva1");
     assert_eq!(thumb_hits.load(Ordering::SeqCst), th_before);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        dl_hits.load(Ordering::SeqCst),
+        dl_before,
+        "avatar-sized thumbnail must not trigger wasteful full /download preload"
+    );
 
     // 3. Client's VERY FIRST request for inline image hits L1 RAM cache with 0 upstream calls!
     let r_img = app

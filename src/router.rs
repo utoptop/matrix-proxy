@@ -1,8 +1,9 @@
 use crate::client_ip::ClientInfo;
 use crate::config::{AuthRouteMode, ProxyProfile, strip_host_port};
 use crate::rewrite::{PublicContext, is_safe_host_header, path_has_prefix, strip_path_prefix};
+use ahash::AHashMap;
 use http::HeaderMap;
-use std::collections::HashMap;
+use std::borrow::Cow;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,9 +26,9 @@ pub enum RouteTarget {
     },
 }
 
-/// Fast O(1) virtual-host router for one listening port (handles 1 dedicated profile OR N shared-port profiles).
+/// Fast O(1) zero-allocation virtual-host router for one listening port (handles 1 dedicated profile OR N shared-port profiles).
 pub struct VhostRouter<T> {
-    exact: HashMap<String, Arc<T>>,
+    exact: AHashMap<String, Arc<T>>,
     wildcards: Vec<(String, Arc<T>)>,
     single_dedicated: Option<(Arc<T>, bool)>,
     default_fallback: Option<Arc<T>>,
@@ -36,7 +37,7 @@ pub struct VhostRouter<T> {
 
 impl<T> VhostRouter<T> {
     pub fn build(entries: Vec<(Vec<String>, bool, bool, Arc<T>)>) -> Self {
-        let mut exact = HashMap::new();
+        let mut exact = AHashMap::with_capacity(entries.len() * 2);
         let mut wildcards = Vec::new();
         let mut default_fallback = None;
         let mut all_instances = Vec::with_capacity(entries.len());
@@ -105,12 +106,18 @@ impl<T> VhostRouter<T> {
     }
 
     fn match_domain(&self, raw_host: &str) -> Option<Arc<T>> {
-        let host = strip_host_port(raw_host).to_ascii_lowercase();
-        if let Some(found) = self.exact.get(&host) {
+        let stripped = strip_host_port(raw_host);
+        // Zero-allocation fast path when Host header is already lowercase (99.9%+ of traffic).
+        let host: Cow<'_, str> = if stripped.bytes().any(|b| b.is_ascii_uppercase()) {
+            Cow::Owned(stripped.to_ascii_lowercase())
+        } else {
+            Cow::Borrowed(stripped)
+        };
+        if let Some(found) = self.exact.get(host.as_ref()) {
             return Some(Arc::clone(found));
         }
         for (suffix, inst) in &self.wildcards {
-            if host.ends_with(suffix) && host.len() > suffix.len() {
+            if host.ends_with(suffix.as_str()) && host.len() > suffix.len() {
                 return Some(Arc::clone(inst));
             }
         }
@@ -118,8 +125,8 @@ impl<T> VhostRouter<T> {
     }
 }
 
-/// Extracts the effective request host (trusting `X-Forwarded-Host` ONLY when `client.peer_is_trusted`).
-pub fn extract_request_host(client: &ClientInfo, headers: &HeaderMap) -> Option<String> {
+/// Zero-allocation extraction of the effective request host (trusting `X-Forwarded-Host` ONLY when `client.peer_is_trusted`).
+pub fn extract_request_host<'a>(client: &ClientInfo, headers: &'a HeaderMap) -> Option<&'a str> {
     if client.peer_is_trusted
         && let Some(xfh) = headers
             .get("x-forwarded-host")
@@ -128,7 +135,7 @@ pub fn extract_request_host(client: &ClientInfo, headers: &HeaderMap) -> Option<
             .map(str::trim)
             .filter(|s| is_safe_host_header(s))
     {
-        return Some(xfh.to_string());
+        return Some(xfh);
     }
 
     headers
@@ -136,7 +143,6 @@ pub fn extract_request_host(client: &ClientInfo, headers: &HeaderMap) -> Option<
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|s| is_safe_host_header(s))
-        .map(ToString::to_string)
 }
 
 pub fn classify_request(
@@ -293,14 +299,14 @@ fn is_request_for_auth_host(
         return false;
     };
 
-    if !strip_host_port(&req_host).eq_ignore_ascii_case(auth_host) {
+    if !strip_host_port(req_host).eq_ignore_ascii_case(auth_host) {
         return false;
     }
 
     // If Matrix & Auth share the same host/IP on different ports (e.g. `http://100.64.0.10:8081` vs `:8082`),
     // match the explicit port too so Matrix traffic isn't misrouted to Auth.
     if auth_host.eq_ignore_ascii_case(matrix_host) {
-        let req_port = extract_host_port(&req_host).or_else(|| {
+        let req_port = extract_host_port(req_host).or_else(|| {
             Some(if client.client_proto == "https" {
                 443
             } else {
