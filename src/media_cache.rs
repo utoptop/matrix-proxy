@@ -30,7 +30,7 @@ use url::Url;
 const DISK_CACHE_MAGIC: &[u8; 8] = b"MPMC01\0\0";
 const MAX_VERIFIED_TOKENS: usize = 4096;
 const MAX_OBSERVED_AVATAR_SIZES: usize = 2;
-const MAX_EFFECTIVE_AVATAR_SIZES: usize = 3;
+const MAX_EFFECTIVE_AVATAR_SIZES: usize = 4;
 const MAX_DECOMPRESSED_SCAN_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_PRELOAD_SCAN_RAW_BYTES: usize = 2 * 1024 * 1024;
 const PRELOAD_QUEUE_CAPACITY: usize = 128;
@@ -239,10 +239,25 @@ fn canonicalize_thumbnail_query(query: Option<&str>) -> (String, Option<AvatarTh
         for (k, v) in url::form_urlencoded::parse(q.as_bytes()) {
             let key = k.to_ascii_lowercase();
             match key.as_str() {
-                "width" | "height" | "animated" | "allow_redirect" => {
+                "width" | "height" => {
                     let val = v.trim().to_ascii_lowercase();
                     if !val.is_empty() {
                         params.insert(key, val);
+                    }
+                }
+                // Per Matrix spec (MSC2705 / v1.11+), omitting `animated` defaults to `false`;
+                // normalize `animated=false` / `0` away so preloaded thumbnails match real clients
+                // (e.g. Element X / matrix-rust-sdk sending `?method=scale&width=192&height=192&animated=false`).
+                "animated" => {
+                    let val = v.trim().to_ascii_lowercase();
+                    if val == "true" || val == "1" {
+                        params.insert(key, "true".to_string());
+                    }
+                }
+                "allow_redirect" => {
+                    let val = v.trim().to_ascii_lowercase();
+                    if val == "true" || val == "1" {
+                        params.insert(key, "true".to_string());
                     }
                 }
                 "method" => {
@@ -2188,20 +2203,29 @@ mod tests {
     #[test]
     fn media_route_canonicalizes_thumbnail_queries_and_auth_flags() {
         let u1 = Url::parse(
-            "https://hs.example.org/_matrix/client/v1/media/thumbnail/example.org/abc123?width=96&method=CROP&height=96&allow_remote=true&timeout_ms=20000",
+            "https://hs.example.org/_matrix/client/v1/media/thumbnail/example.org/abc123?width=96&method=CROP&height=96&allow_remote=true&timeout_ms=20000&animated=false",
         )
         .unwrap();
         let u2 = Url::parse(
             "https://hs.example.org/_matrix/client/unstable/org.matrix.msc3916/media/thumbnail/example.org/abc123?height=96&width=96&method=crop",
         )
         .unwrap();
+        let u_anim = Url::parse(
+            "https://hs.example.org/_matrix/client/v1/media/thumbnail/example.org/abc123?height=96&width=96&method=crop&animated=true",
+        )
+        .unwrap();
         let r1 = parse_matrix_media_route(&Method::GET, &u1).unwrap();
         let r2 = parse_matrix_media_route(&Method::GET, &u2).unwrap();
+        let r_anim = parse_matrix_media_route(&Method::GET, &u_anim).unwrap();
         assert!(r1.requires_auth());
         assert!(r2.requires_auth());
         assert_eq!(
             r1.cache_key("p", "https://hs.example.org"),
             r2.cache_key("p", "https://hs.example.org")
+        );
+        assert_ne!(
+            r1.cache_key("p", "https://hs.example.org"),
+            r_anim.cache_key("p", "https://hs.example.org")
         );
         assert_eq!(
             r1.cache_key("p", "https://hs.example.org"),

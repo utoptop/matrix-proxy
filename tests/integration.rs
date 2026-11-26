@@ -2621,12 +2621,12 @@ async fn proactive_media_preloader_warms_avatars_images_and_thumbnail_downloads(
     assert!(th_before >= 2, "expected preloader to warm 2 avatars");
     assert!(dl_before >= 1, "expected preloader to warm inline image");
 
-    // 2. Client's VERY FIRST request for room avatar hits L1 RAM cache with 0 upstream calls!
+    // 2. Client's VERY FIRST request for room avatar (including Element X's `animated=false` default param) hits L1 RAM cache with 0 upstream calls!
     let r_ava = app
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/_matrix/client/v1/media/thumbnail/hs.test/roomAva1?width=96&height=96&method=crop")
+                .uri("/_matrix/client/v1/media/thumbnail/hs.test/roomAva1?method=crop&width=96&height=96&animated=false")
                 .header(header::HOST, "preload.example.com")
                 .header(header::AUTHORIZATION, "Bearer syt_preload_tok")
                 .body(Body::empty())
