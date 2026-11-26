@@ -1,5 +1,5 @@
 # =============================================================================
-# matrix-proxy v1.5.0 — Clean Configuration Reference
+# matrix-proxy v1.6.0 — Clean Configuration Reference
 # =============================================================================
 # THREE SIMPLE LAYERS (Highest -> Lowest Precedence):
 #   1. `[[proxies]]`  — Per-node config (ALWAYS wins over `[defaults]` & `[server]`)
@@ -66,6 +66,18 @@ tcp_keepalive_secs = 30
 tcp_nodelay = true
 listen_backlog = 4096
 
+# Optional: Auth-safe edge cache for immutable Matrix media & thumbnails (L1 RAM + L2 SSD/disk LRU).
+# Disabled by default; enable to serve avatars, thumbnails & repeat media at <1ms from the proxy edge.
+# When using a `read_only: true` Docker container with `dir = "/app/cache/media"`, mount a writable volume at `/app/cache`.
+[server.media_cache]
+enabled = false
+dir = ""                            # e.g. "/app/cache/media" for persistent L2 disk LRU (empty = RAM only)
+ram_max_mb = 32                     # Strict L1 hot RAM LRU cap in MiB (safe even on 1 GB VPS)
+ram_max_item_kb = 256               # Max item size (KiB) kept in L1 RAM (avatars & thumbnails)
+disk_max_mb = 1024                  # Strict L2 disk LRU cap in MiB (requires `dir`)
+max_item_mb = 16                    # Max cached object size (MiB); larger files stream straight through
+auth_cache_ttl_secs = 180           # TTL for verified Matrix Bearer token hashes (Matrix v1.11+ auth media)
+
 
 # =============================================================================
 # 2. GLOBAL PROXY DEFAULTS (`[defaults]`)
@@ -127,6 +139,18 @@ cache_ttl_secs = 60
 connect_timeout_secs = 15
 request_timeout_secs = 0            # 0 = unlimited (required for Matrix long-poll `/sync`)
 danger_accept_invalid_certs = false
+
+# Edge media cache & proactive background preloading defaults (requires `[server.media_cache].enabled = true`):
+# - Room & member/hero avatars are preloaded proactively (plaintext even in E2EE rooms)
+# - Unencrypted room images/stickers & video thumbnails are preloaded from `/sync`, Sliding Sync & room timelines
+# - Fetching a `/thumbnail/...` automatically pre-warms `/download/...` in the background
+# - All media (including E2EE encrypted blobs) benefits from L1/L2 edge caching & immutable Cache-Control
+media_cache = true
+media_preload = false
+media_preload_concurrency = 4
+media_preload_max_item_mb = 4
+media_preload_on_thumbnail = true
+media_preload_avatar_sizes = ["96x96:crop"]
 
 
 # =============================================================================

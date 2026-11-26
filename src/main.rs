@@ -12,6 +12,7 @@ use matrix_proxy::client_ip::{
 use matrix_proxy::config::{
     Config, ListenerPlan, ProxyProtocol, RuntimeConfig, canonical_ip, redact_proxy_url,
 };
+use matrix_proxy::media_cache::MediaCache;
 use matrix_proxy::metrics::ProxyMetrics;
 use matrix_proxy::ppv2_client::configure_tcp_socket;
 use matrix_proxy::proxy::{
@@ -152,6 +153,7 @@ struct ActiveListener {
 struct ReloadCoordinator {
     config_path: Option<PathBuf>,
     metrics: Arc<ProxyMetrics>,
+    media_cache: RwLock<Option<Arc<MediaCache>>>,
     tracker: Arc<ConnectionTracker>,
     listeners: Mutex<HashMap<SocketAddr, ActiveListener>>,
     reload_lock: Mutex<()>,
@@ -164,12 +166,36 @@ impl ReloadCoordinator {
         Arc::new(Self {
             config_path,
             metrics,
+            media_cache: RwLock::new(None),
             tracker: Arc::new(ConnectionTracker::default()),
             listeners: Mutex::new(HashMap::new()),
             reload_lock: Mutex::new(()),
             watched_tls: RwLock::new(Vec::new()),
             grace_secs: RwLock::new(15),
         })
+    }
+
+    fn resolve_media_cache(&self, runtime: &RuntimeConfig) -> Option<Arc<MediaCache>> {
+        if !runtime.server.media_cache.enabled {
+            let mut guard = self.media_cache.write().unwrap_or_else(|e| e.into_inner());
+            *guard = None;
+            return None;
+        }
+        {
+            let guard = self.media_cache.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(existing) = guard.as_ref()
+                && existing.config() == &runtime.server.media_cache
+            {
+                return Some(Arc::clone(existing));
+            }
+        }
+        let fresh = MediaCache::new(
+            runtime.server.media_cache.clone(),
+            Arc::clone(&self.metrics),
+        );
+        let mut guard = self.media_cache.write().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(Arc::clone(&fresh));
+        Some(fresh)
     }
 
     fn make_reload_fn(self: &Arc<Self>) -> Option<ReloadFn> {
@@ -345,12 +371,14 @@ impl ReloadCoordinator {
         &self,
         runtime: &Arc<RuntimeConfig>,
     ) -> Result<Vec<(ListenerPlan, Arc<ListenerState>, Option<TlsAcceptor>)>> {
+        let shared_media_cache = self.resolve_media_cache(runtime);
         let mut prepared = Vec::with_capacity(runtime.listeners.len());
         for plan in &runtime.listeners {
-            let state = ListenerState::build_with_metrics(
+            let state = ListenerState::build_with_shared(
                 Arc::clone(runtime),
                 plan.clone(),
                 Arc::clone(&self.metrics),
+                shared_media_cache.clone(),
             )?;
             let tls_acceptor = if plan.tls_enabled() {
                 let cert_path = plan.tls_cert_path.as_deref().unwrap();
@@ -506,6 +534,9 @@ async fn main() -> Result<()> {
         hot_reload = runtime.server.hot_reload && resolved_config_path.is_some(),
         hot_reload_interval_secs = runtime.server.hot_reload_interval_secs,
         shutdown_grace_secs = runtime.server.shutdown_grace_secs,
+        media_cache_enabled = runtime.server.media_cache.enabled,
+        media_cache_ram_max_mb = runtime.server.media_cache.ram_max_mb,
+        media_cache_disk_max_mb = runtime.server.media_cache.disk_max_mb,
         "starting matrix-proxy"
     );
 
@@ -891,7 +922,7 @@ fn run_check_config(config_path: Option<&Path>) -> Result<()> {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "<environment>".to_string());
     println!(
-        "OK: matrix-proxy v{} configuration valid (source={}, listeners={}, default_outbound_proxy={}, default_no_proxy={})",
+        "OK: matrix-proxy v{} configuration valid (source={}, listeners={}, default_outbound_proxy={}, default_no_proxy={}, media_cache={})",
         env!("CARGO_PKG_VERSION"),
         src,
         runtime.listeners.len(),
@@ -902,6 +933,21 @@ fn run_check_config(config_path: Option<&Path>) -> Result<()> {
             .map(redact_proxy_url)
             .unwrap_or_else(|| "direct".to_string()),
         runtime.server.outbound_no_proxy.len(),
+        if runtime.server.media_cache.enabled {
+            format!(
+                "on(ram={}MiB,disk={}MiB,dir={})",
+                runtime.server.media_cache.ram_max_mb,
+                runtime.server.media_cache.disk_max_mb,
+                runtime
+                    .server
+                    .media_cache
+                    .dir
+                    .as_deref()
+                    .unwrap_or("<ram-only>"),
+            )
+        } else {
+            "off".to_string()
+        },
     );
     for plan in &runtime.listeners {
         println!(
@@ -930,12 +976,20 @@ fn run_check_config(config_path: Option<&Path>) -> Result<()> {
                 .or(p.upstream.upstream_matrix_server_name.as_deref())
                 .unwrap_or("<unknown>");
             println!(
-                "    - {} | public={} -> upstream={} | auth_proxy={} | mrtc={} | outbound_proxy={} | pp={}/{}",
+                "    - {} | public={} -> upstream={} | auth_proxy={} | mrtc={} | media_preload={} | outbound_proxy={} | pp={}/{}",
                 p.name,
                 pub_url,
                 hs,
                 p.discovery.auth_proxy_mode,
                 p.matrix_rtc.summary(),
+                if runtime.server.media_cache.enabled
+                    && p.media.cache_enabled
+                    && p.media.preload_enabled
+                {
+                    format!("on(c={})", p.media.preload_concurrency)
+                } else {
+                    "off".to_string()
+                },
                 proxy,
                 p.matrix_proxy_protocol(),
                 p.auth_proxy_protocol(),

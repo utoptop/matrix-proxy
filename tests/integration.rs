@@ -2134,3 +2134,614 @@ async fn matrix_rtc_delegation_supports_defaults_upstream_off_and_multi_foci() {
         ])
     );
 }
+
+#[tokio::test]
+async fn media_edge_cache_enforces_auth_serves_ram_disk_range_and_304() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    let thumb_hits = Arc::new(AtomicUsize::new(0));
+    let dl_hits = Arc::new(AtomicUsize::new(0));
+    let token_valid = Arc::new(AtomicBool::new(true));
+
+    let th_c = Arc::clone(&thumb_hits);
+    let tv_th = Arc::clone(&token_valid);
+    let dl_c = Arc::clone(&dl_hits);
+    let tv_dl = Arc::clone(&token_valid);
+    let tv_sync = Arc::clone(&token_valid);
+
+    let big_payload = Arc::new((0u32..4096).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+    let big_for_route = Arc::clone(&big_payload);
+
+    let hs_app = Router::new()
+        .route(
+            "/_matrix/client/v3/sync",
+            get(move |headers: axum::http::HeaderMap| {
+                let tv = Arc::clone(&tv_sync);
+                async move {
+                    let authed = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        == Some("Bearer syt_valid_tok")
+                        && tv.load(Ordering::SeqCst);
+                    if !authed {
+                        return Response::builder()
+                            .status(StatusCode::UNAUTHORIZED)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(r#"{"errcode":"M_UNKNOWN_TOKEN"}"#))
+                            .unwrap();
+                    }
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"next_batch":"b1"}"#))
+                        .unwrap()
+                }
+            }),
+        )
+        .route(
+            "/_matrix/client/v1/media/thumbnail/{server}/{id}",
+            get(move |headers: axum::http::HeaderMap| {
+                let hits = Arc::clone(&th_c);
+                let tv = Arc::clone(&tv_th);
+                async move {
+                    let authed = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        == Some("Bearer syt_valid_tok")
+                        && tv.load(Ordering::SeqCst);
+                    if !authed {
+                        return Response::builder()
+                            .status(StatusCode::UNAUTHORIZED)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(r#"{"errcode":"M_MISSING_TOKEN"}"#))
+                            .unwrap();
+                    }
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "image/webp")
+                        .body(Body::from(b"WEBP-AVATAR-BYTES".to_vec()))
+                        .unwrap()
+                }
+            }),
+        )
+        .route(
+            "/_matrix/client/v1/media/download/{server}/{id}",
+            get(move |headers: axum::http::HeaderMap| {
+                let hits = Arc::clone(&dl_c);
+                let tv = Arc::clone(&tv_dl);
+                let payload = Arc::clone(&big_for_route);
+                async move {
+                    let authed = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        == Some("Bearer syt_valid_tok")
+                        && tv.load(Ordering::SeqCst);
+                    if !authed {
+                        return Response::builder()
+                            .status(StatusCode::UNAUTHORIZED)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(r#"{"errcode":"M_MISSING_TOKEN"}"#))
+                            .unwrap();
+                    }
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/octet-stream")
+                        .header(header::CONTENT_DISPOSITION, "inline; filename=\"blob.bin\"")
+                        .body(Body::from((*payload).clone()))
+                        .unwrap()
+                }
+            }),
+        );
+
+    let hs_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hs_addr = hs_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(hs_listener, hs_app).await;
+    });
+
+    let cache_dir = std::env::temp_dir().join(format!(
+        "matrix-proxy-int-media-cache-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&cache_dir);
+
+    let toml_cfg = format!(
+        r#"
+        [server]
+        listen = "0.0.0.0:8080"
+        expose_info = "always"
+
+        [server.media_cache]
+        enabled = true
+        dir = "{}"
+        ram_max_mb = 2
+        ram_max_item_kb = 1
+        disk_max_mb = 4
+        max_item_mb = 4
+        auth_cache_ttl_secs = 120
+
+        [[proxies]]
+        name = "cached-hs"
+        matrix_proxy_public_url = "https://media-cache.example.com"
+        upstream_matrix_server_url = "http://{hs_addr}"
+        merge_upstream_well_known = false
+        "#,
+        cache_dir.display()
+    );
+    let app = build_single_listener_app(Config::from_toml_str(&toml_cfg).unwrap()).await;
+
+    // 1. Unauthenticated request MUST fail with 401
+    let r_unauth = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_matrix/client/v1/media/thumbnail/hs.test/ava1?width=96&height=96&method=crop")
+                .header(header::HOST, "media-cache.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_unauth.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(thumb_hits.load(Ordering::SeqCst), 0);
+
+    // 2. First authenticated thumbnail fetch -> MISS (populates L1 RAM + L2 disk + verifies token)
+    let r_miss = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_matrix/client/v1/media/thumbnail/hs.test/ava1?width=96&height=96&method=crop&allow_remote=true")
+                .header(header::HOST, "media-cache.example.com")
+                .header(header::AUTHORIZATION, "Bearer syt_valid_tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_miss.status(), StatusCode::OK);
+    assert_eq!(
+        r_miss.headers().get("x-matrix-proxy-cache").unwrap(),
+        "MISS"
+    );
+    assert_eq!(
+        r_miss.headers().get(header::CACHE_CONTROL).unwrap(),
+        "public, max-age=31536000, immutable"
+    );
+    assert_eq!(body_text(r_miss).await, "WEBP-AVATAR-BYTES");
+    assert_eq!(thumb_hits.load(Ordering::SeqCst), 1);
+
+    // Give the async tee-commit task a moment to complete L1/L2 store
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // 3. Unauthenticated request MUST STILL get 401 even though media is cached!
+    let r_unauth_after = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_matrix/client/v1/media/thumbnail/hs.test/ava1?width=96&height=96&method=crop")
+                .header(header::HOST, "media-cache.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_unauth_after.status(), StatusCode::UNAUTHORIZED);
+
+    // 4. Second authenticated fetch with reordered query params -> HIT-RAM (0 upstream hit!)
+    let r_hit = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_matrix/client/v1/media/thumbnail/hs.test/ava1?height=96&method=CROP&width=96&timeout_ms=5000")
+                .header(header::HOST, "media-cache.example.com")
+                .header(header::AUTHORIZATION, "Bearer syt_valid_tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_hit.status(), StatusCode::OK);
+    assert_eq!(
+        r_hit.headers().get("x-matrix-proxy-cache").unwrap(),
+        "HIT-RAM"
+    );
+    let etag = r_hit
+        .headers()
+        .get(header::ETAG)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(body_text(r_hit).await, "WEBP-AVATAR-BYTES");
+    assert_eq!(thumb_hits.load(Ordering::SeqCst), 1);
+
+    // 5. Conditional GET with If-None-Match -> 304 Not Modified from cache
+    let r_304 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_matrix/client/v1/media/thumbnail/hs.test/ava1?width=96&height=96&method=crop")
+                .header(header::HOST, "media-cache.example.com")
+                .header(header::AUTHORIZATION, "Bearer syt_valid_tok")
+                .header(header::IF_NONE_MATCH, etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_304.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(thumb_hits.load(Ordering::SeqCst), 1);
+
+    // 6. 4 KiB download (> ram_max_item_kb = 1 KiB) goes to L2 disk and serves Range 206!
+    let r_big1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_matrix/client/v1/media/download/hs.test/blob1")
+                .header(header::HOST, "media-cache.example.com")
+                .header(header::AUTHORIZATION, "Bearer syt_valid_tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_big1.status(), StatusCode::OK);
+    assert_eq!(
+        r_big1.headers().get("x-matrix-proxy-cache").unwrap(),
+        "MISS"
+    );
+    let got_big1 = r_big1.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(got_big1.as_ref(), big_payload.as_slice());
+    assert_eq!(dl_hits.load(Ordering::SeqCst), 1);
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let r_big_range = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_matrix/client/v1/media/download/hs.test/blob1")
+                .header(header::HOST, "media-cache.example.com")
+                .header(header::AUTHORIZATION, "Bearer syt_valid_tok")
+                .header(header::RANGE, "bytes=10-29")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_big_range.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        r_big_range.headers().get("x-matrix-proxy-cache").unwrap(),
+        "HIT-DISK"
+    );
+    assert_eq!(
+        r_big_range.headers().get(header::CONTENT_RANGE).unwrap(),
+        "bytes 10-29/4096"
+    );
+    let got_slice = r_big_range.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(got_slice.as_ref(), &big_payload[10..=29]);
+    assert_eq!(dl_hits.load(Ordering::SeqCst), 1);
+
+    // 7. Token revocation: once upstream returns 401 on /sync, cached media is no longer served to that token!
+    token_valid.store(false, Ordering::SeqCst);
+    let r_sync_401 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_matrix/client/v3/sync")
+                .header(header::HOST, "media-cache.example.com")
+                .header(header::AUTHORIZATION, "Bearer syt_valid_tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_sync_401.status(), StatusCode::UNAUTHORIZED);
+
+    let r_revoked = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_matrix/client/v1/media/thumbnail/hs.test/ava1?width=96&height=96&method=crop")
+                .header(header::HOST, "media-cache.example.com")
+                .header(header::AUTHORIZATION, "Bearer syt_valid_tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_revoked.status(), StatusCode::UNAUTHORIZED);
+
+    let _ = std::fs::remove_dir_all(&cache_dir);
+}
+
+#[tokio::test]
+async fn proactive_media_preloader_warms_avatars_images_and_thumbnail_downloads() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    let thumb_hits = Arc::new(AtomicUsize::new(0));
+    let dl_hits = Arc::new(AtomicUsize::new(0));
+    let th_c = Arc::clone(&thumb_hits);
+    let dl_c = Arc::clone(&dl_hits);
+
+    let hs_app = Router::new()
+        .route(
+            "/_matrix/client/unstable/org.matrix.simplified_msc3575/sync",
+            post(|| async {
+                let doc = json!({
+                    "pos": "1",
+                    "rooms": {
+                        "!room:hs.test": {
+                            "avatar": "mxc://hs.test/roomAva1",
+                            "heroes": [
+                                { "user_id": "@bob:hs.test", "avatar": "mxc://hs.test/bobAva" }
+                            ],
+                            "timeline": [
+                                {
+                                    "type": "m.room.message",
+                                    "content": {
+                                        "msgtype": "m.image",
+                                        "url": "mxc://hs.test/inlineImg1",
+                                        "info": { "mimetype": "image/png", "size": 1024 }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                });
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(doc.to_string()))
+                    .unwrap()
+            }),
+        )
+        .route(
+            "/_matrix/client/v1/media/thumbnail/{server}/{id}",
+            get(
+                move |axum::extract::Path((_srv, id)): axum::extract::Path<(String, String)>,
+                      headers: axum::http::HeaderMap| {
+                    let hits = Arc::clone(&th_c);
+                    async move {
+                        if headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            != Some("Bearer syt_preload_tok")
+                        {
+                            return Response::builder()
+                                .status(StatusCode::UNAUTHORIZED)
+                                .body(Body::empty())
+                                .unwrap();
+                        }
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(header::CONTENT_TYPE, "image/png")
+                            .body(Body::from(format!("THUMB-{id}")))
+                            .unwrap()
+                    }
+                },
+            ),
+        )
+        .route(
+            "/_matrix/client/v1/media/download/{server}/{id}",
+            get(
+                move |axum::extract::Path((_srv, id)): axum::extract::Path<(String, String)>,
+                      headers: axum::http::HeaderMap| {
+                    let hits = Arc::clone(&dl_c);
+                    async move {
+                        if headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            != Some("Bearer syt_preload_tok")
+                        {
+                            return Response::builder()
+                                .status(StatusCode::UNAUTHORIZED)
+                                .body(Body::empty())
+                                .unwrap();
+                        }
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(header::CONTENT_TYPE, "image/png")
+                            .body(Body::from(format!("FULL-{id}")))
+                            .unwrap()
+                    }
+                },
+            ),
+        );
+
+    let hs_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hs_addr = hs_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(hs_listener, hs_app).await;
+    });
+
+    let toml_cfg = format!(
+        r#"
+        [server]
+        listen = "0.0.0.0:8080"
+        expose_info = "always"
+
+        [server.media_cache]
+        enabled = true
+        ram_max_mb = 8
+        ram_max_item_kb = 256
+
+        [defaults]
+        media_preload = true
+        media_preload_concurrency = 4
+        media_preload_max_item_mb = 4
+        media_preload_on_thumbnail = true
+        media_preload_avatar_sizes = ["96x96:crop"]
+
+        [[proxies]]
+        name = "preload-hs"
+        matrix_proxy_public_url = "https://preload.example.com"
+        upstream_matrix_server_url = "http://{hs_addr}"
+        merge_upstream_well_known = false
+        "#
+    );
+    let app = build_single_listener_app(Config::from_toml_str(&toml_cfg).unwrap()).await;
+
+    // 1. Sliding Sync triggers background preloading of roomAva1, bobAva (96x96:crop) and inlineImg1 (/download)
+    let sync_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/_matrix/client/unstable/org.matrix.simplified_msc3575/sync")
+                .header(header::HOST, "preload.example.com")
+                .header(header::AUTHORIZATION, "Bearer syt_preload_tok")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sync_resp.status(), StatusCode::OK);
+    // Must consume body so the streaming tee reaches EOF and fires the preload callback
+    let _ = body_json(sync_resp).await;
+
+    // Wait up to 2s for background preloader to finish warming all 3 objects
+    for _ in 0..40 {
+        if thumb_hits.load(Ordering::SeqCst) >= 2 && dl_hits.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Brief settle so cache.store completes
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let th_before = thumb_hits.load(Ordering::SeqCst);
+    let dl_before = dl_hits.load(Ordering::SeqCst);
+    assert!(th_before >= 2, "expected preloader to warm 2 avatars");
+    assert!(dl_before >= 1, "expected preloader to warm inline image");
+
+    // 2. Client's VERY FIRST request for room avatar hits L1 RAM cache with 0 upstream calls!
+    let r_ava = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_matrix/client/v1/media/thumbnail/hs.test/roomAva1?width=96&height=96&method=crop")
+                .header(header::HOST, "preload.example.com")
+                .header(header::AUTHORIZATION, "Bearer syt_preload_tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_ava.status(), StatusCode::OK);
+    assert_eq!(
+        r_ava.headers().get("x-matrix-proxy-cache").unwrap(),
+        "HIT-RAM"
+    );
+    assert_eq!(body_text(r_ava).await, "THUMB-roomAva1");
+    assert_eq!(thumb_hits.load(Ordering::SeqCst), th_before);
+
+    // 3. Client's VERY FIRST request for inline image hits L1 RAM cache with 0 upstream calls!
+    let r_img = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_matrix/client/v1/media/download/hs.test/inlineImg1")
+                .header(header::HOST, "preload.example.com")
+                .header(header::AUTHORIZATION, "Bearer syt_preload_tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_img.status(), StatusCode::OK);
+    assert_eq!(
+        r_img.headers().get("x-matrix-proxy-cache").unwrap(),
+        "HIT-RAM"
+    );
+    assert_eq!(body_text(r_img).await, "FULL-inlineImg1");
+    assert_eq!(dl_hits.load(Ordering::SeqCst), dl_before);
+
+    // 4. Thumbnail-triggered full-download preload: fetching a new thumbnail warms `/download` in background
+    let r_thumb = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_matrix/client/v1/media/thumbnail/hs.test/tapPhoto?width=320&height=240&method=scale")
+                .header(header::HOST, "preload.example.com")
+                .header(header::AUTHORIZATION, "Bearer syt_preload_tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_thumb.status(), StatusCode::OK);
+    assert_eq!(body_text(r_thumb).await, "THUMB-tapPhoto");
+
+    for _ in 0..40 {
+        if dl_hits.load(Ordering::SeqCst) > dl_before {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let dl_after_preload = dl_hits.load(Ordering::SeqCst);
+
+    let r_full = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_matrix/client/v1/media/download/hs.test/tapPhoto")
+                .header(header::HOST, "preload.example.com")
+                .header(header::AUTHORIZATION, "Bearer syt_preload_tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_full.status(), StatusCode::OK);
+    assert_eq!(
+        r_full.headers().get("x-matrix-proxy-cache").unwrap(),
+        "HIT-RAM"
+    );
+    assert_eq!(body_text(r_full).await, "FULL-tapPhoto");
+    assert_eq!(dl_hits.load(Ordering::SeqCst), dl_after_preload);
+
+    // 5. Verify /_proxy/info and /_proxy/metrics report media cache & preload counters
+    let info_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_proxy/info")
+                .header(header::HOST, "preload.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let info_json = body_json(info_resp).await;
+    assert_eq!(info_json["media_cache"]["enabled"], true);
+    assert!(info_json["media_cache"]["hits_ram_total"].as_u64().unwrap() >= 3);
+    assert!(
+        info_json["media_cache"]["preload_completed_total"]
+            .as_u64()
+            .unwrap()
+            >= 4
+    );
+
+    let metrics_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_proxy/metrics")
+                .header(header::HOST, "preload.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let metrics_text = body_text(metrics_resp).await;
+    assert!(metrics_text.contains("matrix_proxy_media_cache_hits_ram_total"));
+    assert!(metrics_text.contains("matrix_proxy_media_preload_completed_total"));
+}

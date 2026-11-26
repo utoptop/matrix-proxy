@@ -1,5 +1,5 @@
 # =============================================================================
-# matrix-proxy v1.3 — Hardened Docker Compose Example
+# matrix-proxy v1.6 — Hardened Docker Compose Example
 # Quick start:
 #   cp config.example.toml config.toml
 #   docker compose up -d
@@ -39,6 +39,8 @@ services:
       # Mounting the directory to `/app/conf:ro` (auto-loads `/app/conf/config.toml`) ensures
       # editors/SFTP clients that perform atomic write+rename trigger automatic hot reload cleanly.
       - ./:/app/conf:ro
+      # Optional writable cache volume when `[server.media_cache]` uses `dir = "/app/cache/media"` (owned by UID/GID 1000):
+      # - ./cache:/app/cache
     logging:
       driver: json-file
       options:

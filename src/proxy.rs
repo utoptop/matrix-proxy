@@ -1,9 +1,16 @@
 use crate::client_ip::{ClientInfo, InboundPeer, IpRateLimiter, apply_upstream_client_ip_headers};
 use crate::config::{
     AuthProxyMode, ExposeInfoMode, ListenerPlan, ProxyProfile, ProxyProtocol, RuntimeConfig,
-    ServerConfig, normalized_base_url, redact_proxy_url, should_bypass_outbound_proxy,
+    ServerConfig, normalized_base_url, origin_string, redact_proxy_url,
+    should_bypass_outbound_proxy,
 };
 use crate::discovery::{DiscoveryManager, ResolvedUpstreams};
+use crate::media_cache::{
+    CachedMediaMeta, IMMUTABLE_MEDIA_CACHE_CONTROL, InFlightGuard, InFlightOutcome,
+    MAX_PRELOAD_SCAN_RAW_BYTES, MediaCache, MediaCacheTeeStream, MediaPreloader, MediaRouteInfo,
+    PreloadScanTeeStream, extract_bearer_token, extract_cache_meta_headers,
+    is_cacheable_media_headers, is_preload_scan_path, now_epoch_secs, parse_matrix_media_route,
+};
 use crate::metrics::ProxyMetrics;
 use crate::ppv2_client::{Ppv2Client, maybe_gunzip};
 use crate::rewrite::{PublicContext, RewriteEngine, build_upstream_target_url};
@@ -99,6 +106,8 @@ pub struct ProxyInstance {
     pub ppv2_client: Option<Arc<Ppv2Client>>,
     /// Cached Rustls ClientConfig for WebSocket tunnels (HTTP/1.1 ALPN).
     pub ws_tls_config: Arc<rustls::ClientConfig>,
+    /// Optional proactive background media preloader (active when media cache + media_preload are enabled).
+    pub preloader: Option<Arc<MediaPreloader>>,
 }
 
 impl ProxyInstance {
@@ -106,6 +115,7 @@ impl ProxyInstance {
         server: &ServerConfig,
         profile: ProxyProfile,
         metrics: Option<Arc<ProxyMetrics>>,
+        media_cache: Option<Arc<MediaCache>>,
     ) -> Result<Arc<Self>> {
         let profile = Arc::new(profile);
         let stream_client = build_http_client(server, &profile, false, false)?;
@@ -121,7 +131,7 @@ impl ProxyInstance {
                 profile.upstream.outbound_no_proxy.clone(),
                 profile.upstream.connect_timeout_secs,
                 profile.upstream.danger_accept_invalid_certs,
-                metrics,
+                metrics.clone(),
             )?))
         } else {
             None
@@ -139,6 +149,21 @@ impl ProxyInstance {
             ppv2_client.clone(),
         ));
 
+        let preloader = if profile.media.cache_enabled
+            && profile.media.preload_enabled
+            && let (Some(cache), Some(m)) = (media_cache, metrics)
+        {
+            Some(MediaPreloader::spawn(
+                Arc::clone(&profile),
+                cache,
+                m,
+                stream_client.clone(),
+                ppv2_client.clone(),
+            ))
+        } else {
+            None
+        };
+
         Ok(Arc::new(Self {
             profile,
             discovery,
@@ -146,6 +171,7 @@ impl ProxyInstance {
             rewrite_client,
             ppv2_client,
             ws_tls_config,
+            preloader,
         }))
     }
 }
@@ -188,6 +214,7 @@ pub struct ListenerState {
     pub rate_limiter: Option<Arc<IpRateLimiter>>,
     pub listener_is_tls: bool,
     pub metrics: Arc<ProxyMetrics>,
+    pub media_cache: Option<Arc<MediaCache>>,
     pub health_path: String,
     pub health_path_slash: String,
     pub info_path: String,
@@ -208,10 +235,31 @@ impl ListenerState {
         plan: ListenerPlan,
         metrics: Arc<ProxyMetrics>,
     ) -> Result<Arc<Self>> {
+        let media_cache = if runtime.server.media_cache.enabled {
+            Some(MediaCache::new(
+                runtime.server.media_cache.clone(),
+                Arc::clone(&metrics),
+            ))
+        } else {
+            None
+        };
+        Self::build_with_shared(runtime, plan, metrics, media_cache)
+    }
+
+    pub fn build_with_shared(
+        runtime: Arc<RuntimeConfig>,
+        plan: ListenerPlan,
+        metrics: Arc<ProxyMetrics>,
+        media_cache: Option<Arc<MediaCache>>,
+    ) -> Result<Arc<Self>> {
         let mut entries = Vec::with_capacity(plan.profiles.len());
         for profile in &plan.profiles {
-            let inst =
-                ProxyInstance::build(&runtime.server, profile.clone(), Some(Arc::clone(&metrics)))?;
+            let inst = ProxyInstance::build(
+                &runtime.server,
+                profile.clone(),
+                Some(Arc::clone(&metrics)),
+                media_cache.clone(),
+            )?;
             entries.push((
                 profile.route_hosts.clone(),
                 profile.is_default,
@@ -252,6 +300,7 @@ impl ListenerState {
             rate_limiter,
             listener_is_tls,
             metrics,
+            media_cache,
             health_path,
             health_path_slash,
             info_path,
@@ -770,12 +819,20 @@ fn handle_listener_summary_info(
                 "outbound_proxy": inst.profile.upstream.outbound_proxy.as_deref().map(redact_proxy_url),
                 "auth_proxy_mode": inst.profile.discovery.auth_proxy_mode,
                 "matrix_rtc": inst.profile.matrix_rtc.info_json(),
+                "media_cache": inst.profile.media.cache_enabled,
+                "media_preload": inst.profile.media.preload_enabled,
                 "upstream_matrix_proxy_protocol": inst.profile.matrix_proxy_protocol(),
                 "upstream_auth_proxy_protocol": inst.profile.auth_proxy_protocol(),
                 "client_ip_mode": inst.profile.upstream.client_ip_mode,
             })
         })
         .collect();
+
+    let media_cache_info = state
+        .media_cache
+        .as_ref()
+        .map(|c| c.stats_json())
+        .unwrap_or_else(|| json!({ "enabled": false }));
 
     json_response(
         StatusCode::OK,
@@ -788,6 +845,7 @@ fn handle_listener_summary_info(
             "shared_port": state.vhost.is_shared_port(),
             "seen_client_ip": client.client_ip.to_string(),
             "runtime": runtime_metrics_json(state, metrics),
+            "media_cache": media_cache_info,
             "profiles": profiles,
         }),
         false,
@@ -802,6 +860,12 @@ fn handle_profile_info(
     upstreams: &ResolvedUpstreams,
     client: &ClientInfo,
 ) -> Response<Body> {
+    let media_cache_info = state
+        .media_cache
+        .as_ref()
+        .map(|c| c.stats_json())
+        .unwrap_or_else(|| json!({ "enabled": false }));
+
     let body = json!({
         "service": "matrix-proxy",
         "version": env!("CARGO_PKG_VERSION"),
@@ -810,6 +874,8 @@ fn handle_profile_info(
         "inbound_proxy_protocol": state.plan.inbound_proxy_protocol,
         "seen_client_ip": client.client_ip.to_string(),
         "runtime": runtime_metrics_json(state, metrics),
+        "media_cache": media_cache_info,
+        "media": inst.profile.media,
         "public": {
             "matrix_proxy_public_url": normalized_base_url(&public.matrix_base),
             "matrix_proxy_public_auth_url": normalized_base_url(&public.auth_base),
@@ -1205,6 +1271,128 @@ async fn forward_request(
     let restrict_uia_encoding =
         kind == ForwardKind::Matrix && is_full_auth_mode && is_uia_matrix_path(target_url.path());
 
+    let bearer_token = if kind == ForwardKind::Matrix {
+        extract_bearer_token(&parts.headers).map(ToString::to_string)
+    } else {
+        None
+    };
+    let media_route = if kind == ForwardKind::Matrix {
+        parse_matrix_media_route(&parts.method, &target_url)
+    } else {
+        None
+    };
+    let profile_media_cache = state
+        .media_cache
+        .as_ref()
+        .filter(|_| inst.profile.media.cache_enabled);
+    let has_range_request = parts.headers.contains_key(http::header::RANGE);
+
+    let mut media_cache_key: Option<String> = None;
+    let mut in_flight_guard: Option<InFlightGuard> = None;
+
+    if let (Some(route), Some(cache)) = (&media_route, profile_media_cache) {
+        if let Some(spec) = &route.thumbnail_spec {
+            cache.observe_avatar_thumb_size(&inst.profile.name, spec);
+        }
+        let upstream_origin = origin_string(&upstreams.matrix_url);
+        let key = route.cache_key(&inst.profile.name, &upstream_origin);
+        let caller_verified = bearer_token
+            .as_deref()
+            .is_some_and(|t| cache.is_token_verified(&inst.profile.name, t));
+
+        if (!route.requires_auth() || caller_verified)
+            && let Some(hit) = cache.lookup(&key, caller_verified)
+        {
+            let is_ram = hit.is_ram();
+            match cache
+                .build_hit_response(&key, hit, &parts.method, &parts.headers)
+                .await
+            {
+                Ok(resp) => {
+                    if is_ram {
+                        state
+                            .metrics
+                            .media_cache_hits_ram_total
+                            .fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        state
+                            .metrics
+                            .media_cache_hits_disk_total
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    if route.is_thumbnail
+                        && let Some(preloader) = &inst.preloader
+                    {
+                        preloader.enqueue_full_download_for_thumbnail(
+                            route,
+                            &upstreams.matrix_url,
+                            bearer_token.clone(),
+                            client,
+                        );
+                    }
+                    return resp;
+                }
+                Err(err) => {
+                    debug!(
+                        profile = %inst.profile.name,
+                        error = %format!("{err:#}"),
+                        "L2 media cache read failed; falling back to upstream"
+                    );
+                    cache.remove_l2_entry(&key);
+                }
+            }
+        }
+
+        if parts.method == Method::GET && !has_range_request {
+            match cache.begin_in_flight(&key) {
+                InFlightOutcome::Leader(guard) => {
+                    in_flight_guard = Some(guard);
+                }
+                InFlightOutcome::Waiter(notify) => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), notify.notified()).await;
+                    if (!route.requires_auth() || caller_verified)
+                        && let Some(hit) = cache.lookup(&key, caller_verified)
+                    {
+                        let is_ram = hit.is_ram();
+                        if let Ok(resp) = cache
+                            .build_hit_response(&key, hit, &parts.method, &parts.headers)
+                            .await
+                        {
+                            if is_ram {
+                                state
+                                    .metrics
+                                    .media_cache_hits_ram_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                state
+                                    .metrics
+                                    .media_cache_hits_disk_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            if route.is_thumbnail
+                                && let Some(preloader) = &inst.preloader
+                            {
+                                preloader.enqueue_full_download_for_thumbnail(
+                                    route,
+                                    &upstreams.matrix_url,
+                                    bearer_token.clone(),
+                                    client,
+                                );
+                            }
+                            return resp;
+                        }
+                    }
+                }
+            }
+        }
+
+        state
+            .metrics
+            .media_cache_misses_total
+            .fetch_add(1, Ordering::Relaxed);
+        media_cache_key = Some(key);
+    }
+
     // Collect dynamic hop-by-hop headers declared via RFC 9110 `Connection: ...`.
     let dynamic_req_hop = collect_connection_headers(&parts.headers);
     let mut out_headers = HeaderMap::new();
@@ -1263,6 +1451,21 @@ async fn forward_request(
             .map(|n| n > 0)
             .unwrap_or(false)
         || parts.headers.contains_key(http::header::TRANSFER_ENCODING);
+
+    let req_method = parts.method.clone();
+    let media_ctx = MediaResponseContext {
+        inst,
+        media_cache: profile_media_cache,
+        upstream_matrix_url: &upstreams.matrix_url,
+        client,
+        method: &req_method,
+        target_path: target_url.path(),
+        bearer_token,
+        media_route,
+        cache_key: media_cache_key,
+        in_flight_guard,
+        has_range_request,
+    };
 
     // Path A: Native Hyper HTTP/2+HTTP/1.1 with standard PROXY Protocol v1/v2 carrying real client IP!
     if outbound_pp.is_enabled()
@@ -1326,6 +1529,7 @@ async fn forward_request(
             &parts.headers,
             kind,
             should_maybe_rewrite_body,
+            media_ctx,
             upstream_resp,
         )
         .await;
@@ -1380,9 +1584,162 @@ async fn forward_request(
         &parts.headers,
         kind,
         should_maybe_rewrite_body,
+        media_ctx,
         upstream_resp,
     )
     .await
+}
+
+struct MediaResponseContext<'a> {
+    inst: &'a ProxyInstance,
+    media_cache: Option<&'a Arc<MediaCache>>,
+    upstream_matrix_url: &'a Url,
+    client: &'a ClientInfo,
+    method: &'a Method,
+    target_path: &'a str,
+    bearer_token: Option<String>,
+    media_route: Option<MediaRouteInfo>,
+    cache_key: Option<String>,
+    in_flight_guard: Option<InFlightGuard>,
+    has_range_request: bool,
+}
+
+enum ResponseStreamHook {
+    None,
+    MediaCache {
+        cache: Arc<MediaCache>,
+        key: String,
+        meta: CachedMediaMeta,
+        max_bytes: usize,
+        initial_capacity: usize,
+        in_flight: Option<InFlightGuard>,
+    },
+    PreloadScan {
+        preloader: Arc<MediaPreloader>,
+        content_encoding: String,
+        upstream_matrix_url: Url,
+        bearer_token: Option<String>,
+        client: ClientInfo,
+    },
+}
+
+fn prepare_media_and_preload_hook(
+    kind: ForwardKind,
+    status: StatusCode,
+    resp_headers: &HeaderMap,
+    do_body_rewrite: bool,
+    mut ctx: MediaResponseContext<'_>,
+) -> (bool, Option<&'static str>, ResponseStreamHook) {
+    if kind != ForwardKind::Matrix {
+        return (false, None, ResponseStreamHook::None);
+    }
+
+    // Track Bearer token validity from any Matrix Client-Server response (zero secrets stored).
+    if let (Some(cache), Some(token)) = (ctx.media_cache, ctx.bearer_token.as_deref()) {
+        if status.is_success() {
+            cache.record_verified_token(&ctx.inst.profile.name, token);
+        } else if status == StatusCode::UNAUTHORIZED {
+            cache.revoke_token(&ctx.inst.profile.name, token);
+        }
+    }
+
+    let is_media_ok = ctx.media_route.is_some() && status == StatusCode::OK;
+    if is_media_ok {
+        if let Some(route) = &ctx.media_route
+            && route.is_thumbnail
+            && let Some(preloader) = &ctx.inst.preloader
+        {
+            preloader.enqueue_full_download_for_thumbnail(
+                route,
+                ctx.upstream_matrix_url,
+                ctx.bearer_token.clone(),
+                ctx.client,
+            );
+        }
+
+        if let (Some(cache), Some(route), Some(key)) = (
+            ctx.media_cache,
+            ctx.media_route.as_ref(),
+            ctx.cache_key.take(),
+        ) {
+            let cacheable = !do_body_rewrite
+                && *ctx.method == Method::GET
+                && !ctx.has_range_request
+                && is_cacheable_media_headers(resp_headers, cache.max_item_bytes());
+            if cacheable {
+                let (content_type, content_disposition, etag) =
+                    extract_cache_meta_headers(resp_headers);
+                let content_len_hint = resp_headers
+                    .get(http::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let meta = CachedMediaMeta {
+                    content_type,
+                    content_disposition,
+                    etag: etag.unwrap_or_else(|| format!("\"{}\"", &key[..24])),
+                    requires_auth: route.requires_auth() || ctx.bearer_token.is_some(),
+                    body_len: content_len_hint as u64,
+                    stored_epoch_secs: now_epoch_secs(),
+                };
+                return (
+                    true,
+                    Some("MISS"),
+                    ResponseStreamHook::MediaCache {
+                        cache: Arc::clone(cache),
+                        key,
+                        meta,
+                        max_bytes: cache.max_item_bytes(),
+                        initial_capacity: content_len_hint,
+                        in_flight: ctx.in_flight_guard.take(),
+                    },
+                );
+            }
+            return (true, Some("BYPASS"), ResponseStreamHook::None);
+        }
+        return (true, None, ResponseStreamHook::None);
+    }
+
+    if !do_body_rewrite
+        && status == StatusCode::OK
+        && ctx.media_route.is_none()
+        && let Some(preloader) = &ctx.inst.preloader
+        && is_preload_scan_path(ctx.method, ctx.target_path)
+    {
+        let content_type = resp_headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let content_len = resp_headers
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<usize>().ok());
+        if is_json_content_type(&content_type)
+            && content_len
+                .map(|n| n <= MAX_PRELOAD_SCAN_RAW_BYTES)
+                .unwrap_or(true)
+        {
+            let content_encoding = resp_headers
+                .get(http::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            return (
+                false,
+                None,
+                ResponseStreamHook::PreloadScan {
+                    preloader: Arc::clone(preloader),
+                    content_encoding,
+                    upstream_matrix_url: ctx.upstream_matrix_url.clone(),
+                    bearer_token: ctx.bearer_token,
+                    client: ctx.client.clone(),
+                },
+            );
+        }
+    }
+
+    (false, None, ResponseStreamHook::None)
 }
 
 const MAX_MATRIX_UIA_REWRITE_BYTES: usize = 64 * 1024;
@@ -1436,6 +1793,7 @@ fn apply_buffered_body_rewrite(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn finish_hyper_response(
     server_cfg: &ServerConfig,
     rewriter: &RewriteEngine<'_>,
@@ -1443,6 +1801,7 @@ async fn finish_hyper_response(
     req_headers: &HeaderMap,
     kind: ForwardKind,
     should_maybe_rewrite_body: bool,
+    media_ctx: MediaResponseContext<'_>,
     upstream_resp: Response<hyper::body::Incoming>,
 ) -> Response<Body> {
     let status = upstream_resp.status();
@@ -1458,6 +1817,9 @@ async fn finish_hyper_response(
     );
     let do_body_rewrite = rewrite_mode != BodyRewriteMode::None;
 
+    let (immutable_media, cache_header, stream_hook) =
+        prepare_media_and_preload_hook(kind, status, &resp_headers, do_body_rewrite, media_ctx);
+
     let out_builder = build_rewritten_response_headers(
         status,
         &resp_headers,
@@ -1466,6 +1828,8 @@ async fn finish_hyper_response(
         req_headers,
         kind,
         do_body_rewrite,
+        immutable_media,
+        cache_header,
     );
 
     if do_body_rewrite {
@@ -1486,12 +1850,51 @@ async fn finish_hyper_response(
             }
         }
     } else {
+        let body = match stream_hook {
+            ResponseStreamHook::None => Body::new(upstream_resp.into_body()),
+            ResponseStreamHook::MediaCache {
+                cache,
+                key,
+                meta,
+                max_bytes,
+                initial_capacity,
+                in_flight,
+            } => Body::from_stream(MediaCacheTeeStream::new(
+                upstream_resp.into_body().into_data_stream(),
+                cache,
+                key,
+                meta,
+                max_bytes,
+                initial_capacity,
+                in_flight,
+            )),
+            ResponseStreamHook::PreloadScan {
+                preloader,
+                content_encoding,
+                upstream_matrix_url,
+                bearer_token,
+                client,
+            } => Body::from_stream(PreloadScanTeeStream::new(
+                upstream_resp.into_body().into_data_stream(),
+                MAX_PRELOAD_SCAN_RAW_BYTES,
+                move |raw| {
+                    preloader.enqueue_from_json_payload(
+                        raw,
+                        content_encoding,
+                        upstream_matrix_url,
+                        bearer_token,
+                        client,
+                    );
+                },
+            )),
+        };
         out_builder
-            .body(Body::new(upstream_resp.into_body()))
+            .body(body)
             .unwrap_or_else(|_| json_error(StatusCode::BAD_GATEWAY, "M_UNKNOWN", "response error"))
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn finish_reqwest_response(
     server_cfg: &ServerConfig,
     rewriter: &RewriteEngine<'_>,
@@ -1499,6 +1902,7 @@ async fn finish_reqwest_response(
     req_headers: &HeaderMap,
     kind: ForwardKind,
     should_maybe_rewrite_body: bool,
+    media_ctx: MediaResponseContext<'_>,
     upstream_resp: reqwest::Response,
 ) -> Response<Body> {
     let status = upstream_resp.status();
@@ -1514,6 +1918,9 @@ async fn finish_reqwest_response(
     );
     let do_body_rewrite = rewrite_mode != BodyRewriteMode::None;
 
+    let (immutable_media, cache_header, stream_hook) =
+        prepare_media_and_preload_hook(kind, status, &resp_headers, do_body_rewrite, media_ctx);
+
     let out_builder = build_rewritten_response_headers(
         status,
         &resp_headers,
@@ -1522,6 +1929,8 @@ async fn finish_reqwest_response(
         req_headers,
         kind,
         do_body_rewrite,
+        immutable_media,
+        cache_header,
     );
 
     if do_body_rewrite {
@@ -1549,8 +1958,46 @@ async fn finish_reqwest_response(
         }
     } else {
         let stream = upstream_resp.bytes_stream();
+        let body = match stream_hook {
+            ResponseStreamHook::None => Body::from_stream(stream),
+            ResponseStreamHook::MediaCache {
+                cache,
+                key,
+                meta,
+                max_bytes,
+                initial_capacity,
+                in_flight,
+            } => Body::from_stream(MediaCacheTeeStream::new(
+                stream,
+                cache,
+                key,
+                meta,
+                max_bytes,
+                initial_capacity,
+                in_flight,
+            )),
+            ResponseStreamHook::PreloadScan {
+                preloader,
+                content_encoding,
+                upstream_matrix_url,
+                bearer_token,
+                client,
+            } => Body::from_stream(PreloadScanTeeStream::new(
+                stream,
+                MAX_PRELOAD_SCAN_RAW_BYTES,
+                move |raw| {
+                    preloader.enqueue_from_json_payload(
+                        raw,
+                        content_encoding,
+                        upstream_matrix_url,
+                        bearer_token,
+                        client,
+                    );
+                },
+            )),
+        };
         out_builder
-            .body(Body::from_stream(stream))
+            .body(body)
             .unwrap_or_else(|_| json_error(StatusCode::BAD_GATEWAY, "M_UNKNOWN", "response error"))
     }
 }
@@ -1604,6 +2051,7 @@ fn check_body_rewrite(
     (BodyRewriteMode::None, content_encoding, 0)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_rewritten_response_headers(
     status: StatusCode,
     resp_headers: &HeaderMap,
@@ -1612,6 +2060,8 @@ fn build_rewritten_response_headers(
     req_headers: &HeaderMap,
     kind: ForwardKind,
     do_body_rewrite: bool,
+    immutable_media: bool,
+    media_cache_header: Option<&'static str>,
 ) -> axum::http::response::Builder {
     let is_auth = kind == ForwardKind::Auth;
     let dynamic_resp_hop = collect_connection_headers(resp_headers);
@@ -1631,6 +2081,13 @@ fn build_rewritten_response_headers(
         }
         if do_body_rewrite
             && (name == http::header::CONTENT_LENGTH || name == http::header::CONTENT_ENCODING)
+        {
+            continue;
+        }
+        if immutable_media
+            && (name == http::header::CACHE_CONTROL
+                || name == http::header::ACCEPT_RANGES
+                || name.as_str().eq_ignore_ascii_case("x-matrix-proxy-cache"))
         {
             continue;
         }
@@ -1697,6 +2154,15 @@ fn build_rewritten_response_headers(
             .header(http::header::ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone())
             .header(http::header::ACCESS_CONTROL_ALLOW_CREDENTIALS, "true")
             .header(http::header::VARY, "Origin");
+    }
+
+    if immutable_media {
+        out_builder = out_builder
+            .header(http::header::CACHE_CONTROL, IMMUTABLE_MEDIA_CACHE_CONTROL)
+            .header(http::header::ACCEPT_RANGES, "bytes");
+    }
+    if let Some(cache_tag) = media_cache_header {
+        out_builder = out_builder.header("x-matrix-proxy-cache", cache_tag);
     }
 
     out_builder

@@ -200,6 +200,150 @@ pub struct ServerTuningConfig {
     pub listen_backlog: Option<u32>,
 }
 
+/// Optional `[server.media_cache]` sub-table for edge caching of immutable Matrix media & thumbnails.
+/// Uses a strictly bounded L1 hot RAM LRU (avatars/thumbnails) backed by an optional L2 SSD/disk LRU.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct MediaCacheConfig {
+    /// Enable edge media caching (default: `false` so no cache RAM/disk is allocated unless opted in).
+    pub enabled: bool,
+    /// Optional persistent L2 disk cache directory (e.g. `"/app/cache/media"`). Omit or leave empty for RAM-only.
+    pub dir: Option<String>,
+    /// Maximum L1 hot RAM cache budget in MiB (default: `32`; `0` disables L1 RAM cache).
+    pub ram_max_mb: u64,
+    /// Maximum single item size in KiB eligible for L1 RAM cache (default: `256` — ideal for avatars & thumbnails).
+    pub ram_max_item_kb: u64,
+    /// Maximum L2 persistent disk cache budget in MiB (default: `1024`; requires `dir`).
+    pub disk_max_mb: u64,
+    /// Maximum single cached media object size in MiB (default: `16`; larger files stream straight through).
+    pub max_item_mb: u64,
+    /// TTL in seconds for verified Matrix Bearer tokens (stored as SHA-256 hashes only) used to authorize
+    /// cached responses for Matrix v1.11+ authenticated media endpoints (default: `180`).
+    pub auth_cache_ttl_secs: u64,
+}
+
+impl Default for MediaCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dir: None,
+            ram_max_mb: 32,
+            ram_max_item_kb: 256,
+            disk_max_mb: 1024,
+            max_item_mb: 16,
+            auth_cache_ttl_secs: 180,
+        }
+    }
+}
+
+impl MediaCacheConfig {
+    pub fn ram_max_bytes(&self) -> usize {
+        usize::try_from(self.ram_max_mb.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX)
+    }
+
+    pub fn ram_max_item_bytes(&self) -> usize {
+        usize::try_from(self.ram_max_item_kb.saturating_mul(1024)).unwrap_or(usize::MAX)
+    }
+
+    pub fn disk_max_bytes(&self) -> u64 {
+        self.disk_max_mb.saturating_mul(1024 * 1024)
+    }
+
+    pub fn max_item_bytes(&self) -> usize {
+        usize::try_from(self.max_item_mb.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX)
+    }
+}
+
+/// Validated avatar thumbnail dimension preset (`"{width}x{height}:{crop|scale}"`, e.g. `"96x96:crop"`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct AvatarThumbSpec {
+    pub width: u32,
+    pub height: u32,
+    pub method: String,
+}
+
+impl AvatarThumbSpec {
+    pub fn parse(raw: &str) -> Result<Self> {
+        let trimmed = raw.trim();
+        let (dims, method_raw) = match trimmed.split_once(':') {
+            Some((d, m)) => (d.trim(), m.trim()),
+            None => (trimmed, "crop"),
+        };
+        let (w_str, h_str) = dims
+            .split_once('x')
+            .or_else(|| dims.split_once('X'))
+            .ok_or_else(|| {
+                anyhow!(
+                    "invalid avatar thumbnail spec '{raw}': expected 'WxH:crop' or 'WxH:scale' (e.g. '96x96:crop')"
+                )
+            })?;
+        let width: u32 = w_str
+            .trim()
+            .parse()
+            .with_context(|| format!("invalid width in avatar thumbnail spec '{raw}'"))?;
+        let height: u32 = h_str
+            .trim()
+            .parse()
+            .with_context(|| format!("invalid height in avatar thumbnail spec '{raw}'"))?;
+        if !(16..=1024).contains(&width) || !(16..=1024).contains(&height) {
+            bail!("avatar thumbnail dimensions in '{raw}' must be between 16 and 1024");
+        }
+        let method = method_raw.to_ascii_lowercase();
+        if method != "crop" && method != "scale" {
+            bail!("invalid thumbnail method '{method_raw}' in '{raw}': expected 'crop' or 'scale'");
+        }
+        Ok(Self {
+            width,
+            height,
+            method,
+        })
+    }
+
+    pub fn label(&self) -> String {
+        format!("{}x{}:{}", self.width, self.height, self.method)
+    }
+}
+
+/// Resolved per-profile media caching & proactive background preloading settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MediaProfileConfig {
+    /// Allow this profile to read/write the shared edge `[server.media_cache]` (default: `true`).
+    pub cache_enabled: bool,
+    /// Enable proactive background media preloading from `/sync`, Sliding Sync, `/messages`, `/state`, `/members`, and `/profile`.
+    pub preload_enabled: bool,
+    /// Maximum concurrent background preload fetches for this profile (1..=16, default: `4`).
+    pub preload_concurrency: usize,
+    /// Maximum single object size in MiB fetched by the background preloader (1..=64, default: `4`).
+    pub preload_max_item_mb: u64,
+    /// When a `/thumbnail/{server}/{id}` is requested, proactively warm `/download/{server}/{id}` in background.
+    pub preload_on_thumbnail: bool,
+    /// Configured avatar thumbnail dimensions to pre-warm for discovered avatars (also adapts to client-observed square avatar sizes).
+    pub preload_avatar_sizes: Vec<AvatarThumbSpec>,
+}
+
+impl Default for MediaProfileConfig {
+    fn default() -> Self {
+        Self {
+            cache_enabled: true,
+            preload_enabled: false,
+            preload_concurrency: 4,
+            preload_max_item_mb: 4,
+            preload_on_thumbnail: true,
+            preload_avatar_sizes: vec![AvatarThumbSpec {
+                width: 96,
+                height: 96,
+                method: "crop".to_string(),
+            }],
+        }
+    }
+}
+
+impl MediaProfileConfig {
+    pub fn preload_max_item_bytes(&self) -> usize {
+        usize::try_from(self.preload_max_item_mb.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX)
+    }
+}
+
 /// Unified `[defaults]` section holding all global proxy-node defaults.
 /// Every key here has the exact same name inside `[[proxies]]`; per-profile values always win.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -250,6 +394,18 @@ pub struct ProxyDefaultsConfig {
     pub merge_upstream_well_known: Option<bool>,
     pub identity_server_url: Option<String>,
     pub cache_ttl_secs: Option<u64>,
+    /// Allow profiles to use the shared `[server.media_cache]` (default: `true` when media cache is enabled).
+    pub media_cache: Option<bool>,
+    /// Enable proactive background preloading of avatars & unencrypted media discovered in `/sync` and room timelines.
+    pub media_preload: Option<bool>,
+    /// Maximum concurrent background preload fetches per profile (default: `4`).
+    pub media_preload_concurrency: Option<usize>,
+    /// Maximum object size in MiB fetched by the background preloader (default: `4`).
+    pub media_preload_max_item_mb: Option<u64>,
+    /// Proactively fetch `/download/{server}/{id}` in background when a `/thumbnail/{server}/{id}` is requested (default: `true`).
+    pub media_preload_on_thumbnail: Option<bool>,
+    /// Avatar thumbnail presets (`"WxH:crop"` / `"WxH:scale"`) to pre-warm for discovered avatars (default: `["96x96:crop"]`).
+    pub media_preload_avatar_sizes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -282,6 +438,8 @@ pub struct ServerConfig {
     pub reload: Option<ServerReloadConfig>,
     /// Clean structured performance & abuse protection settings (`[server.tuning]`).
     pub tuning: Option<ServerTuningConfig>,
+    /// Optional edge media cache settings (`[server.media_cache]`).
+    pub media_cache: MediaCacheConfig,
     pub max_rewrite_body_bytes: usize,
     pub max_concurrent_requests: usize,
     pub rate_limit_rps: u64,
@@ -331,6 +489,7 @@ impl Default for ServerConfig {
             expose_info: ExposeInfoMode::Trusted,
             reload: None,
             tuning: None,
+            media_cache: MediaCacheConfig::default(),
             max_rewrite_body_bytes: 4 * 1024 * 1024,
             max_concurrent_requests: 10_000,
             rate_limit_rps: 0,
@@ -469,6 +628,12 @@ pub struct DiscoveryConfig {
     pub merge_upstream_well_known: bool,
     pub identity_server_url: Option<String>,
     pub cache_ttl_secs: u64,
+    pub media_cache: bool,
+    pub media_preload: bool,
+    pub media_preload_concurrency: usize,
+    pub media_preload_max_item_mb: u64,
+    pub media_preload_on_thumbnail: bool,
+    pub media_preload_avatar_sizes: Vec<String>,
 }
 
 impl Default for DiscoveryConfig {
@@ -483,6 +648,12 @@ impl Default for DiscoveryConfig {
             merge_upstream_well_known: true,
             identity_server_url: None,
             cache_ttl_secs: 60,
+            media_cache: true,
+            media_preload: false,
+            media_preload_concurrency: 4,
+            media_preload_max_item_mb: 4,
+            media_preload_on_thumbnail: true,
+            media_preload_avatar_sizes: vec!["96x96:crop".to_string()],
         }
     }
 }
@@ -573,6 +744,18 @@ pub struct ProxyProfileInput {
     pub merge_upstream_well_known: Option<bool>,
     pub identity_server_url: Option<String>,
     pub cache_ttl_secs: Option<u64>,
+    /// Allow profiles to use the shared `[server.media_cache]` (default: `true` when media cache is enabled).
+    pub media_cache: Option<bool>,
+    /// Enable proactive background preloading of avatars & unencrypted media discovered in `/sync` and room timelines.
+    pub media_preload: Option<bool>,
+    /// Maximum concurrent background preload fetches per profile (default: `4`).
+    pub media_preload_concurrency: Option<usize>,
+    /// Maximum object size in MiB fetched by the background preloader (default: `4`).
+    pub media_preload_max_item_mb: Option<u64>,
+    /// Proactively fetch `/download/{server}/{id}` in background when a `/thumbnail/{server}/{id}` is requested (default: `true`).
+    pub media_preload_on_thumbnail: Option<bool>,
+    /// Avatar thumbnail presets (`"WxH:crop"` / `"WxH:scale"`) to pre-warm for discovered avatars (default: `["96x96:crop"]`).
+    pub media_preload_avatar_sizes: Option<Vec<String>>,
 }
 
 /// Normalized, validated, self-contained runtime configuration for a single upstream proxy profile.
@@ -596,6 +779,8 @@ pub struct ProxyProfile {
     pub discovery: DiscoveryConfig,
     /// Resolved direct MatrixRTC delegation policy advertised in `/.well-known/matrix/client`.
     pub matrix_rtc: MatrixRtcDelegation,
+    /// Resolved edge media caching & proactive preloading policy for this profile.
+    pub media: MediaProfileConfig,
     pub parsed_rewrite_origins: Vec<String>,
 }
 
@@ -835,6 +1020,24 @@ impl Config {
         if let Some(v) = d.cache_ttl_secs {
             self.discovery.cache_ttl_secs = v;
         }
+        if let Some(v) = d.media_cache {
+            self.discovery.media_cache = v;
+        }
+        if let Some(v) = d.media_preload {
+            self.discovery.media_preload = v;
+        }
+        if let Some(v) = d.media_preload_concurrency {
+            self.discovery.media_preload_concurrency = v;
+        }
+        if let Some(v) = d.media_preload_max_item_mb {
+            self.discovery.media_preload_max_item_mb = v;
+        }
+        if let Some(v) = d.media_preload_on_thumbnail {
+            self.discovery.media_preload_on_thumbnail = v;
+        }
+        if let Some(v) = d.media_preload_avatar_sizes {
+            self.discovery.media_preload_avatar_sizes = v;
+        }
     }
 
     pub fn into_runtime(mut self) -> Result<RuntimeConfig> {
@@ -940,6 +1143,27 @@ impl Config {
         }
         if let Some(v) = env_parse::<u64>("SHUTDOWN_GRACE_SECS")? {
             self.server.shutdown_grace_secs = v;
+        }
+        if let Some(v) = env_bool("MEDIA_CACHE_ENABLED")? {
+            self.server.media_cache.enabled = v;
+        }
+        if let Some(v) = env_non_empty("MEDIA_CACHE_DIR") {
+            self.server.media_cache.dir = Some(v);
+        }
+        if let Some(v) = env_parse::<u64>("MEDIA_CACHE_RAM_MAX_MB")? {
+            self.server.media_cache.ram_max_mb = v;
+        }
+        if let Some(v) = env_parse::<u64>("MEDIA_CACHE_RAM_MAX_ITEM_KB")? {
+            self.server.media_cache.ram_max_item_kb = v;
+        }
+        if let Some(v) = env_parse::<u64>("MEDIA_CACHE_DISK_MAX_MB")? {
+            self.server.media_cache.disk_max_mb = v;
+        }
+        if let Some(v) = env_parse::<u64>("MEDIA_CACHE_MAX_ITEM_MB")? {
+            self.server.media_cache.max_item_mb = v;
+        }
+        if let Some(v) = env_parse::<u64>("MEDIA_CACHE_AUTH_TTL_SECS")? {
+            self.server.media_cache.auth_cache_ttl_secs = v;
         }
 
         if let Some(v) =
@@ -1060,6 +1284,24 @@ impl Config {
         if let Some(v) = env_parse::<u64>("DISCOVERY_CACHE_TTL_SECS")? {
             self.discovery.cache_ttl_secs = v;
         }
+        if let Some(v) = env_bool("MEDIA_CACHE")? {
+            self.discovery.media_cache = v;
+        }
+        if let Some(v) = env_bool("MEDIA_PRELOAD")? {
+            self.discovery.media_preload = v;
+        }
+        if let Some(v) = env_parse::<usize>("MEDIA_PRELOAD_CONCURRENCY")? {
+            self.discovery.media_preload_concurrency = v;
+        }
+        if let Some(v) = env_parse::<u64>("MEDIA_PRELOAD_MAX_ITEM_MB")? {
+            self.discovery.media_preload_max_item_mb = v;
+        }
+        if let Some(v) = env_bool("MEDIA_PRELOAD_ON_THUMBNAIL")? {
+            self.discovery.media_preload_on_thumbnail = v;
+        }
+        if let Some(v) = env_non_empty("MEDIA_PRELOAD_AVATAR_SIZES") {
+            self.discovery.media_preload_avatar_sizes = split_csv(&v);
+        }
 
         Ok(())
     }
@@ -1070,6 +1312,10 @@ impl Config {
         normalize_opt_string(&mut self.server.tls_cert_path);
         normalize_opt_string(&mut self.server.tls_key_path);
         normalize_opt_string(&mut self.server.outbound_proxy);
+        normalize_opt_string(&mut self.server.media_cache.dir);
+        self.server.media_cache.max_item_mb = self.server.media_cache.max_item_mb.clamp(1, 256);
+        self.server.media_cache.auth_cache_ttl_secs =
+            self.server.media_cache.auth_cache_ttl_secs.clamp(5, 3600);
         self.server.outbound_no_proxy = normalize_no_proxy_list(&self.server.outbound_no_proxy);
         if let Some(proxy) = &self.server.outbound_proxy {
             validate_outbound_proxy_value("server.outbound_proxy", proxy)?;
@@ -1326,7 +1572,24 @@ impl Config {
                     .unwrap_or(self.discovery.merge_upstream_well_known),
                 identity_server_url: id_url,
                 cache_ttl_secs: raw.cache_ttl_secs.unwrap_or(self.discovery.cache_ttl_secs),
+                media_cache: raw.media_cache.unwrap_or(self.discovery.media_cache),
+                media_preload: raw.media_preload.unwrap_or(self.discovery.media_preload),
+                media_preload_concurrency: raw
+                    .media_preload_concurrency
+                    .unwrap_or(self.discovery.media_preload_concurrency),
+                media_preload_max_item_mb: raw
+                    .media_preload_max_item_mb
+                    .unwrap_or(self.discovery.media_preload_max_item_mb),
+                media_preload_on_thumbnail: raw
+                    .media_preload_on_thumbnail
+                    .unwrap_or(self.discovery.media_preload_on_thumbnail),
+                media_preload_avatar_sizes: raw
+                    .media_preload_avatar_sizes
+                    .clone()
+                    .unwrap_or_else(|| self.discovery.media_preload_avatar_sizes.clone()),
             };
+
+            let media = resolve_media_profile_config(&format!("proxies[{name}]"), &discovery)?;
 
             let route_hosts = collect_profile_route_hosts(
                 matrix_proxy_public_url.as_ref(),
@@ -1348,6 +1611,7 @@ impl Config {
                 routing,
                 discovery,
                 matrix_rtc,
+                media,
                 parsed_rewrite_origins,
             });
         }
@@ -1404,6 +1668,8 @@ impl Config {
             &self.discovery.matrix_rtc_urls,
         )?;
 
+        let media = resolve_media_profile_config("discovery", &self.discovery)?;
+
         let route_hosts = collect_profile_route_hosts(
             matrix_proxy_public_url.as_ref(),
             matrix_proxy_public_auth_url.as_ref(),
@@ -1424,6 +1690,7 @@ impl Config {
             routing: self.routing.clone(),
             discovery: self.discovery.clone(),
             matrix_rtc,
+            media,
             parsed_rewrite_origins,
         })
     }
@@ -1526,6 +1793,39 @@ fn group_into_listeners(profiles: Vec<ProxyProfile>) -> Result<Vec<ListenerPlan>
     }
 
     Ok(listeners)
+}
+
+fn resolve_media_profile_config(
+    prefix: &str,
+    discovery: &DiscoveryConfig,
+) -> Result<MediaProfileConfig> {
+    let mut avatar_sizes = Vec::new();
+    for raw in &discovery.media_preload_avatar_sizes {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let spec = AvatarThumbSpec::parse(trimmed)
+            .with_context(|| format!("invalid {prefix}.media_preload_avatar_sizes entry"))?;
+        if !avatar_sizes.contains(&spec) {
+            avatar_sizes.push(spec);
+        }
+    }
+    if avatar_sizes.is_empty() {
+        avatar_sizes.push(AvatarThumbSpec {
+            width: 96,
+            height: 96,
+            method: "crop".to_string(),
+        });
+    }
+    Ok(MediaProfileConfig {
+        cache_enabled: discovery.media_cache,
+        preload_enabled: discovery.media_preload,
+        preload_concurrency: discovery.media_preload_concurrency.clamp(1, 16),
+        preload_max_item_mb: discovery.media_preload_max_item_mb.clamp(1, 64),
+        preload_on_thumbnail: discovery.media_preload_on_thumbnail,
+        preload_avatar_sizes: avatar_sizes,
+    })
 }
 
 fn resolve_matrix_rtc_delegation(
