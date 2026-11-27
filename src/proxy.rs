@@ -4,6 +4,7 @@ use crate::config::{
     ServerConfig, normalized_base_url, redact_proxy_url, should_bypass_outbound_proxy,
 };
 use crate::discovery::{DiscoveryManager, ResolvedUpstreams};
+use crate::dns::global_dns_resolver;
 use crate::media_cache::{
     CacheKey, CompactMeta, IMMUTABLE_MEDIA_CACHE_CONTROL, InFlightGuard, InFlightOutcome,
     MAX_PRELOAD_SCAN_RAW_BYTES, MediaCache, MediaCacheTeeStream, MediaPreloader, MediaRouteInfo,
@@ -14,7 +15,9 @@ use crate::metrics::ProxyMetrics;
 use crate::ppv2_client::{Ppv2Client, maybe_gunzip};
 use crate::rewrite::{PublicContext, RewriteEngine, build_upstream_target_url};
 use crate::router::{RouteTarget, VhostRouter, classify_request, extract_request_host};
-use crate::ws::{build_client_tls_config, is_websocket_upgrade, proxy_websocket};
+use crate::ws::{
+    build_client_tls_config, build_client_tls_config_owned, is_websocket_upgrade, proxy_websocket,
+};
 use ahash::{AHashMap, AHashSet};
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
@@ -399,7 +402,39 @@ impl ListenerState {
                 tokio::time::timeout(Duration::from_secs(10), inst.discovery.initial_resolve())
                     .await;
             match res {
-                Ok(Ok(_)) => Ok(()),
+                Ok(Ok(resolved)) => {
+                    // Pre-warm in-process DNS cache for both Matrix & Auth origins and prime an
+                    // idle HTTP/2 + TLS 1.3 connection on `stream_client` so the very first user
+                    // `/sync` never pays cold DNS + TCP + TLS handshake latency.
+                    let dns = global_dns_resolver();
+                    if let Some(host) = resolved.matrix_url.host_str() {
+                        dns.prewarm(host);
+                    }
+                    if let Some(auth_url) = resolved.auth_url.as_ref()
+                        && let Some(host) = auth_url.host_str()
+                    {
+                        dns.prewarm(host);
+                    }
+                    if !inst.profile.matrix_proxy_protocol().is_enabled() {
+                        let warm_client = inst.stream_client.clone();
+                        let warm_url = build_upstream_target_url(
+                            &resolved.matrix_url,
+                            "/_matrix/client/versions",
+                        );
+                        let host_ov = inst.profile.upstream.upstream_matrix_host_header.clone();
+                        tokio::spawn(async move {
+                            let mut req = warm_client.get(warm_url).timeout(Duration::from_secs(5));
+                            if let Some(h) = host_ov {
+                                req = req.header(reqwest::header::HOST, h);
+                            }
+                            if let Ok(resp) = req.send().await {
+                                // Drain tiny `/versions` body so Hyper returns the H2/H1 conn to pool.
+                                let _ = resp.bytes().await;
+                            }
+                        });
+                    }
+                    Ok(())
+                }
                 Ok(Err(err)) => {
                     if inst.profile.upstream.upstream_matrix_server_url.is_none() {
                         Err(err).with_context(|| {
@@ -459,8 +494,14 @@ fn build_http_client(
     } else {
         reqwest::redirect::Policy::none()
     };
+    let tls_cfg = build_client_tls_config_owned(
+        profile.upstream.danger_accept_invalid_certs,
+        &[b"h2".as_slice(), b"http/1.1".as_slice()],
+    )?;
     let mut builder = reqwest::Client::builder()
         .redirect(redirect_policy)
+        .dns_resolver(global_dns_resolver())
+        .use_preconfigured_tls(tls_cfg)
         .connect_timeout(Duration::from_secs(
             profile.upstream.connect_timeout_secs.max(1),
         ))
@@ -468,20 +509,21 @@ fn build_http_client(
         .pool_idle_timeout(Duration::from_secs(server.pool_idle_timeout_secs))
         .tcp_nodelay(server.tcp_nodelay)
         .http2_adaptive_window(true)
-        .http2_initial_stream_window_size(512 * 1024)
-        .http2_initial_connection_window_size(2 * 1024 * 1024)
-        .http2_keep_alive_interval(Duration::from_secs(30))
-        .http2_keep_alive_timeout(Duration::from_secs(20))
+        .http2_initial_stream_window_size(1024 * 1024)
+        .http2_initial_connection_window_size(4 * 1024 * 1024)
+        .http2_max_frame_size(32 * 1024)
+        .http2_keep_alive_interval(Duration::from_secs(15))
+        .http2_keep_alive_timeout(Duration::from_secs(8))
         .http2_keep_alive_while_idle(true);
 
     if server.tcp_keepalive_secs > 0 {
-        builder = builder.tcp_keepalive(Duration::from_secs(server.tcp_keepalive_secs));
+        builder = builder
+            .tcp_keepalive(Duration::from_secs(server.tcp_keepalive_secs))
+            .tcp_keepalive_interval(Duration::from_secs(5))
+            .tcp_keepalive_retries(3);
     }
     if profile.upstream.request_timeout_secs > 0 {
         builder = builder.timeout(Duration::from_secs(profile.upstream.request_timeout_secs));
-    }
-    if profile.upstream.danger_accept_invalid_certs {
-        builder = builder.danger_accept_invalid_certs(true);
     }
     if !auto_decompress {
         builder = builder.no_gzip().no_brotli().no_deflate();
@@ -1378,47 +1420,54 @@ async fn forward_request(
             .as_deref()
             .is_some_and(|t| cache.is_token_verified(&inst.profile.name, t));
 
-        if (!route.requires_auth() || caller_verified)
-            && let Some(hit) = cache.lookup(&key, caller_verified)
-        {
-            let is_ram = hit.is_ram();
-            match cache
-                .build_hit_response(&key, hit, &parts.method, &parts.headers)
-                .await
-            {
-                Ok(resp) => {
-                    if is_ram {
-                        state
-                            .metrics
-                            .media_cache_hits_ram_total
-                            .fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        state
-                            .metrics
-                            .media_cache_hits_disk_total
-                            .fetch_add(1, Ordering::Relaxed);
+        if !route.requires_auth() || caller_verified {
+            if let Some(hit) = cache.lookup(&key, caller_verified) {
+                let is_ram = hit.is_ram();
+                match cache
+                    .build_hit_response(&key, hit, &parts.method, &parts.headers)
+                    .await
+                {
+                    Ok(resp) => {
+                        if is_ram {
+                            state
+                                .metrics
+                                .media_cache_hits_ram_total
+                                .fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            state
+                                .metrics
+                                .media_cache_hits_disk_total
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        if route.is_thumbnail
+                            && let Some(preloader) = &inst.preloader
+                        {
+                            preloader.enqueue_full_download_for_thumbnail(
+                                route,
+                                &upstreams.matrix_url,
+                                &upstreams.matrix_origin,
+                                bearer_token.clone(),
+                                client,
+                            );
+                        }
+                        return resp;
                     }
-                    if route.is_thumbnail
-                        && let Some(preloader) = &inst.preloader
-                    {
-                        preloader.enqueue_full_download_for_thumbnail(
-                            route,
-                            &upstreams.matrix_url,
-                            &upstreams.matrix_origin,
-                            bearer_token.clone(),
-                            client,
+                    Err(err) => {
+                        debug!(
+                            profile = %inst.profile.name,
+                            error = %format!("{err:#}"),
+                            "L2 media cache read failed; falling back to upstream"
                         );
+                        cache.remove_l2_entry(&key);
                     }
-                    return resp;
                 }
-                Err(err) => {
-                    debug!(
-                        profile = %inst.profile.name,
-                        error = %format!("{err:#}"),
-                        "L2 media cache read failed; falling back to upstream"
-                    );
-                    cache.remove_l2_entry(&key);
-                }
+            }
+            if cache.is_negatively_cached(&key, caller_verified) {
+                state
+                    .metrics
+                    .media_cache_negative_hits_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return MediaCache::build_negative_404_response(&parts.method);
             }
         }
 
@@ -1429,37 +1478,43 @@ async fn forward_request(
                 }
                 InFlightOutcome::Waiter(notify) => {
                     let _ = tokio::time::timeout(Duration::from_secs(5), notify.notified()).await;
-                    if (!route.requires_auth() || caller_verified)
-                        && let Some(hit) = cache.lookup(&key, caller_verified)
-                    {
-                        let is_ram = hit.is_ram();
-                        if let Ok(resp) = cache
-                            .build_hit_response(&key, hit, &parts.method, &parts.headers)
-                            .await
-                        {
-                            if is_ram {
-                                state
-                                    .metrics
-                                    .media_cache_hits_ram_total
-                                    .fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                state
-                                    .metrics
-                                    .media_cache_hits_disk_total
-                                    .fetch_add(1, Ordering::Relaxed);
-                            }
-                            if route.is_thumbnail
-                                && let Some(preloader) = &inst.preloader
+                    if !route.requires_auth() || caller_verified {
+                        if let Some(hit) = cache.lookup(&key, caller_verified) {
+                            let is_ram = hit.is_ram();
+                            if let Ok(resp) = cache
+                                .build_hit_response(&key, hit, &parts.method, &parts.headers)
+                                .await
                             {
-                                preloader.enqueue_full_download_for_thumbnail(
-                                    route,
-                                    &upstreams.matrix_url,
-                                    &upstreams.matrix_origin,
-                                    bearer_token.clone(),
-                                    client,
-                                );
+                                if is_ram {
+                                    state
+                                        .metrics
+                                        .media_cache_hits_ram_total
+                                        .fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    state
+                                        .metrics
+                                        .media_cache_hits_disk_total
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                if route.is_thumbnail
+                                    && let Some(preloader) = &inst.preloader
+                                {
+                                    preloader.enqueue_full_download_for_thumbnail(
+                                        route,
+                                        &upstreams.matrix_url,
+                                        &upstreams.matrix_origin,
+                                        bearer_token.clone(),
+                                        client,
+                                    );
+                                }
+                                return resp;
                             }
-                            return resp;
+                        } else if cache.is_negatively_cached(&key, caller_verified) {
+                            state
+                                .metrics
+                                .media_cache_negative_hits_total
+                                .fetch_add(1, Ordering::Relaxed);
+                            return MediaCache::build_negative_404_response(&parts.method);
                         }
                     }
                 }
@@ -1726,6 +1781,17 @@ fn prepare_media_and_preload_hook(
         } else if status == StatusCode::UNAUTHORIZED {
             cache.revoke_token(&ctx.inst.profile.name, token);
         }
+    }
+
+    if status == StatusCode::NOT_FOUND
+        && let (Some(cache), Some(route), Some(key)) = (
+            ctx.media_cache,
+            ctx.media_route.as_ref(),
+            ctx.cache_key.as_ref(),
+        )
+    {
+        cache.record_negative_404(key, route.requires_auth() || ctx.bearer_token.is_some());
+        return (false, Some("MISS-404"), ResponseStreamHook::None);
     }
 
     let is_media_ok = ctx.media_route.is_some() && status == StatusCode::OK;
@@ -2108,6 +2174,14 @@ fn check_body_rewrite(
     should_maybe_rewrite_body: bool,
     max_auth_bytes: usize,
 ) -> (BodyRewriteMode, String, usize) {
+    let maybe_matrix_uia = kind == ForwardKind::Matrix
+        && auth_proxy_mode == AuthProxyMode::Full
+        && matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN);
+    // Zero-allocation fast path for 99.9% of Matrix API & media responses (`/sync`, `/send`, `/media`).
+    if !should_maybe_rewrite_body && !maybe_matrix_uia {
+        return (BodyRewriteMode::None, String::new(), 0);
+    }
+
     let content_type = resp_headers
         .get(http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -2130,9 +2204,7 @@ fn check_body_rewrite(
         return (BodyRewriteMode::AuthText, content_encoding, max_auth_bytes);
     }
 
-    if kind == ForwardKind::Matrix
-        && auth_proxy_mode == AuthProxyMode::Full
-        && matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+    if maybe_matrix_uia
         && is_json_content_type(&content_type)
         && is_decodable_encoding(&content_encoding)
         && content_len

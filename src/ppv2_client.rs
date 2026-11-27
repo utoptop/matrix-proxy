@@ -1,5 +1,6 @@
 use crate::client_ip::{encode_proxy_protocol_local, encode_proxy_protocol_proxy};
 use crate::config::{ProxyProtocol, ServerConfig, should_bypass_outbound_proxy};
+use crate::dns::global_dns_resolver;
 use crate::metrics::ProxyMetrics;
 use crate::ws::{
     build_client_tls_config, connect_via_proxy, fallback_dst_addr, trim_ipv6_brackets,
@@ -467,10 +468,11 @@ impl Ppv2Client {
             h2_builder
                 .timer(TokioTimer::new())
                 .adaptive_window(true)
-                .initial_stream_window_size(512 * 1024)
-                .initial_connection_window_size(2 * 1024 * 1024)
-                .keep_alive_interval(Duration::from_secs(30))
-                .keep_alive_timeout(Duration::from_secs(20))
+                .initial_stream_window_size(1024 * 1024)
+                .initial_connection_window_size(4 * 1024 * 1024)
+                .max_frame_size(32 * 1024)
+                .keep_alive_interval(Duration::from_secs(15))
+                .keep_alive_timeout(Duration::from_secs(8))
                 .keep_alive_while_idle(true);
 
             let (sender, conn) = h2_builder
@@ -525,10 +527,10 @@ impl Ppv2Client {
             .await?;
             (proxied, None)
         } else {
-            let tcp = TcpStream::connect((clean_host, port))
+            let tcp = global_dns_resolver()
+                .connect_tcp_fast(clean_host, port, self.tcp_nodelay, self.tcp_keepalive)
                 .await
                 .with_context(|| format!("TCP connect to {host}:{port} failed"))?;
-            configure_tcp_socket(&tcp, self.tcp_nodelay, self.tcp_keepalive);
             let peer = tcp.peer_addr().ok();
             (Box::new(tcp), peer)
         };
@@ -680,11 +682,22 @@ fn build_hyper_req(
 
 pub fn configure_tcp_socket(stream: &TcpStream, nodelay: bool, keepalive: Duration) {
     let _ = stream.set_nodelay(nodelay);
+    let sock_ref = SockRef::from(stream);
     if !keepalive.is_zero() {
-        let ka = TcpKeepalive::new()
+        let mut ka = TcpKeepalive::new()
             .with_time(keepalive)
-            .with_interval(Duration::from_secs(10));
-        let _ = SockRef::from(stream).set_tcp_keepalive(&ka);
+            .with_interval(Duration::from_secs(5));
+        #[cfg(not(windows))]
+        {
+            ka = ka.with_retries(3);
+        }
+        let _ = sock_ref.set_tcp_keepalive(&ka);
+    }
+    // On Linux, cap unacknowledged TCP retransmission stalls at 15s instead of the default ~15min
+    // so blackholed upstream links fail over and reconnect immediately for Matrix `/sync`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let _ = sock_ref.set_tcp_user_timeout(Some(Duration::from_secs(15)));
     }
 }
 

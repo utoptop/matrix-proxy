@@ -32,6 +32,8 @@ use url::Url;
 const DISK_CACHE_MAGIC: &[u8; 8] = b"MPMC01\0\0";
 const CACHE_SHARDS: usize = 16;
 const MAX_VERIFIED_TOKENS_PER_SHARD: usize = 256; // 4096 total across 16 shards
+const NEGATIVE_404_TTL: Duration = Duration::from_secs(300);
+const MAX_NEGATIVE_404_PER_SHARD: usize = 256; // 4096 total across 16 shards (~180 KiB max)
 const MAX_OBSERVED_AVATAR_SIZES: usize = 2;
 const MAX_EFFECTIVE_AVATAR_SIZES: usize = 2;
 const MAX_DECOMPRESSED_SCAN_BYTES: usize = 8 * 1024 * 1024;
@@ -710,6 +712,12 @@ struct L2Entry {
     data_offset: u64,
 }
 
+#[derive(Clone, Copy)]
+struct Negative404Entry {
+    cached_at: Instant,
+    requires_auth: bool,
+}
+
 pub enum InFlightOutcome {
     Leader(InFlightGuard),
     Waiter(Arc<Notify>),
@@ -748,6 +756,7 @@ pub struct MediaCache {
     l1_shards: Vec<Mutex<LruMap<L1Entry>>>,
     disk_dir: Option<PathBuf>,
     l2_shards: Vec<Mutex<LruMap<L2Entry>>>,
+    negative_404: Vec<Mutex<AHashMap<CacheKey, Negative404Entry>>>,
     verified_tokens: Vec<Mutex<AHashMap<CacheKey, Instant>>>,
     observed_avatar_sizes: Mutex<AHashMap<String, VecDeque<AvatarThumbSpec>>>,
     in_flight: Vec<Mutex<AHashMap<CacheKey, Arc<Notify>>>>,
@@ -826,6 +835,9 @@ impl MediaCache {
             .map(|_| Mutex::new(LruMap::default()))
             .collect();
         let l2_shards = l2_shards.into_iter().map(Mutex::new).collect();
+        let negative_404 = (0..CACHE_SHARDS)
+            .map(|_| Mutex::new(AHashMap::with_capacity(16)))
+            .collect();
         let verified_tokens = (0..CACHE_SHARDS)
             .map(|_| Mutex::new(AHashMap::with_capacity(16)))
             .collect();
@@ -846,6 +858,7 @@ impl MediaCache {
             l1_shards,
             disk_dir,
             l2_shards,
+            negative_404,
             verified_tokens,
             observed_avatar_sizes: Mutex::new(AHashMap::with_capacity(8)),
             in_flight,
@@ -896,6 +909,89 @@ impl MediaCache {
             }
             None => false,
         }
+    }
+
+    /// Records a bounded short-TTL (5m) negative cache entry for upstream `404 Not Found` media
+    /// responses so client retry loops for missing/deleted avatars never hammer upstream homeservers.
+    pub fn record_negative_404(&self, key: &CacheKey, requires_auth: bool) {
+        let now = Instant::now();
+        let mut map = self.negative_404[shard_of(key)].lock();
+        if map.len() >= MAX_NEGATIVE_404_PER_SHARD && !map.contains_key(key) {
+            map.retain(|_, e| now.saturating_duration_since(e.cached_at) < NEGATIVE_404_TTL);
+            if map.len() >= MAX_NEGATIVE_404_PER_SHARD {
+                map.clear();
+            }
+        }
+        map.insert(
+            *key,
+            Negative404Entry {
+                cached_at: now,
+                requires_auth,
+            },
+        );
+    }
+
+    /// Returns true if `key` recently returned `404 Not Found` and caller is authorized to see it.
+    pub fn is_negatively_cached(&self, key: &CacheKey, caller_is_verified: bool) -> bool {
+        let now = Instant::now();
+        let mut map = self.negative_404[shard_of(key)].lock();
+        match map.get(key).copied() {
+            Some(entry) if now.saturating_duration_since(entry.cached_at) < NEGATIVE_404_TTL => {
+                !entry.requires_auth || caller_is_verified
+            }
+            Some(_) => {
+                map.remove(key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Returns true if `key` is negatively cached (used by background preloader to skip dead media).
+    pub fn has_any_negative_404(&self, key: &CacheKey) -> bool {
+        let now = Instant::now();
+        let mut map = self.negative_404[shard_of(key)].lock();
+        match map.get(key).copied() {
+            Some(entry) if now.saturating_duration_since(entry.cached_at) < NEGATIVE_404_TTL => {
+                true
+            }
+            Some(_) => {
+                map.remove(key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    pub fn clear_negative_404(&self, key: &CacheKey) {
+        self.negative_404[shard_of(key)].lock().remove(key);
+    }
+
+    /// Builds an instant `<0.1ms` Matrix `M_NOT_FOUND` response for a negative-cache hit.
+    pub fn build_negative_404_response(method: &Method) -> Response<Body> {
+        const BODY_BYTES: &[u8] = b"{\"errcode\":\"M_NOT_FOUND\",\"error\":\"Media not found\"}";
+        let body = if *method == Method::HEAD {
+            Body::empty()
+        } else {
+            Body::from(Bytes::from_static(BODY_BYTES))
+        };
+        Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header(http::header::CONTENT_LENGTH, BODY_BYTES.len().to_string())
+            .header(http::header::CACHE_CONTROL, "public, max-age=300")
+            .header("x-matrix-proxy-cache", "NEG-404")
+            .header(http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .header(
+                http::header::ACCESS_CONTROL_ALLOW_METHODS,
+                "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+            )
+            .header(
+                http::header::ACCESS_CONTROL_ALLOW_HEADERS,
+                "X-Requested-With, Content-Type, Authorization, Date, Origin, Accept",
+            )
+            .body(body)
+            .unwrap_or_else(|_| Response::new(Body::empty()))
     }
 
     /// Adaptively remembers the most recent square avatar thumbnail sizes actually requested by
@@ -1106,6 +1202,7 @@ impl MediaCache {
         }
 
         if stored_anywhere {
+            self.clear_negative_404(&key);
             self.metrics
                 .media_cache_stores_total
                 .fetch_add(1, Ordering::Relaxed);
@@ -1303,6 +1400,10 @@ impl MediaCache {
             l2_entries += g.len();
             l2_bytes += g.total_bytes();
         }
+        let mut negative_entries = 0usize;
+        for shard in &self.negative_404 {
+            negative_entries += shard.lock().len();
+        }
         serde_json::json!({
             "enabled": true,
             "shards": CACHE_SHARDS,
@@ -1316,8 +1417,10 @@ impl MediaCache {
             "l1_bytes": l1_bytes,
             "l2_entries": l2_entries,
             "l2_bytes": l2_bytes,
+            "negative_entries": negative_entries,
             "hits_ram_total": self.metrics.media_cache_hits_ram_total.load(Ordering::Relaxed),
             "hits_disk_total": self.metrics.media_cache_hits_disk_total.load(Ordering::Relaxed),
+            "negative_hits_total": self.metrics.media_cache_negative_hits_total.load(Ordering::Relaxed),
             "misses_total": self.metrics.media_cache_misses_total.load(Ordering::Relaxed),
             "stores_total": self.metrics.media_cache_stores_total.load(Ordering::Relaxed),
             "evictions_total": self.metrics.media_cache_evictions_total.load(Ordering::Relaxed),
@@ -2310,7 +2413,9 @@ impl MediaPreloader {
     }
 
     fn try_enqueue(&self, job: PreloadJob) {
-        if self.cache.contains_key(&job.cache_key) {
+        if self.cache.contains_key(&job.cache_key)
+            || self.cache.has_any_negative_404(&job.cache_key)
+        {
             self.metrics
                 .media_preload_skipped_total
                 .fetch_add(1, Ordering::Relaxed);
@@ -2361,7 +2466,7 @@ async fn execute_preload_job(
     max_bytes: usize,
     job: PreloadJob,
 ) {
-    if cache.contains_key(&job.cache_key) {
+    if cache.contains_key(&job.cache_key) || cache.has_any_negative_404(&job.cache_key) {
         metrics
             .media_preload_skipped_total
             .fetch_add(1, Ordering::Relaxed);
@@ -2450,6 +2555,15 @@ async fn execute_preload_job(
                 .media_preload_completed_total
                 .fetch_add(1, Ordering::Relaxed);
         }
+        Ok(PreloadFetchResult::NotFound) => {
+            cache.record_negative_404(
+                &job.cache_key,
+                job.requires_auth || job.bearer_token.is_some(),
+            );
+            metrics
+                .media_preload_skipped_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
         Ok(PreloadFetchResult::Skipped) => {
             metrics
                 .media_preload_skipped_total
@@ -2476,6 +2590,7 @@ enum PreloadFetchResult {
         etag: Option<String>,
         data: Bytes,
     },
+    NotFound,
     Skipped,
 }
 
@@ -2495,6 +2610,9 @@ async fn fetch_preload_reqwest(
         req = req.header(k, v);
     }
     let resp = req.send().await?;
+    if resp.status() == StatusCode::NOT_FOUND {
+        return Ok(PreloadFetchResult::NotFound);
+    }
     if resp.status() != StatusCode::OK {
         return Err(anyhow!("upstream returned HTTP {}", resp.status()));
     }
@@ -2545,6 +2663,9 @@ async fn fetch_preload_ppv2(
     .await
     .context("PPv2 preload request timed out")??;
 
+    if resp.status() == StatusCode::NOT_FOUND {
+        return Ok(PreloadFetchResult::NotFound);
+    }
     if resp.status() != StatusCode::OK {
         return Err(anyhow!("upstream returned HTTP {}", resp.status()));
     }
@@ -2952,6 +3073,23 @@ mod tests {
         assert!(cache.is_token_verified("prof", "syt_secret"));
         cache.revoke_token("prof", "syt_secret");
         assert!(!cache.is_token_verified("prof", "syt_secret"));
+
+        // Negative 404 cache enforces auth isolation and clears cleanly once stored.
+        let key_missing = sha256_key(b"missing-avatar");
+        assert!(!cache.is_negatively_cached(&key_missing, true));
+        cache.record_negative_404(&key_missing, true);
+        assert!(!cache.is_negatively_cached(&key_missing, false));
+        assert!(cache.is_negatively_cached(&key_missing, true));
+        assert!(cache.has_any_negative_404(&key_missing));
+        cache
+            .store(
+                key_missing,
+                mk_meta(hot_data.len(), true),
+                hot_data.clone(),
+                StorePolicy::ClientHot,
+            )
+            .await;
+        assert!(!cache.has_any_negative_404(&key_missing));
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

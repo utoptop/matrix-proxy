@@ -1,6 +1,7 @@
 use crate::client_ip::{ClientInfo, apply_upstream_client_ip_headers, encode_proxy_protocol_proxy};
 use crate::config::{ProxyProfile, ProxyProtocol, ServerConfig, should_bypass_outbound_proxy};
-use crate::ppv2_client::{BoxedStream, configure_tcp_socket};
+use crate::dns::global_dns_resolver;
+use crate::ppv2_client::BoxedStream;
 use crate::rewrite::RewriteEngine;
 use anyhow::{Context, Result, anyhow, bail};
 use axum::body::Body;
@@ -12,7 +13,6 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
 use url::Url;
@@ -230,10 +230,10 @@ async fn connect_upstream_ws_stream(
         .await?;
         (proxied, None)
     } else {
-        let tcp = TcpStream::connect((clean_target, target_port))
+        let tcp = global_dns_resolver()
+            .connect_tcp_fast(clean_target, target_port, server_cfg.tcp_nodelay, keepalive)
             .await
             .with_context(|| format!("TCP connect to {target_host}:{target_port} failed"))?;
-        configure_tcp_socket(&tcp, server_cfg.tcp_nodelay, keepalive);
         let peer = tcp.peer_addr().ok();
         (Box::new(tcp), peer)
     };
@@ -293,12 +293,12 @@ pub async fn connect_via_proxy(
     let proxy_host = trim_ipv6_brackets(proxy_host_raw);
     let proxy_port = proxy_url.port_or_known_default().unwrap_or(1080);
 
-    let tcp = TcpStream::connect((proxy_host, proxy_port))
+    let tcp = global_dns_resolver()
+        .connect_tcp_fast(proxy_host, proxy_port, tcp_nodelay, tcp_keepalive)
         .await
         .with_context(|| {
             format!("failed to connect to outbound proxy {proxy_host_raw}:{proxy_port}")
         })?;
-    configure_tcp_socket(&tcp, tcp_nodelay, tcp_keepalive);
 
     let mut stream: BoxedStream = if proxy_url.scheme().eq_ignore_ascii_case("https") {
         let proxy_tls_cfg = cached_https_proxy_tls_config(tls_config);
@@ -490,10 +490,18 @@ fn cached_webpki_root_store() -> Arc<rustls::RootCertStore> {
     }))
 }
 
-pub fn build_client_tls_config(
+fn shared_tls_session_cache() -> Arc<rustls::client::ClientSessionMemoryCache> {
+    static CACHE: OnceLock<Arc<rustls::client::ClientSessionMemoryCache>> = OnceLock::new();
+    Arc::clone(CACHE.get_or_init(|| Arc::new(rustls::client::ClientSessionMemoryCache::new(1024))))
+}
+
+/// Builds an owned `rustls::ClientConfig` sharing one process-wide `webpki` root certificate store
+/// AND one shared TLS 1.3 session ticket cache (`ClientSessionMemoryCache`) across `reqwest`,
+/// `Ppv2Client`, and WebSocket clients for 1-RTT session resumption and minimal memory footprint.
+pub fn build_client_tls_config_owned(
     danger_accept_invalid_certs: bool,
     alpn_protocols: &[&[u8]],
-) -> Result<Arc<rustls::ClientConfig>> {
+) -> Result<rustls::ClientConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut cfg = if danger_accept_invalid_certs {
         rustls::ClientConfig::builder_with_provider(provider)
@@ -508,11 +516,22 @@ pub fn build_client_tls_config(
             .with_no_client_auth()
     };
 
+    cfg.resumption = rustls::client::Resumption::store(shared_tls_session_cache());
     if !alpn_protocols.is_empty() {
         cfg.alpn_protocols = alpn_protocols.iter().map(|p| p.to_vec()).collect();
     }
 
-    Ok(Arc::new(cfg))
+    Ok(cfg)
+}
+
+pub fn build_client_tls_config(
+    danger_accept_invalid_certs: bool,
+    alpn_protocols: &[&[u8]],
+) -> Result<Arc<rustls::ClientConfig>> {
+    Ok(Arc::new(build_client_tls_config_owned(
+        danger_accept_invalid_certs,
+        alpn_protocols,
+    )?))
 }
 
 #[derive(Debug)]

@@ -7,7 +7,7 @@ set -euo pipefail
 #   - Merged into a unified OCI multi-arch manifest index on Docker Hub
 #     (and optionally GHCR when GHCR_TOKEN is supplied).
 
-APP_VERSION="${APP_VERSION:-2.0.0}"
+APP_VERSION="${APP_VERSION:-2.0.1}"
 DOCKERHUB_REPO="${DOCKERHUB_REPO:-utoptop/matrix-proxy}"
 PUBLISH_TAGS="${PUBLISH_TAGS:-1.0 latest ${APP_VERSION}}"
 LOCAL_CARGO_JOBS="${LOCAL_CARGO_JOBS:-4}"

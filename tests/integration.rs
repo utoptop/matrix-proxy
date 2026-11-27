@@ -2752,3 +2752,139 @@ async fn proactive_media_preloader_warms_avatars_images_and_thumbnail_downloads(
     assert!(metrics_text.contains("matrix_proxy_media_cache_hits_ram_total"));
     assert!(metrics_text.contains("matrix_proxy_media_preload_completed_total"));
 }
+
+#[tokio::test]
+async fn media_cache_short_circuits_repeated_404_not_found_without_hitting_upstream() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let upstream_hits = Arc::new(AtomicUsize::new(0));
+    let hits_clone = Arc::clone(&upstream_hits);
+
+    let hs_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hs_addr = hs_listener.local_addr().unwrap();
+    let hs_url = format!("http://{hs_addr}");
+
+    let hs_app = Router::new()
+        .route(
+            "/_matrix/client/v3/sync",
+            get(|| async {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"next_batch":"s1"}"#))
+                    .unwrap()
+            }),
+        )
+        .route(
+            "/_matrix/client/v1/media/thumbnail/{server}/{id}",
+            get(move || {
+                let hits = Arc::clone(&hits_clone);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            r#"{"errcode":"M_NOT_FOUND","error":"Media not found"}"#,
+                        ))
+                        .unwrap()
+                }
+            }),
+        );
+    tokio::spawn(async move {
+        let _ = axum::serve(hs_listener, hs_app).await;
+    });
+
+    let toml_cfg = format!(
+        r#"
+        [server]
+        expose_info = "always"
+
+        [server.media_cache]
+        enabled = true
+        ram_max_mb = 4
+        disk_max_mb = 0
+
+        [[proxies]]
+        name = "neg404"
+        matrix_proxy_public_url = "https://neg404.example.com"
+        upstream_matrix_server_url = "{hs_url}"
+        upstream_matrix_auth_url = "{hs_url}"
+        merge_upstream_well_known = false
+        media_cache = true
+        media_preload = false
+        "#
+    );
+
+    let cfg: Config = toml::from_str(&toml_cfg).unwrap();
+    let app = build_single_listener_app(cfg).await;
+
+    // Authenticate bearer token once via /sync.
+    let sync_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_matrix/client/v3/sync")
+                .header(header::HOST, "neg404.example.com")
+                .header(header::AUTHORIZATION, "Bearer syt_valid_404_tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sync_resp.status(), StatusCode::OK);
+
+    // 1. First request misses and hits upstream once (404 -> recorded in negative cache).
+    let r1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_matrix/client/v1/media/thumbnail/r.example/deadId?width=192&height=192&method=scale")
+                .header(header::HOST, "neg404.example.com")
+                .header(header::AUTHORIZATION, "Bearer syt_valid_404_tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        r1.headers().get("x-matrix-proxy-cache").unwrap(),
+        "MISS-404"
+    );
+    assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+
+    // 2. Repeated retries with valid token short-circuit locally without touching upstream!
+    for _ in 0..3 {
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/_matrix/client/v1/media/thumbnail/r.example/deadId?width=192&height=192&method=scale&animated=false")
+                    .header(header::HOST, "neg404.example.com")
+                    .header(header::AUTHORIZATION, "Bearer syt_valid_404_tok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        assert_eq!(r.headers().get("x-matrix-proxy-cache").unwrap(), "NEG-404");
+    }
+    assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+
+    // 3. Unauthenticated caller must NOT be served from the auth negative cache (still hits upstream).
+    let r_unauth = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_matrix/client/v1/media/thumbnail/r.example/deadId?width=192&height=192&method=scale")
+                .header(header::HOST, "neg404.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_unauth.status(), StatusCode::NOT_FOUND);
+    assert_eq!(upstream_hits.load(Ordering::SeqCst), 2);
+}

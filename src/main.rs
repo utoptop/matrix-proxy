@@ -40,8 +40,9 @@ use tower::ServiceExt;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-/// Ultra-low-fragmentation global slab allocator (`mimalloc`) with fast OS page purging
-/// (`MIMALLOC_PURGE_DELAY=500`), eliminating glibc `ptmalloc2` multi-arena RSS retention.
+/// Ultra-low-fragmentation global slab allocator (`mimalloc` with `no_thp`) + fast OS page purging
+/// (`MIMALLOC_ALLOW_THP=0`, `MIMALLOC_PURGE_DELAY=10`), eliminating glibc multi-arena retention
+/// and Linux 2 MiB transparent huge page RSS bloat.
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -820,11 +821,12 @@ async fn serve_listener(
                         .http2()
                         .timer(TokioTimer::new())
                         .adaptive_window(true)
-                        .initial_stream_window_size(512 * 1024)
-                        .initial_connection_window_size(2 * 1024 * 1024)
+                        .initial_stream_window_size(1024 * 1024)
+                        .initial_connection_window_size(4 * 1024 * 1024)
+                        .max_frame_size(32 * 1024)
                         .max_concurrent_streams(256)
-                        .keep_alive_interval(Duration::from_secs(30))
-                        .keep_alive_timeout(Duration::from_secs(20));
+                        .keep_alive_interval(Duration::from_secs(15))
+                        .keep_alive_timeout(Duration::from_secs(8));
 
                     if let Some(acceptor) = cfg.tls_acceptor.as_ref() {
                         let tls_stream = match tokio::time::timeout(

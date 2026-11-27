@@ -1,6 +1,7 @@
 pub mod client_ip;
 pub mod config;
 pub mod discovery;
+pub mod dns;
 pub mod media_cache;
 pub mod metrics;
 pub mod ppv2_client;

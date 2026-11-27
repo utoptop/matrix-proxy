@@ -1,8 +1,8 @@
 [package]
 name = "matrix-proxy"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2024"
-description = "High-performance multi-tenant Rust reverse proxy for Matrix Client-Server & Matrix Auth (MAS/OIDC) with sharded O(1) L1/L2 edge media cache, zero-DOM streaming preloader, lock-free hot reload, and standard PROXY Protocol v1/v2"
+description = "High-performance multi-tenant Rust reverse proxy for Matrix Client-Server & Matrix Auth (MAS/OIDC) with sharded O(1) L1/L2 edge media cache, negative 404 caching, async DNS + TLS 1.3 resumption, lock-free hot reload, and standard PROXY Protocol v1/v2"
 license = "MIT"
 
 [dependencies]
@@ -20,9 +20,9 @@ http-body-util = "0.1"
 hyper = { version = "1.6", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2", "service"] }
 ipnet = "2.10"
-mimalloc = { version = "0.1", default-features = false }
+mimalloc = { version = "0.1", default-features = false, features = ["no_thp"] }
 parking_lot = "0.12"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "rustls-tls-native-roots", "stream", "socks", "json", "gzip", "brotli", "deflate", "http2"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "stream", "socks", "json", "gzip", "brotli", "deflate", "http2"] }
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2.2"
